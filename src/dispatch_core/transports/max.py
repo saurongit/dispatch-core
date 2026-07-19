@@ -1,0 +1,341 @@
+from __future__ import annotations
+
+import asyncio
+import time
+from collections import deque
+from typing import Any
+
+import httpx
+
+from dispatch_core.messaging.models import OutboundEnvelope, Provider
+
+from .common import decode_callback, encode_callback, group_buttons, stable_payload_id
+from .contracts import EventKind, InboundEvent, SendResult
+
+
+class MaxTransport:
+    provider = Provider.MAX
+
+    def __init__(
+        self,
+        token: str,
+        *,
+        api_base: str = "https://platform-api2.max.ru",
+        client: httpx.AsyncClient | None = None,
+        proxy: str | None = None,
+        requests_per_second: int = 25,
+    ) -> None:
+        if not token:
+            raise ValueError("MAX bot token is required")
+        if not 1 <= requests_per_second <= 30:
+            raise ValueError("MAX request rate must be between 1 and 30")
+        self._token = token
+        self._api_base = api_base.rstrip("/")
+        self._owns_client = client is None
+        self._client = client or httpx.AsyncClient(
+            proxy=proxy,
+            headers={"Authorization": token},
+            timeout=httpx.Timeout(40),
+        )
+        self._rate = requests_per_second
+        self._rate_lock = asyncio.Lock()
+        self._request_times: deque[float] = deque()
+
+    async def close(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
+
+    def external_event_id(self, payload: dict[str, Any]) -> str:
+        for candidate in self._identity_candidates(payload):
+            if candidate:
+                return f"max:{candidate}"
+        return stable_payload_id(self.provider.value, payload)
+
+    def parse(self, payload: dict[str, Any]) -> tuple[InboundEvent, ...]:
+        updates = payload.get("updates")
+        if isinstance(updates, list):
+            events: list[InboundEvent] = []
+            for item in updates:
+                if isinstance(item, dict):
+                    events.extend(self._parse_one(item))
+            return tuple(events)
+        return self._parse_one(payload)
+
+    def _parse_one(self, item: dict[str, Any]) -> tuple[InboundEvent, ...]:
+        update_type = item.get("update_type") or item.get("type") or "message"
+        external_event_id = self.external_event_id(item)
+        if update_type == "message_callback":
+            callback = item.get("callback")
+            callback = callback if isinstance(callback, dict) else {}
+            user_id = self._user_id(callback) or self._user_id(item)
+            token = decode_callback(callback.get("payload") or callback.get("data"))
+            if not user_id or not token:
+                return ()
+            return (
+                InboundEvent(
+                    provider=self.provider,
+                    external_event_id=external_event_id,
+                    external_user_id=user_id,
+                    chat_id=user_id,
+                    kind=EventKind.CALLBACK,
+                    callback_token=token,
+                    callback_id=str(callback.get("callback_id") or "") or None,
+                    raw=item,
+                ),
+            )
+        if update_type == "bot_started":
+            user_id = self._user_id(item)
+            if not user_id:
+                return ()
+            return (
+                self._event(
+                    external_event_id,
+                    user_id,
+                    EventKind.START,
+                    item,
+                    text=self._text(item) or "/start",
+                ),
+            )
+        if update_type not in {"message_created", "message"}:
+            return ()
+        message = item.get("message")
+        message = message if isinstance(message, dict) else item
+        user_id = self._user_id(message) or self._user_id(item)
+        if not user_id:
+            return ()
+        text = self._text(message)
+        body = message.get("body")
+        body = body if isinstance(body, dict) else {}
+        attachments = body.get("attachments")
+        attachments = attachments if isinstance(attachments, list) else []
+        events: list[InboundEvent] = []
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            attachment_type = attachment.get("type")
+            attachment_payload = attachment.get("payload")
+            attachment_payload = (
+                attachment_payload if isinstance(attachment_payload, dict) else {}
+            )
+            if attachment_type == "image" and attachment_payload.get("url"):
+                events.append(
+                    self._event(
+                        external_event_id,
+                        user_id,
+                        EventKind.PHOTO,
+                        item,
+                        text=text,
+                        media_id=str(attachment_payload["url"]),
+                    )
+                )
+            elif attachment_type == "location":
+                try:
+                    latitude = float(attachment["latitude"])
+                    longitude = float(attachment["longitude"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                events.append(
+                    self._event(
+                        external_event_id,
+                        user_id,
+                        EventKind.LOCATION,
+                        item,
+                        text=text,
+                        latitude=latitude,
+                        longitude=longitude,
+                    )
+                )
+        if events:
+            return tuple(events)
+        return (
+            self._event(
+                external_event_id,
+                user_id,
+                EventKind.MESSAGE,
+                item,
+                text=text,
+            ),
+        )
+
+    async def get_updates(
+        self,
+        *,
+        marker: int | None,
+        timeout_seconds: int = 30,
+        limit: int = 100,
+    ) -> tuple[tuple[dict[str, Any], ...], int | None]:
+        parameters: dict[str, Any] = {
+            "timeout": timeout_seconds,
+            "limit": limit,
+        }
+        if marker is not None:
+            parameters["marker"] = marker
+        response = await self._request(
+            "GET",
+            "/updates",
+            params=parameters,
+            request_timeout=timeout_seconds + 15,
+        )
+        data = response.json()
+        if not isinstance(data, dict):
+            raise RuntimeError("MAX updates response is not an object")
+        updates = data.get("updates") or []
+        if not isinstance(updates, list):
+            raise RuntimeError("MAX updates field is not a list")
+        items = tuple(item for item in updates if isinstance(item, dict))
+        next_marker = data.get("marker")
+        if next_marker is not None:
+            try:
+                next_marker = int(next_marker)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("MAX marker is not an integer") from exc
+        return items, next_marker if next_marker is not None else marker
+
+    async def send(self, message: OutboundEnvelope) -> SendResult:
+        body: dict[str, Any] = {"text": message.text, "format": "html"}
+        if message.buttons:
+            body["attachments"] = [
+                {
+                    "type": "inline_keyboard",
+                    "payload": {
+                        "buttons": [
+                            [self._button(button) for button in row]
+                            for row in group_buttons(message.buttons)
+                        ]
+                    },
+                }
+            ]
+        response = await self._request(
+            "POST",
+            "/messages",
+            params={"user_id": message.recipient_id},
+            json=body,
+        )
+        data = response.json()
+        if not isinstance(data, dict):
+            return SendResult()
+        sent = data.get("message")
+        sent = sent if isinstance(sent, dict) else data
+        sent_body = sent.get("body")
+        sent_body = sent_body if isinstance(sent_body, dict) else {}
+        external_id = (
+            sent_body.get("mid")
+            or sent.get("message_id")
+            or sent.get("id")
+            or data.get("message_id")
+        )
+        return SendResult(
+            external_message_id=str(external_id) if external_id else None
+        )
+
+    async def answer_callback(
+        self, callback_id: str, text: str | None = None
+    ) -> None:
+        body = {"notification": text} if text else {}
+        await self._request(
+            "POST",
+            "/answers",
+            params={"callback_id": callback_id},
+            json=body,
+        )
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        request_timeout: float | None = None,
+    ) -> httpx.Response:
+        await self._wait_api_slot()
+        response = await self._client.request(
+            method,
+            f"{self._api_base}{path}",
+            params=params,
+            json=json,
+            headers={"Authorization": self._token},
+            timeout=request_timeout,
+        )
+        response.raise_for_status()
+        return response
+
+    async def _wait_api_slot(self) -> None:
+        async with self._rate_lock:
+            while True:
+                now = time.monotonic()
+                cutoff = now - 1
+                while self._request_times and self._request_times[0] <= cutoff:
+                    self._request_times.popleft()
+                if len(self._request_times) < self._rate:
+                    self._request_times.append(now)
+                    return
+                delay = 1 - (now - self._request_times[0])
+                await asyncio.sleep(max(0, delay))
+
+    @staticmethod
+    def _identity_candidates(item: dict[str, Any]) -> tuple[object, ...]:
+        callback = item.get("callback")
+        callback = callback if isinstance(callback, dict) else {}
+        message = item.get("message")
+        message = message if isinstance(message, dict) else {}
+        body = message.get("body")
+        body = body if isinstance(body, dict) else {}
+        return (
+            item.get("update_id"),
+            callback.get("callback_id"),
+            body.get("mid"),
+            message.get("message_id"),
+            item.get("timestamp"),
+        )
+
+    @staticmethod
+    def _user_id(item: dict[str, Any]) -> str:
+        for key in ("user", "from", "sender"):
+            user = item.get(key)
+            if isinstance(user, dict):
+                value = user.get("id") or user.get("user_id")
+                if value is not None:
+                    return str(value)
+        value = item.get("user_id")
+        return str(value) if value is not None else ""
+
+    @staticmethod
+    def _text(item: dict[str, Any]) -> str | None:
+        text = item.get("text")
+        body = item.get("body")
+        if text is None and isinstance(body, dict):
+            text = body.get("text")
+        return str(text) if text is not None else None
+
+    @staticmethod
+    def _event(
+        external_event_id: str,
+        user_id: str,
+        kind: EventKind,
+        raw: dict[str, Any],
+        **values: Any,
+    ) -> InboundEvent:
+        return InboundEvent(
+            provider=Provider.MAX,
+            external_event_id=external_event_id,
+            external_user_id=user_id,
+            chat_id=user_id,
+            kind=kind,
+            raw=raw,
+            **values,
+        )
+
+    @staticmethod
+    def _button(button: Any) -> dict[str, Any]:
+        if button.callback_token is not None:
+            return {
+                "type": "callback",
+                "text": button.text,
+                "payload": encode_callback(button.callback_token),
+            }
+        if button.url is not None:
+            return {"type": "link", "text": button.text, "url": button.url}
+        if button.request_location:
+            return {"type": "request_geo_location", "text": button.text}
+        raise ValueError("unsupported MAX button")

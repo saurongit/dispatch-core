@@ -1,0 +1,28 @@
+services:
+  api:
+    environment:
+      DISPATCH_TELEGRAM_RECEIVE_MODE: ${TELEGRAM_RECEIVE_MODE:-polling}
+      DISPATCH_MAX_RECEIVE_MODE: ${MAX_RECEIVE_MODE:-webhook}
+      DISPATCH_TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
+      DISPATCH_MAX_BOT_TOKEN_FILE: /run/secrets/max_bot_token
+      DISPATCH_TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
+      DISPATCH_MAX_WEBHOOK_SECRET: ${MAX_WEBHOOK_SECRET:-}
+    secrets:
+      - telegram_bot_token
+      - max_bot_token
+
+  worker:
+    environment:
+      DISPATCH_TELEGRAM_RECEIVE_MODE: ${TELEGRAM_RECEIVE_MODE:-polling}
+      DISPATCH_MAX_RECEIVE_MODE: ${MAX_RECEIVE_MODE:-webhook}
+      DISPATCH_TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
+      DISPATCH_MAX_BOT_TOKEN_FILE: /run/secrets/max_bot_token
+    secrets:
+      - telegram_bot_token
+      - max_bot_token
+
+secrets:
+  telegram_bot_token:
+    file: ./secrets/telegram_bot_token
+  max_bot_token:
+    file: ./secrets/max_bot_token

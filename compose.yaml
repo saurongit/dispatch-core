@@ -1,0 +1,65 @@
+name: dispatch-core
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dispatch
+      POSTGRES_USER: dispatch
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - dispatch-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dispatch -d dispatch"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    security_opt:
+      - no-new-privileges:true
+
+  api:
+    build:
+      context: .
+    image: dispatch-core:local
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment: &dispatch-environment
+      DISPATCH_DATABASE_URL: postgresql://dispatch:${POSTGRES_PASSWORD}@postgres:5432/dispatch
+      DISPATCH_ADMIN_API_KEY: ${DISPATCH_ADMIN_API_KEY:?set a 32+ character key in .env}
+      DISPATCH_ORGANIZATION_ID: ${DISPATCH_ORGANIZATION_ID:-default}
+      DISPATCH_ORGANIZATION_NAME: ${DISPATCH_ORGANIZATION_NAME:-Dispatch Core}
+      DISPATCH_TELEGRAM_RECEIVE_MODE: disabled
+      DISPATCH_MAX_RECEIVE_MODE: disabled
+    ports:
+      - "${DISPATCH_HTTP_PORT:-8080}:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  worker:
+    image: dispatch-core:local
+    restart: unless-stopped
+    command: ["dispatch-core-worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
+    environment: *dispatch-environment
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  dispatch-postgres:
