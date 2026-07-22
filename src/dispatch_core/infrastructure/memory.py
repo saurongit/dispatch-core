@@ -14,7 +14,9 @@ from dispatch_core.domain.work_order import WorkOrder
 @dataclass(slots=True)
 class MemoryStore:
     orders: dict[str, WorkOrder] = field(default_factory=dict)
-    tracking_sessions: dict[str, TrackingSession] = field(default_factory=dict)
+    tracking_sessions: dict[tuple[str, str], TrackingSession] = field(
+        default_factory=dict
+    )
     outbox_events: list[DomainEvent] = field(default_factory=list)
     lock: RLock = field(default_factory=RLock)
 
@@ -23,9 +25,11 @@ class _OrderRepository:
     def __init__(self, unit_of_work: InMemoryUnitOfWork) -> None:
         self._uow = unit_of_work
 
-    def get(self, order_id: str) -> WorkOrder:
+    def get(self, organization_id: str, order_id: str) -> WorkOrder:
         stored = self._uow._store.orders.get(order_id)
         if stored is None:
+            raise NotFound(f"work order {order_id!r} was not found")
+        if stored.organization_id != organization_id:
             raise NotFound(f"work order {order_id!r} was not found")
         return deepcopy(stored)
 
@@ -39,17 +43,27 @@ class _TrackingRepository:
     def __init__(self, unit_of_work: InMemoryUnitOfWork) -> None:
         self._uow = unit_of_work
 
-    def get(self, session_id: str) -> TrackingSession:
-        stored = self._uow._store.tracking_sessions.get(session_id)
+    def get(
+        self, organization_id: str, session_id: str
+    ) -> TrackingSession:
+        stored = self._uow._store.tracking_sessions.get(
+            (organization_id, session_id)
+        )
         if stored is None:
             raise NotFound(f"tracking session {session_id!r} was not found")
         return deepcopy(stored)
 
-    def find_active_for_order(self, order_id: str) -> TrackingSession | None:
+    def find_active_for_order(
+        self, organization_id: str, order_id: str
+    ) -> TrackingSession | None:
         matches = [
             item
-            for item in self._uow._store.tracking_sessions.values()
-            if item.work_order_id == order_id and item.status is TrackingStatus.ACTIVE
+            for (stored_org, _), item in (
+                self._uow._store.tracking_sessions.items()
+            )
+            if stored_org == organization_id
+            and item.work_order_id == order_id
+            and item.status is TrackingStatus.ACTIVE
         ]
         if len(matches) > 1:
             raise RuntimeError("more than one active tracking session for work order")
@@ -60,7 +74,7 @@ class _TrackingRepository:
     ) -> None:
         snapshot = deepcopy(session)
         snapshot.pull_events()
-        self._uow._staged_tracking[session.id] = (
+        self._uow._staged_tracking[(session.organization_id, session.id)] = (
             snapshot,
             expected_version,
         )
@@ -100,6 +114,7 @@ class InMemoryUnitOfWork:
     def commit(self) -> None:
         with self._store.lock:
             self._check_versions()
+            self._check_executor_capacity()
             for aggregate_id, (order, _) in self._staged_orders.items():
                 self._store.orders[aggregate_id] = deepcopy(order)
             for aggregate_id, (session, _) in self._staged_tracking.items():
@@ -114,11 +129,28 @@ class InMemoryUnitOfWork:
             self._store.tracking_sessions, self._staged_tracking
         )
 
+    def _check_executor_capacity(self) -> None:
+        active_statuses = {"assigned", "accepted", "en_route", "in_progress"}
+        merged = dict(self._store.orders)
+        merged.update(
+            {order.id: order for order, _ in self._staged_orders.values()}
+        )
+        occupied: set[str] = set()
+        for order in merged.values():
+            if order.assignee_id is None or order.status.value not in active_statuses:
+                continue
+            key = f"{order.organization_id}:{order.assignee_id}"
+            if key in occupied:
+                raise ConcurrencyConflict(
+                    "executor already has another active work order"
+                )
+            occupied.add(key)
+
     @staticmethod
     def _check_collection_versions(
-        stored: dict[str, WorkOrder] | dict[str, TrackingSession],
+        stored: dict[str, WorkOrder] | dict[tuple[str, str], TrackingSession],
         staged: dict[str, tuple[WorkOrder, int | None]]
-        | dict[str, tuple[TrackingSession, int | None]],
+        | dict[tuple[str, str], tuple[TrackingSession, int | None]],
     ) -> None:
         for aggregate_id, (_, expected_version) in staged.items():
             current = stored.get(aggregate_id)

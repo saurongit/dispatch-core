@@ -11,9 +11,10 @@ request -> pool/direct assignment -> accept -> travel -> work -> report -> close
 ```
 
 It is deliberately a focused operational core, not an unfinished attempt to
-clone every CRM feature. A site, customer bot, dispatcher screen or external
-system creates requests through the API. Telegram and MAX are interchangeable
-executor/operator transports around the same domain model.
+clone every CRM feature. Client, operator, master and administrator workplaces
+live in messenger frontends; a dispatcher web board is outside the target
+product. Sites, phone intake and external systems remain optional request
+generators.
 
 ## Why this repository exists
 
@@ -95,8 +96,9 @@ python -m venv .venv
 
 The in-memory demo completes a curated operator/executor flow without external
 services. PostgreSQL integration tests run when `TEST_DATABASE_URL` is set.
-The complete suite currently contains more than 470 tests and enforces 90%
-branch coverage in CI across Python 3.12, 3.13 and 3.14.
+The verified suite currently contains 579 passing tests, including 37 live
+PostgreSQL integration tests. CI enforces 90% branch coverage across Python
+3.12, 3.13 and 3.14.
 
 ## Run with Docker Compose
 
@@ -112,16 +114,25 @@ The base profile deliberately disables messenger providers. To enable them,
 create private token files and add the transport override:
 
 ```bash
-install -m 600 /dev/null secrets/telegram_bot_token
-install -m 600 /dev/null secrets/max_bot_token
-# Put one token in each local file; never commit those files.
+mkdir -p secrets
+for name in telegram_{client,operator,master,admin}_bot_token \
+            max_{client,staff}_bot_token; do
+  install -m 600 /dev/null "secrets/$name"
+done
+# Put the corresponding tokens in the files; never commit them.
 docker compose -f compose.yaml -f compose.transports.example.yaml up --build -d
 ```
 
-Create actors and bind their external messenger IDs through `POST /v1/actors`,
-then create work through `POST /v1/orders`. Set
-`DISPATCH_ENVIRONMENT=development` to expose `/docs` locally; schema endpoints
-are disabled in the default production environment. See
+Telegram uses separate client/operator/master/admin role bots. MAX uses two
+physical bots: one client bot and one shared staff bot. On `/start`, the staff
+bot offers only the roles actually granted to that person.
+
+In the normal flow an administrator creates a staff member and that person
+binds a Telegram/MAX account with a one-time code. `POST /v1/actors` remains
+available for provisioning and development fixtures; work can be created
+through `POST /v1/orders`. Set `DISPATCH_ENVIRONMENT=development` to expose
+`/docs` locally; schema endpoints are disabled in the default production
+environment. See
 [operations](docs/OPERATIONS.md) for exact examples, webhook registration,
 backup and limitations.
 
@@ -145,14 +156,19 @@ claim of magical exactly-once networking.
 
 ## Product boundaries
 
-Available now: domain/application core, PostgreSQL, FastAPI, Telegram, MAX,
-durable messaging workflow, tracking, Docker packaging and example industry
-packs.
+Available now as a foundation: domain/application core, PostgreSQL, FastAPI,
+Telegram/MAX adapters, frontend-isolated durable messaging, tracking, industry
+packs, guided client intake, controlled staff binding, shared-MAX role
+selection and operator/master workspaces. An operator can create, inspect and
+safely disable an idle master; a master can navigate assigned active work and
+the lifecycle actions valid for its current state.
 
-Not available yet: dispatcher web UI, customer-bot conversation builder,
-installer UI, SQLite desktop profile, attachment object storage, separate
-hybrid edge, route optimisation, billing, inventory, payroll and a full sales
-CRM. The module catalog reports these boundaries explicitly.
+Still pending: complete order cards and assignment from the operator menu,
+operator report approval, the remaining customer conversations, installer UI,
+SQLite desktop profile, attachment object storage and a separate hybrid edge.
+A dispatcher web UI, route optimisation, billing, inventory, payroll and a
+full sales CRM are deliberately outside the current product boundary. The
+module catalog reports these boundaries explicitly.
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Operations](docs/OPERATIONS.md)

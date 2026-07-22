@@ -32,31 +32,36 @@ def main() -> None:
             comment_required=True,
         ),
     )
-    service.claim_coordination(order.id, "dispatcher-1")
+    service.claim_coordination("demo-org", order.id, "dispatcher-1")
     service.publish_pool(
+        "demo-org",
         order.id,
         PoolMode.CURATED,
         actor_id="dispatcher-1",
     )
-    service.express_interest(order.id, "executor-7")
+    service.express_interest("demo-org", order.id, "executor-7")
     service.assign_order(
+        "demo-org",
         order.id,
         "executor-7",
         actor_id="dispatcher-1",
     )
-    service.accept_order(order.id, "executor-7")
+    service.accept_order("demo-org", order.id, "executor-7")
     order, session = service.start_travel(
-        order.id, "executor-7", session_id="demo-track"
+        "demo-org", order.id, "executor-7", session_id="demo-track"
     )
     service.record_location(
+        organization_id="demo-org",
+        executor_id="executor-7",
         session_id=session.id,
         latitude=55.751244,
         longitude=37.618423,
         source=LocationSource.TELEGRAM,
         accuracy_m=12.0,
     )
-    service.start_work(order.id, "executor-7")
+    service.start_work("demo-org", order.id, "executor-7")
     order = service.complete_order(
+        "demo-org",
         order.id,
         "executor-7",
         CompletionReport(

@@ -202,13 +202,18 @@ class FakeOutboundStore:
     messages: tuple[OutboundEnvelope, ...]
     delivered: list[tuple[int, str | None]] = field(default_factory=list)
     failed: list[tuple[int, str]] = field(default_factory=list)
+    claimed_consumer_keys: tuple[str, ...] = ()
 
     async def claim(
-        self, provider: Provider, *, limit: int
+        self,
+        provider: Provider,
+        *,
+        limit: int,
+        consumer_key: str = "",
+        consumer_keys: tuple[str, ...] | None = None,
     ) -> tuple[OutboundEnvelope, ...]:
-        matches = tuple(
-            item for item in self.messages if item.provider is provider
-        )
+        self.claimed_consumer_keys = consumer_keys or (consumer_key,)
+        matches = tuple(item for item in self.messages if item.provider is provider)
         return matches[:limit]
 
     async def mark_delivered(
@@ -252,6 +257,24 @@ async def test_sender_does_not_claim_queue_without_transport() -> None:
     assert store.delivered == []
 
 
+@pytest.mark.asyncio
+async def test_shared_max_staff_sender_claims_all_staff_role_queues() -> None:
+    store = FakeOutboundStore(messages=(message(Provider.MAX),))
+    sender = OutboundSender(  # type: ignore[arg-type]
+        store,
+        {Provider.MAX: FakeTransport()},  # type: ignore[dict-item]
+        consumer_key="staff",
+    )
+
+    assert await sender.run_once(Provider.MAX) == 1
+    assert store.claimed_consumer_keys == (
+        "staff",
+        "admin",
+        "operator",
+        "master",
+    )
+
+
 @dataclass
 class FakePollingInbox:
     cursors: dict[tuple[Provider, str], str] = field(default_factory=dict)
@@ -262,9 +285,7 @@ class FakePollingInbox:
 
     async def accept_poll_batch(self, **values: Any) -> int:
         self.batches.append(values)
-        self.cursors[(values["provider"], values["consumer_key"])] = values[
-            "next_cursor"
-        ]
+        self.cursors[(values["provider"], values["cursor_key"])] = values["next_cursor"]
         return len(values["events"])
 
 
@@ -287,7 +308,7 @@ class FakeTelegramPolling:
 @pytest.mark.asyncio
 async def test_telegram_polling_persists_batch_before_cursor() -> None:
     inbox = FakePollingInbox(
-        cursors={(Provider.TELEGRAM, "consumer"): "40"}
+        cursors={(Provider.TELEGRAM, "org-1:telegram:consumer"): "40"}
     )
     transport = FakeTelegramPolling(
         updates=({"update_id": 40}, {"update_id": 41}),
@@ -323,7 +344,7 @@ class FakeMaxPolling:
 
 @pytest.mark.asyncio
 async def test_max_polling_persists_batch_and_marker() -> None:
-    inbox = FakePollingInbox(cursors={(Provider.MAX, "consumer"): "8"})
+    inbox = FakePollingInbox(cursors={(Provider.MAX, "org-1:max:consumer"): "8"})
     transport = FakeMaxPolling(updates=({"id": "u-1"},), next_marker=9)
     receiver = DurablePollingReceiver(inbox)  # type: ignore[arg-type]
     inserted = await receiver.max_once(
@@ -342,11 +363,14 @@ async def test_polling_does_not_advance_when_provider_has_no_cursor() -> None:
     inbox = FakePollingInbox()
     transport = FakeTelegramPolling(updates=(), next_offset=None)
     receiver = DurablePollingReceiver(inbox)  # type: ignore[arg-type]
-    assert await receiver.telegram_once(  # type: ignore[arg-type]
-        transport,
-        organization_id="org-1",
-        consumer_key="consumer",
-    ) == 0
+    assert (
+        await receiver.telegram_once(  # type: ignore[arg-type]
+            transport,
+            organization_id="org-1",
+            consumer_key="consumer",
+        )
+        == 0
+    )
     assert inbox.batches == []
 
 
@@ -358,9 +382,7 @@ class FakeOutboxWorkerStore:
     async def claim_events(self, *, limit: int) -> tuple[PendingDomainEvent, ...]:
         return self.events[:limit]
 
-    async def mark_failed(
-        self, event: PendingDomainEvent, error: str
-    ) -> None:
+    async def mark_failed(self, event: PendingDomainEvent, error: str) -> None:
         self.failures.append(error)
 
 

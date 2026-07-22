@@ -7,9 +7,9 @@ from typing import Any
 from dispatch_core.domain.work_order import EvidenceRequirements, PoolMode
 
 DEFAULT_ROLE_LABELS: dict[str, str] = {
-    "executor": "Мастер",
-    "coordinator": "Оператор",
-    "requester": "Клиент",
+    "master": "Мастер",
+    "operator": "Оператор",
+    "client": "Клиент",
 }
 
 
@@ -441,7 +441,12 @@ INDUSTRY_PACK_INDEX: dict[str, IndustryPack] = {
 
 
 def seed_definition(pack_id: str) -> PackDefinition:
-    pack = INDUSTRY_PACK_INDEX.get(pack_id, INDUSTRY_PACKS[0])
+    pack = INDUSTRY_PACK_INDEX.get(pack_id)
+    if pack is None:
+        raise ValueError(
+            f"unknown pack_id {pack_id!r}; "
+            f"available: {', '.join(INDUSTRY_PACK_INDEX)}"
+        )
     return pack.to_definition()
 
 

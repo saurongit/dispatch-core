@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterable
 from pathlib import Path
 from types import TracebackType
@@ -25,6 +26,8 @@ from dispatch_core.domain.work_order import (
     WorkOrder,
     WorkOrderStatus,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _json_value(value: Any) -> Any:
@@ -136,12 +139,19 @@ class PostgresUnitOfWork:
                 if exc_type is None and self._committed:
                     await self._transaction.commit()
                 else:
-                    await self._transaction.rollback()
+                    try:
+                        await self._transaction.rollback()
+                    except Exception:
+                        logger.warning("rollback failed during cleanup", exc_info=True)
         finally:
-            if self._connection is not None:
-                await self._pool.release(self._connection)
-            self._connection = None
-            self._transaction = None
+            try:
+                if self._connection is not None:
+                    await self._pool.release(self._connection)
+            except Exception:
+                logger.warning("failed to release connection", exc_info=True)
+            finally:
+                self._connection = None
+                self._transaction = None
 
     async def commit(self) -> None:
         if self._connection is None:
@@ -159,6 +169,31 @@ class PostgresOrderRepository:
             SELECT * FROM work_orders
             WHERE organization_id = $1 AND id = $2
             FOR UPDATE
+            """,
+            organization_id,
+            order_id,
+        )
+        if row is None:
+            raise NotFound(f"work order {order_id!r} was not found")
+        responses = await self._connection.fetch(
+            """
+            SELECT executor_id, status, responded_at
+            FROM pool_responses
+            WHERE organization_id = $1 AND work_order_id = $2
+            ORDER BY responded_at, executor_id
+            """,
+            organization_id,
+            order_id,
+        )
+        return _order_from_rows(row, responses)
+
+    async def get_for_read(
+        self, organization_id: str, order_id: str
+    ) -> WorkOrder:
+        row = await self._connection.fetchrow(
+            """
+            SELECT * FROM work_orders
+            WHERE organization_id = $1 AND id = $2
             """,
             organization_id,
             order_id,
@@ -317,8 +352,8 @@ class PostgresTrackingRepository:
                     """
                     INSERT INTO tracking_sessions (
                         organization_id, id, work_order_id, executor_id,
-                        status, version
-                    ) VALUES ($1, $2, $3, $4, $5, $6)
+                        status, version, created_at, updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                     ON CONFLICT (organization_id, id) DO NOTHING
                     """,
                     session.organization_id,
@@ -327,6 +362,8 @@ class PostgresTrackingRepository:
                     session.executor_id,
                     session.status.value,
                     session.version,
+                    session.created_at,
+                    session.updated_at,
                 )
                 if result != "INSERT 0 1":
                     raise ConcurrencyConflict(
@@ -339,8 +376,9 @@ class PostgresTrackingRepository:
                         work_order_id = $3,
                         executor_id = $4,
                         status = $5,
-                        version = $6
-                    WHERE organization_id = $1 AND id = $2 AND version = $7
+                        version = $6,
+                        updated_at = $7
+                    WHERE organization_id = $1 AND id = $2 AND version = $8
                     """,
                     session.organization_id,
                     session.id,
@@ -348,6 +386,7 @@ class PostgresTrackingRepository:
                     session.executor_id,
                     session.status.value,
                     session.version,
+                    session.updated_at,
                     expected_version,
                 )
                 if result != "UPDATE 1":
@@ -532,4 +571,6 @@ def _tracking_from_rows(
             for item in points
         ],
         version=row["version"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )

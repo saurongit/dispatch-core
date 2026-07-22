@@ -3,7 +3,7 @@
 ## Configuration
 
 Copy `.env.example` to `.env`. Generate independent random values for the
-PostgreSQL password, admin API key and webhook secrets. Use a URL-safe
+PostgreSQL password, admin API key and callback signing secret. Use a URL-safe
 alphanumeric/hex PostgreSQL password because Compose interpolates it into a
 connection URI. Do not reuse a bot token as a webhook or admin secret.
 
@@ -23,8 +23,17 @@ checks PostgreSQL.
 
 ## Register actors
 
-Find a Telegram/MAX external user ID by sending a message before registration;
-the bot returns the ID without executing a command. Bind it with the admin API:
+The normal messenger flow does not require copying an external ID. The
+implemented admin flow creates an operator and returns a short-lived four-digit
+code; the operator opens the correct Telegram role bot or the shared MAX staff
+bot, presses `/start` and enters it. From the operator workspace, the operator
+can create a master by entering a name and phone number; the master binds with
+the generated code through the Telegram master bot or the same MAX staff bot.
+A code is one-time, frontend-scoped and protected by a 15-minute/five-attempt
+input session. Retrying the final creation message reuses the same durable
+creation request and cannot create a duplicate master.
+
+The admin API remains useful for development fixtures:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/actors \
@@ -32,15 +41,15 @@ curl -X POST http://127.0.0.1:8080/v1/actors \
   -H 'Content-Type: application/json' \
   -d '{
     "actor_id": "executor-1",
-    "role": "executor",
+    "role": "master",
     "display_name": "Executor One",
     "provider": "telegram",
     "external_user_id": "123456789"
   }'
 ```
 
-Roles are `admin`, `coordinator`, `executor` and `requester`. The same internal
-actor may have separate Telegram and MAX identities by repeating the call.
+Roles are `admin`, `operator`, `master` and `client`. One actor may hold several
+explicit roles and separate Telegram/MAX bindings.
 
 ## Create a request
 
@@ -85,16 +94,30 @@ polling and webhooks cannot operate simultaneously.
 
 ## MAX
 
+The supported topology has exactly two logical MAX frontends per organisation:
+
+- `client`: the public client bot;
+- `staff`: one shared bot for admin, operator and master work.
+
+On `bot_started`/`/start`, the staff bot clears its previous mode and renders
+only the roles currently granted to that actor. Its worker consumes all staff
+role notifications but cannot claim the client queue. The sample Compose
+override runs both MAX bots in polling mode, so it needs no public callback
+endpoint and cannot mix their updates.
+
 The adapter uses `https://platform-api2.max.ru` and sends the bot token in the
-`Authorization` header. For production, publish
-`https://YOUR_DOMAIN/webhooks/max` on HTTPS port 443 and create the subscription:
+`Authorization` header. If a deployment chooses webhooks, publish a distinct
+public URL for each physical bot and route each URL to a frontend instance with
+the matching `client` or `staff` consumer key. Each instance exposes its own
+`/webhooks/max` handler on HTTPS port 443. Create each bot subscription with the
+corresponding URL and secret:
 
 ```bash
 curl -X POST https://platform-api2.max.ru/subscriptions \
   -H 'Authorization: YOUR_MAX_BOT_TOKEN' \
   -H 'Content-Type: application/json' \
   -d '{
-    "url": "https://YOUR_DOMAIN/webhooks/max",
+    "url": "https://MAX_CLIENT_OR_STAFF_DOMAIN/webhooks/max",
     "update_types": ["message_created", "message_callback", "bot_started"],
     "secret": "YOUR_MAX_WEBHOOK_SECRET"
   }'

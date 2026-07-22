@@ -41,7 +41,7 @@ def outbound(
     )
 
 
-@pytest.mark.parametrize("token", ["a", "abc_123", "x" * 48])
+@pytest.mark.parametrize("token", ["a", "abc_123", "x" * 38])
 def test_callback_codec_round_trip(token: str) -> None:
     encoded = encode_callback(token, signing_secret=_TEST_SECRET)
     assert decode_callback(encoded, signing_secret=_TEST_SECRET) == token
@@ -68,7 +68,7 @@ def test_callback_decoder_rejects_dc2_without_secret() -> None:
     assert decode_callback(encoded) is None
 
 
-@pytest.mark.parametrize("token", ["", "x" * 49])
+@pytest.mark.parametrize("token", ["", "x" * 39])
 def test_callback_encoder_rejects_invalid_length(token: str) -> None:
     with pytest.raises(ValueError, match="length"):
         encode_callback(token, signing_secret=_TEST_SECRET)

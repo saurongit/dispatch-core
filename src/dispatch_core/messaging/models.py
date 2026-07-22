@@ -18,6 +18,7 @@ class InboundEnvelope:
     external_event_id: str
     organization_id: str
     payload: dict[str, Any]
+    consumer_key: str = ""
     attempts: int = 0
 
     def __post_init__(self) -> None:
@@ -59,6 +60,7 @@ class OutboundEnvelope:
     text: str
     buttons: tuple[OutboundButton, ...] = ()
     attempts: int = 0
+    consumer_key: str = ""
 
 
 @dataclass(frozen=True, slots=True)

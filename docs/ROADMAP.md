@@ -8,31 +8,44 @@
 - PostgreSQL migrations, optimistic locking and race-preventing constraints;
 - durable inbox/cursors, transactional outbox and durable outbound queue;
 - Telegram and MAX polling/webhook transports, buttons, photos and locations;
+- durable, role-scoped `/start -> code` staff enrollment with expiry and an
+  attempt limit;
+- frontend-isolated inbox/cursors and the two-bot MAX topology with a durable
+  admin/operator/master selector in the shared staff bot;
+- operator/master workspaces with master creation, role-safe removal, active
+  order navigation and paired Telegram/MAX PostgreSQL E2E;
 - FastAPI command/configuration surface and health endpoints;
 - Docker Compose packaging and file-based provider secrets;
-- 470+ tests, live PostgreSQL race/E2E tests and a 90% branch-coverage gate.
+- 579 tests, including 37 live PostgreSQL race/E2E tests, and a 90% branch
+  coverage gate.
 
 This milestone is usable as an integration backend and a technical portfolio.
 It is not yet a self-service product for a non-technical dispatcher.
 
-## Next — one real pilot without a source-code fork
+## Next — messenger production parity without a source-code fork
 
-- small dispatcher web board: create, filter, inspect, assign and cancel;
-- configuration UI for actors, work types, fields and evidence requirements;
-- customer/requester intake as an optional API/web/bot module;
-- attachment object storage, retention settings and authorised download;
-- visible queue/dead-letter health, structured logs and basic metrics;
-- backup/restore command plus a tested recovery exercise;
-- invitation/onboarding flow instead of raw actor API calls;
-- release versioning, licence, threat model and operator runbook.
+The behavioural source of truth is `dez_core_dr`; `../ANCHOR.md` records the
+non-negotiable product contract. There is deliberately no dispatcher web board.
 
-Exit criterion: a small non-technical team runs real work for a week without
-editing YAML, environment variables or source code.
+- keep the now-green PostgreSQL integration suite mandatory in CI;
+- port curated pool preview/diagnostics, deliberate assignment, calls and chat
+  from `core_dr` into the implemented operator workspace;
+- port master travel/location/report flow and operator report approval/final
+  close;
+- port client tracking, chat, status and review flows;
+- support explicitly assigned multi-role actors and the nano onboarding preset;
+- add automatic card/button/FSM parity checks between Telegram and MAX;
+- add attachment storage, retention, queue health, backup and recovery checks.
 
-## Then — desktop and reusable packs
+Exit criterion: a non-technical team configures an IndustryPack in the admin
+bot and completes client -> operator -> master -> report -> operator close for a
+week without a web board, YAML edits or a source fork.
+
+## Then — packaging and reusable packs
 
 - durable local profile for an office PC or mini-PC;
-- tray/launcher installer and guided first-run wizard;
+- tray/launcher installer and guided first-run wizard that provisions messenger
+  frontends;
 - field service, local delivery, property and tourism starter packs;
 - route/customer status view with explicit retention and access policy;
 - signed, versioned connectivity bundle delivery with rollback;

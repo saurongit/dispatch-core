@@ -1,28 +1,96 @@
-services:
-  api:
-    environment:
-      DISPATCH_TELEGRAM_RECEIVE_MODE: ${TELEGRAM_RECEIVE_MODE:-polling}
-      DISPATCH_MAX_RECEIVE_MODE: ${MAX_RECEIVE_MODE:-webhook}
-      DISPATCH_TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
-      DISPATCH_MAX_BOT_TOKEN_FILE: /run/secrets/max_bot_token
-      DISPATCH_TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
-      DISPATCH_MAX_WEBHOOK_SECRET: ${MAX_WEBHOOK_SECRET:-}
-    secrets:
-      - telegram_bot_token
-      - max_bot_token
+x-worker-base: &worker-base
+  image: dispatch-core:local
+  restart: unless-stopped
+  command: ["dispatch-core-worker"]
+  depends_on:
+    postgres:
+      condition: service_healthy
+    api:
+      condition: service_started
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
 
+x-worker-environment: &worker-environment
+  DISPATCH_DATABASE_URL: postgresql://dispatch:${POSTGRES_PASSWORD}@postgres:5432/dispatch
+  DISPATCH_ADMIN_API_KEY: ${DISPATCH_ADMIN_API_KEY:?set a 32+ character key}
+  DISPATCH_ORGANIZATION_ID: ${DISPATCH_ORGANIZATION_ID:-default}
+  DISPATCH_ORGANIZATION_NAME: ${DISPATCH_ORGANIZATION_NAME:-Dispatch Core}
+  DISPATCH_CALLBACK_SIGNING_SECRET: ${CALLBACK_SIGNING_SECRET:?set a random callback signing secret}
+  DISPATCH_TELEGRAM_RECEIVE_MODE: disabled
+  DISPATCH_MAX_RECEIVE_MODE: disabled
+
+services:
+  # The base worker becomes the shared client frontend for both messengers.
   worker:
     environment:
-      DISPATCH_TELEGRAM_RECEIVE_MODE: ${TELEGRAM_RECEIVE_MODE:-polling}
-      DISPATCH_MAX_RECEIVE_MODE: ${MAX_RECEIVE_MODE:-webhook}
-      DISPATCH_TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
-      DISPATCH_MAX_BOT_TOKEN_FILE: /run/secrets/max_bot_token
+      <<: *worker-environment
+      DISPATCH_CONSUMER_KEY: client
+      DISPATCH_TELEGRAM_RECEIVE_MODE: polling
+      DISPATCH_TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_client_bot_token
+      DISPATCH_MAX_RECEIVE_MODE: polling
+      DISPATCH_MAX_BOT_TOKEN_FILE: /run/secrets/max_client_bot_token
     secrets:
-      - telegram_bot_token
-      - max_bot_token
+      - telegram_client_bot_token
+      - max_client_bot_token
+
+  # Telegram keeps separate role bots.
+  worker-telegram-operator:
+    <<: *worker-base
+    environment:
+      <<: *worker-environment
+      DISPATCH_CONSUMER_KEY: operator
+      DISPATCH_TELEGRAM_RECEIVE_MODE: polling
+      DISPATCH_TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_operator_bot_token
+    secrets:
+      - telegram_operator_bot_token
+
+  worker-telegram-master:
+    <<: *worker-base
+    environment:
+      <<: *worker-environment
+      DISPATCH_CONSUMER_KEY: master
+      DISPATCH_TELEGRAM_RECEIVE_MODE: polling
+      DISPATCH_TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_master_bot_token
+    secrets:
+      - telegram_master_bot_token
+
+  worker-telegram-admin:
+    <<: *worker-base
+    environment:
+      <<: *worker-environment
+      DISPATCH_CONSUMER_KEY: admin
+      DISPATCH_TELEGRAM_RECEIVE_MODE: polling
+      DISPATCH_TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_admin_bot_token
+    secrets:
+      - telegram_admin_bot_token
+
+  # MAX uses one second physical bot for every staff role. /start opens the
+  # explicit admin/operator/master selector; client traffic never enters it.
+  worker-max-staff:
+    <<: *worker-base
+    environment:
+      <<: *worker-environment
+      DISPATCH_CONSUMER_KEY: staff
+      DISPATCH_MAX_RECEIVE_MODE: polling
+      DISPATCH_MAX_BOT_TOKEN_FILE: /run/secrets/max_staff_bot_token
+    secrets:
+      - max_staff_bot_token
 
 secrets:
-  telegram_bot_token:
-    file: ./secrets/telegram_bot_token
-  max_bot_token:
-    file: ./secrets/max_bot_token
+  telegram_client_bot_token:
+    file: ./secrets/telegram_client_bot_token
+  telegram_operator_bot_token:
+    file: ./secrets/telegram_operator_bot_token
+  telegram_master_bot_token:
+    file: ./secrets/telegram_master_bot_token
+  telegram_admin_bot_token:
+    file: ./secrets/telegram_admin_bot_token
+  max_client_bot_token:
+    file: ./secrets/max_client_bot_token
+  max_staff_bot_token:
+    file: ./secrets/max_staff_bot_token

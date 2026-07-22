@@ -18,8 +18,10 @@ from dispatch_core.infrastructure.async_memory import (
 )
 from dispatch_core.infrastructure.read_models import AsyncMemoryOrderReader
 from dispatch_core.messaging.models import Provider
+from dispatch_core.transports.common import encode_executor_token
 
 ADMIN_KEY = "test-admin-key-that-is-at-least-32-characters"
+EXECUTOR_SECRET = "test-executor-token-signing-secret-32-chars!"
 
 
 @dataclass
@@ -61,6 +63,7 @@ async def api_client(
     max_secret: str | None = "max-webhook-secret",
     webhook_max_body_bytes: int = 1_048_576,
     environment: str = "production",
+    executor_token_secret: str | None = EXECUTOR_SECRET,
 ) -> AsyncIterator[tuple[httpx.AsyncClient, AsyncMemoryStore]]:
     store = AsyncMemoryStore()
     factory = AsyncMemoryUnitOfWorkFactory(store)
@@ -73,6 +76,7 @@ async def api_client(
         max_webhook_secret=max_secret,
         webhook_max_body_bytes=webhook_max_body_bytes,
         environment=environment,
+        executor_token_secret=executor_token_secret,
     )
     app = create_app(
         settings,
@@ -95,6 +99,13 @@ def auth_headers(*, idempotency_key: str | None = None) -> dict[str, str]:
     if idempotency_key is not None:
         headers["Idempotency-Key"] = idempotency_key
     return headers
+
+
+def executor_headers(organization_id: str, actor_id: str) -> dict[str, str]:
+    token, _ = encode_executor_token(
+        organization_id, actor_id, signing_secret=EXECUTOR_SECRET
+    )
+    return {"Authorization": f"Bearer {token}"}
 
 
 def order_body(**overrides: Any) -> dict[str, Any]:
@@ -134,8 +145,7 @@ async def test_health_endpoints_are_public_and_ready_when_injected() -> None:
 
 
 @pytest.mark.asyncio
-async def test_schema_endpoints_are_hidden_in_production_and_visible_in_development(
-) -> None:
+async def test_schema_endpoints_visibility_depends_on_environment() -> None:
     async with api_client() as (client, _):
         production = await client.get("/openapi.json")
     async with api_client(environment="development") as (client, _):
@@ -166,9 +176,7 @@ async def test_create_and_read_order() -> None:
     async with api_client() as (client, _):
         created = await create_order(client)
         order_id = created.json()["id"]
-        fetched = await client.get(
-            f"/v1/orders/{order_id}", headers=auth_headers()
-        )
+        fetched = await client.get(f"/v1/orders/{order_id}", headers=auth_headers())
     assert created.status_code == 201
     assert created.json()["status"] == "submitted"
     assert created.json()["details"]["asset"] == "lift-42"
@@ -196,9 +204,7 @@ async def test_create_retry_returns_same_order_without_second_event() -> None:
     assert second.status_code == 201
     assert first.json()["id"] == second.json()["id"]
     assert len(store.orders) == 1
-    assert [event.name for event in store.outbox_events] == [
-        "work_order.submitted"
-    ]
+    assert [event.name for event in store.outbox_events] == ["work_order.submitted"]
 
 
 @pytest.mark.asyncio
@@ -217,9 +223,7 @@ async def test_idempotency_key_cannot_be_reused_for_different_body() -> None:
 @pytest.mark.asyncio
 async def test_unknown_order_returns_404() -> None:
     async with api_client() as (client, _):
-        response = await client.get(
-            "/v1/orders/unknown", headers=auth_headers()
-        )
+        response = await client.get("/v1/orders/unknown", headers=auth_headers())
     assert response.status_code == 404
 
 
@@ -232,7 +236,7 @@ async def test_admin_can_bind_actor_to_messenger_identity() -> None:
             headers=auth_headers(),
             json={
                 "actor_id": "executor-1",
-                "role": "executor",
+                "role": "master",
                 "display_name": "Executor One",
                 "provider": "telegram",
                 "external_user_id": "7001",
@@ -244,7 +248,7 @@ async def test_admin_can_bind_actor_to_messenger_identity() -> None:
         {
             "organization_id": "org-1",
             "actor_id": "executor-1",
-            "role": "executor",
+            "role": "master",
             "display_name": "Executor One",
             "provider": Provider.TELEGRAM,
             "external_user_id": "7001",
@@ -257,13 +261,13 @@ async def test_admin_can_bind_actor_to_messenger_identity() -> None:
     [
         {
             "actor_id": "executor-1",
-            "role": "executor",
+            "role": "master",
             "display_name": "Executor",
             "provider": "telegram",
         },
         {
             "actor_id": "executor-1",
-            "role": "executor",
+            "role": "master",
             "display_name": "Executor",
             "external_user_id": "7001",
         },
@@ -316,7 +320,7 @@ async def test_full_curated_api_flow_with_tracking_and_evidence() -> None:
         )
         location = await client.post(
             "/v1/tracking/track-1/points",
-            headers=auth_headers(),
+            headers=executor_headers("org-1", "executor-2"),
             json={
                 "latitude": 53.75,
                 "longitude": 87.1,
@@ -341,6 +345,7 @@ async def test_full_curated_api_flow_with_tracking_and_evidence() -> None:
 
     assert travel.status_code == 200
     assert travel.json()["tracking_session_id"] == "track-1"
+    assert location.status_code == 200, location.json()
     assert location.json()["point_count"] == 1
     assert started.json()["status"] == "in_progress"
     assert completed.status_code == 200
@@ -371,9 +376,7 @@ async def test_first_claim_api_race_has_exactly_one_winner() -> None:
             claim("executor-1"),
             claim("executor-2"),
         )
-        fetched = await client.get(
-            f"/v1/orders/{order_id}", headers=auth_headers()
-        )
+        fetched = await client.get(f"/v1/orders/{order_id}", headers=auth_headers())
 
     assert sorted(response.status_code for response in responses) == [200, 409]
     assert fetched.json()["assignee_id"] in {"executor-1", "executor-2"}
@@ -421,9 +424,7 @@ async def test_completion_validation_does_not_change_state() -> None:
             headers=auth_headers(),
             json={"executor_id": "executor-1"},
         )
-        fetched = await client.get(
-            f"/v1/orders/{order_id}", headers=auth_headers()
-        )
+        fetched = await client.get(f"/v1/orders/{order_id}", headers=auth_headers())
     assert failed.status_code == 409
     assert fetched.json()["status"] == "in_progress"
 
@@ -463,6 +464,7 @@ async def test_webhook_persists_raw_event_before_processing(
             "external_event_id": f"{provider.value}:77",
             "organization_id": "org-1",
             "payload": {"update_id": 77, "message": {"text": "hello"}},
+            "consumer_key": "",
         }
     ]
     assert transport.closed
@@ -479,9 +481,7 @@ async def test_telegram_webhook_rejects_invalid_secret(
     inbox = FakeInbox()
     async with api_client(
         inbox=inbox,
-        transports={
-            Provider.TELEGRAM: FakeTransport(Provider.TELEGRAM)
-        },
+        transports={Provider.TELEGRAM: FakeTransport(Provider.TELEGRAM)},
     ) as (client, _):
         response = await client.post(
             "/webhooks/telegram",
@@ -497,9 +497,7 @@ async def test_disabled_webhook_is_not_discoverable() -> None:
     async with api_client() as (client, _):
         response = await client.post(
             "/webhooks/telegram",
-            headers={
-                "X-Telegram-Bot-Api-Secret-Token": "telegram-webhook-secret"
-            },
+            headers={"X-Telegram-Bot-Api-Secret-Token": "telegram-webhook-secret"},
             json={"update_id": 1},
         )
     assert response.status_code == 404
@@ -509,15 +507,11 @@ async def test_disabled_webhook_is_not_discoverable() -> None:
 async def test_webhook_rejects_non_object_json() -> None:
     async with api_client(
         inbox=FakeInbox(),
-        transports={
-            Provider.TELEGRAM: FakeTransport(Provider.TELEGRAM)
-        },
+        transports={Provider.TELEGRAM: FakeTransport(Provider.TELEGRAM)},
     ) as (client, _):
         response = await client.post(
             "/webhooks/telegram",
-            headers={
-                "X-Telegram-Bot-Api-Secret-Token": "telegram-webhook-secret"
-            },
+            headers={"X-Telegram-Bot-Api-Secret-Token": "telegram-webhook-secret"},
             json=[1, 2, 3],
         )
     assert response.status_code == 400
@@ -589,3 +583,97 @@ async def test_webhook_requires_configured_provider_secret() -> None:
             json={"update_id": 1},
         )
     assert response.status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# Executor auth negative tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tracking_rejects_missing_executor_token() -> None:
+    async with api_client() as (client, _):
+        response = await client.post(
+            "/v1/tracking/track-1/points",
+            json={
+                "latitude": 55.0,
+                "longitude": 37.0,
+                "source": "telegram",
+            },
+        )
+    assert response.status_code == 401
+    assert "Bearer" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_tracking_rejects_invalid_executor_token() -> None:
+    async with api_client() as (client, _):
+        response = await client.post(
+            "/v1/tracking/track-1/points",
+            headers={"Authorization": "Bearer dt1:org-1:ivan:9999999999:bad"},
+            json={
+                "latitude": 55.0,
+                "longitude": 37.0,
+                "source": "telegram",
+            },
+        )
+    assert response.status_code == 401
+    assert "Invalid" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_tracking_rejects_token_with_wrong_secret() -> None:
+    other_token, _ = encode_executor_token(
+        "org-1", "ivan-7", signing_secret="wrong-secret-32-chars-long!!!!!"
+    )
+    async with api_client() as (client, _):
+        response = await client.post(
+            "/v1/tracking/track-1/points",
+            headers={"Authorization": f"Bearer {other_token}"},
+            json={
+                "latitude": 55.0,
+                "longitude": 37.0,
+                "source": "telegram",
+            },
+        )
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_tracking_rejects_token_for_wrong_org() -> None:
+    token, _ = encode_executor_token(
+        "other-org", "executor-2", signing_secret=EXECUTOR_SECRET
+    )
+    async with api_client() as (client, _):
+        response = await client.post(
+            "/v1/tracking/track-1/points",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "latitude": 55.0,
+                "longitude": 37.0,
+                "source": "telegram",
+            },
+        )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_executor_token_endpoint_requires_admin_auth() -> None:
+    async with api_client() as (client, _):
+        response = await client.post(
+            "/v1/auth/executor-token",
+            json={"actor_id": "ivan-7"},
+        )
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_executor_token_endpoint_rejects_missing_secret() -> None:
+    async with api_client(executor_token_secret=None) as (client, _):
+        response = await client.post(
+            "/v1/auth/executor-token",
+            headers=auth_headers(),
+            json={"actor_id": "ivan-7"},
+        )
+    assert response.status_code == 503
+    assert "not configured" in response.json()["detail"]

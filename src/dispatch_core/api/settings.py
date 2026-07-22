@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -35,6 +38,9 @@ class Settings(BaseSettings):
     max_receive_mode: Literal["disabled", "polling", "webhook"] = "disabled"
     max_proxy: SecretStr | None = None
     callback_signing_secret: SecretStr | None = None
+    executor_token_secret: SecretStr | None = None
+    executor_token_ttl_seconds: int = 3600
+    consumer_key: str = ""
     worker_idle_seconds: float = Field(default=0.25, ge=0.05, le=10)
     api_host: str = "0.0.0.0"
     api_port: int = Field(default=8080, ge=1, le=65535)
@@ -64,4 +70,14 @@ class Settings(BaseSettings):
                 secret is None or not secret.get_secret_value().strip()
             ):
                 raise ValueError(f"{provider} webhook mode requires a secret")
+        if self.callback_signing_secret is None:
+            logger.warning(
+                "callback_signing_secret is not set — dc2 callback tokens "
+                "will be rejected at runtime"
+            )
+        if self.executor_token_secret is None:
+            logger.warning(
+                "executor_token_secret is not set — executor auth tokens "
+                "cannot be issued or verified"
+            )
         return self

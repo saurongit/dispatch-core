@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import secrets
+import time
+from collections import defaultdict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -12,6 +15,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
 from dispatch_core.application.async_service import AsyncDispatchService
+from dispatch_core.application.identity import ActorIdentity
 from dispatch_core.domain.errors import (
     ConcurrencyConflict,
     DomainError,
@@ -26,6 +30,10 @@ from dispatch_core.infrastructure.postgres import (
 from dispatch_core.infrastructure.read_models import OrderReader, PostgresOrderReader
 from dispatch_core.infrastructure.workflow_store import PostgresIdentityStore
 from dispatch_core.messaging.models import Provider
+from dispatch_core.transports.common import (
+    decode_executor_token,
+    encode_executor_token,
+)
 from dispatch_core.transports.contracts import Transport
 
 from .schemas import (
@@ -36,6 +44,8 @@ from .schemas import (
     CancelInput,
     CompleteInput,
     CreateOrderInput,
+    ExecutorTokenRequest,
+    ExecutorTokenResponse,
     LocationInput,
     LocationRecordedResponse,
     PublishPoolInput,
@@ -44,6 +54,13 @@ from .schemas import (
     WorkOrderResponse,
 )
 from .settings import Settings
+
+logger = logging.getLogger(__name__)
+
+_AUTH_ATTEMPTS: dict[str, list[float]] = defaultdict(list)
+_AUTH_WINDOW = 60.0
+_AUTH_MAX_ATTEMPTS = 10
+_AUTH_SWEEPCounter: int = 0
 
 
 def create_app(
@@ -86,9 +103,7 @@ def create_app(
                     resolved_settings.organization_id,
                     resolved_settings.organization_name,
                 )
-            service = AsyncDispatchService(
-                PostgresUnitOfWorkFactory(database.pool)
-            )
+            service = AsyncDispatchService(PostgresUnitOfWorkFactory(database.pool))
             reader = PostgresOrderReader(database.pool)
             inbox = PostgresInboxStore(database.pool)
             identities = PostgresIdentityStore(database.pool)
@@ -138,25 +153,113 @@ def create_app(
     ) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
 
-    async def authenticate(authorization: str | None = Header(default=None)) -> None:
+    async def authenticate(
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> None:
+        global _AUTH_SWEEPCounter
+        client_ip = request.client.host if request.client else "unknown"
+        now = time.monotonic()
+        _AUTH_ATTEMPTS[client_ip] = [
+            t for t in _AUTH_ATTEMPTS[client_ip] if now - t < _AUTH_WINDOW
+        ]
+        if not _AUTH_ATTEMPTS[client_ip]:
+            _AUTH_ATTEMPTS.pop(client_ip, None)
+        _AUTH_SWEEPCounter += 1
+        if _AUTH_SWEEPCounter % 100 == 0:
+            stale = [
+                ip
+                for ip, timestamps in _AUTH_ATTEMPTS.items()
+                if not timestamps or now - timestamps[-1] >= _AUTH_WINDOW
+            ]
+            for ip in stale:
+                _AUTH_ATTEMPTS.pop(ip, None)
+        if len(_AUTH_ATTEMPTS[client_ip]) >= _AUTH_MAX_ATTEMPTS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many authentication attempts",
+            )
         expected = resolved_settings.admin_api_key.get_secret_value()
         prefix = "Bearer "
         if authorization is None or not authorization.startswith(prefix):
+            _AUTH_ATTEMPTS[client_ip].append(now)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Bearer authentication required",
             )
         if not secrets.compare_digest(authorization.removeprefix(prefix), expected):
+            _AUTH_ATTEMPTS[client_ip].append(now)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid API key",
             )
+        _AUTH_ATTEMPTS.pop(client_ip, None)
+
+    async def authenticate_executor(
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> ActorIdentity:
+        global _AUTH_SWEEPCounter
+        client_ip = request.client.host if request.client else "unknown"
+        now = time.monotonic()
+        _AUTH_ATTEMPTS[client_ip] = [
+            t for t in _AUTH_ATTEMPTS[client_ip] if now - t < _AUTH_WINDOW
+        ]
+        if not _AUTH_ATTEMPTS[client_ip]:
+            _AUTH_ATTEMPTS.pop(client_ip, None)
+        if len(_AUTH_ATTEMPTS[client_ip]) >= _AUTH_MAX_ATTEMPTS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many authentication attempts",
+            )
+        signing = resolved_settings.executor_token_secret
+        if signing is None:
+            raise HTTPException(status_code=503, detail="Executor auth not configured")
+        prefix = "Bearer "
+        if authorization is None or not authorization.startswith(prefix):
+            _AUTH_ATTEMPTS[client_ip].append(now)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Bearer authentication required",
+            )
+        token = authorization.removeprefix(prefix)
+        result = decode_executor_token(token, signing_secret=signing.get_secret_value())
+        if result is None:
+            _AUTH_ATTEMPTS[client_ip].append(now)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired executor token",
+            )
+        org_id, actor_id = result
+        identities = get_identities(request)
+        if identities is not None:
+            identity = await identities.resolve(
+                organization_id=org_id,
+                provider=Provider.TELEGRAM,
+                external_user_id=actor_id,
+            )
+        else:
+            identity = None
+        if identity is None:
+            identity = ActorIdentity(
+                organization_id=org_id,
+                actor_id=actor_id,
+                role="master",
+                display_name=actor_id,
+                provider=Provider.TELEGRAM,
+                external_user_id=actor_id,
+            )
+        _AUTH_ATTEMPTS.pop(client_ip, None)
+        return identity
 
     def get_service(request: Request) -> AsyncDispatchService:
         value = request.app.state.service
         if value is None:
             raise HTTPException(status_code=503, detail="Service is not ready")
         return value
+
+    def get_identities(request: Request) -> PostgresIdentityStore | None:
+        return getattr(request.app.state, "identities", None)
 
     def get_reader(request: Request) -> OrderReader:
         value = request.app.state.reader
@@ -206,7 +309,9 @@ def create_app(
                 source=body.source,
                 details=body.details,
                 requester_id=body.requester_id,
-                evidence_requirements=EvidenceRequirements(**body.evidence.model_dump()),
+                evidence_requirements=EvidenceRequirements(
+                    **body.evidence.model_dump()
+                ),
             )
         except ConcurrencyConflict:
             order = await get_reader(request).get(
@@ -233,6 +338,30 @@ def create_app(
             resolved_settings.organization_id, order_id
         )
         return WorkOrderResponse.from_domain(order)
+
+    @app.post(
+        "/v1/auth/executor-token",
+        response_model=ExecutorTokenResponse,
+        tags=["auth"],
+    )
+    async def create_executor_token(
+        body: ExecutorTokenRequest,
+        request: Request,
+        _authenticated: None = Depends(authenticate),
+    ) -> ExecutorTokenResponse:
+        signing = resolved_settings.executor_token_secret
+        if signing is None:
+            raise HTTPException(
+                status_code=503,
+                detail="executor_token_secret is not configured",
+            )
+        token, expires_at = encode_executor_token(
+            resolved_settings.organization_id,
+            body.actor_id,
+            signing_secret=signing.get_secret_value(),
+            ttl_seconds=resolved_settings.executor_token_ttl_seconds,
+        )
+        return ExecutorTokenResponse(token=token, expires_at=expires_at)
 
     @app.post(
         "/v1/actors",
@@ -382,10 +511,11 @@ def create_app(
         session_id: str,
         body: LocationInput,
         request: Request,
-        _authenticated: None = Depends(authenticate),
+        identity: ActorIdentity = Depends(authenticate_executor),  # noqa: B008
     ) -> LocationRecordedResponse:
         tracking = await get_service(request).record_location(
-            organization_id=resolved_settings.organization_id,
+            organization_id=identity.organization_id,
+            executor_id=identity.actor_id,
             session_id=session_id,
             latitude=body.latitude,
             longitude=body.longitude,
@@ -475,6 +605,7 @@ def create_app(
             external_event_id=transport.external_event_id(payload),
             organization_id=resolved_settings.organization_id,
             payload=payload,
+            consumer_key=resolved_settings.consumer_key,
         )
         return {"ok": True}
 
@@ -495,9 +626,7 @@ def _verify_webhook_secret(
     if expected_secret is None:
         raise HTTPException(status_code=503, detail="Webhook secret is not configured")
     provided = request.headers.get(header, "")
-    if not secrets.compare_digest(
-        provided, expected_secret.get_secret_value()
-    ):
+    if not secrets.compare_digest(provided, expected_secret.get_secret_value()):
         raise HTTPException(status_code=403, detail="Forbidden")
 
 

@@ -65,19 +65,24 @@ class PostgresInboxStore:
         external_event_id: str,
         organization_id: str,
         payload: dict[str, Any],
+        consumer_key: str = "",
     ) -> bool:
         async with self._pool.acquire() as connection:
             result = await connection.execute(
                 """
                 INSERT INTO inbox_events (
-                    provider, external_event_id, organization_id, payload
-                ) VALUES ($1, $2, $3, $4::jsonb)
-                ON CONFLICT (provider, external_event_id) DO NOTHING
+                    provider, external_event_id, organization_id, payload,
+                    consumer_key
+                ) VALUES ($1, $2, $3, $4::jsonb, $5)
+                ON CONFLICT (
+                    organization_id, provider, consumer_key, external_event_id
+                ) DO NOTHING
                 """,
                 provider.value,
                 external_event_id,
                 organization_id,
                 _json_text(payload),
+                consumer_key,
             )
         return result == "INSERT 0 1"
 
@@ -87,6 +92,7 @@ class PostgresInboxStore:
         provider: Provider,
         organization_id: str,
         consumer_key: str,
+        cursor_key: str | None = None,
         events: Sequence[tuple[str, dict[str, Any]]],
         next_cursor: str,
     ) -> int:
@@ -98,14 +104,19 @@ class PostgresInboxStore:
                     result = await connection.execute(
                         """
                         INSERT INTO inbox_events (
-                            provider, external_event_id, organization_id, payload
-                        ) VALUES ($1, $2, $3, $4::jsonb)
-                        ON CONFLICT (provider, external_event_id) DO NOTHING
+                            provider, external_event_id, organization_id, payload,
+                            consumer_key
+                        ) VALUES ($1, $2, $3, $4::jsonb, $5)
+                        ON CONFLICT (
+                            organization_id, provider, consumer_key,
+                            external_event_id
+                        ) DO NOTHING
                         """,
                         provider.value,
                         external_event_id,
                         organization_id,
                         _json_text(payload),
+                        consumer_key,
                     )
                     inserted += int(result == "INSERT 0 1")
                 await connection.execute(
@@ -118,14 +129,12 @@ class PostgresInboxStore:
                         updated_at = EXCLUDED.updated_at
                     """,
                     provider.value,
-                    consumer_key,
+                    cursor_key or consumer_key,
                     next_cursor,
                 )
         return inserted
 
-    async def get_cursor(
-        self, provider: Provider, consumer_key: str
-    ) -> str | None:
+    async def get_cursor(self, provider: Provider, consumer_key: str) -> str | None:
         async with self._pool.acquire() as connection:
             return await connection.fetchval(
                 """
@@ -139,6 +148,8 @@ class PostgresInboxStore:
     async def claim(
         self,
         *,
+        organization_id: str | None = None,
+        consumer_key: str = "",
         limit: int = 50,
         stale_after_seconds: int = 120,
     ) -> tuple[InboundEnvelope, ...]:
@@ -149,14 +160,21 @@ class PostgresInboxStore:
                 rows = await connection.fetch(
                     """
                     WITH candidates AS (
-                        SELECT provider, external_event_id
+                        SELECT organization_id, provider, consumer_key,
+                               external_event_id
                         FROM inbox_events
-                        WHERE (
-                            status = 'pending' AND next_attempt_at <= now()
-                        ) OR (
-                            status = 'processing'
-                            AND claimed_at < now() - make_interval(secs => $2)
-                        )
+                        WHERE consumer_key = $3
+                          AND ($4::text IS NULL OR organization_id = $4)
+                          AND (
+                              (
+                                  status = 'pending'
+                                  AND next_attempt_at <= now()
+                              ) OR (
+                                  status = 'processing'
+                                  AND claimed_at
+                                      < now() - make_interval(secs => $2)
+                              )
+                          )
                         ORDER BY received_at, provider, external_event_id
                         FOR UPDATE SKIP LOCKED
                         LIMIT $1
@@ -167,12 +185,16 @@ class PostgresInboxStore:
                         claimed_at = now(),
                         last_error = NULL
                     FROM candidates
-                    WHERE item.provider = candidates.provider
+                    WHERE item.organization_id = candidates.organization_id
+                      AND item.provider = candidates.provider
+                      AND item.consumer_key = candidates.consumer_key
                       AND item.external_event_id = candidates.external_event_id
                     RETURNING item.*
                     """,
                     limit,
                     stale_after_seconds,
+                    consumer_key,
+                    organization_id,
                 )
         return tuple(
             InboundEnvelope(
@@ -180,6 +202,7 @@ class PostgresInboxStore:
                 external_event_id=row["external_event_id"],
                 organization_id=row["organization_id"],
                 payload=_json_value(row["payload"]),
+                consumer_key=row["consumer_key"],
                 attempts=row["attempts"],
             )
             for row in rows
@@ -192,10 +215,13 @@ class PostgresInboxStore:
                 UPDATE inbox_events SET
                     status = 'processed', processed_at = now(), claimed_at = NULL
                 WHERE provider = $1 AND external_event_id = $2
+                  AND organization_id = $3 AND consumer_key = $4
                   AND status = 'processing'
                 """,
                 item.provider.value,
                 item.external_event_id,
+                item.organization_id,
+                item.consumer_key,
             )
 
     async def mark_failed(
@@ -216,6 +242,7 @@ class PostgresInboxStore:
                     claimed_at = NULL,
                     last_error = $5
                 WHERE provider = $1 AND external_event_id = $2
+                  AND organization_id = $6 AND consumer_key = $7
                   AND status = 'processing'
                 """,
                 item.provider.value,
@@ -223,6 +250,8 @@ class PostgresInboxStore:
                 "dead" if is_dead else "pending",
                 delay,
                 error[:2000],
+                item.organization_id,
+                item.consumer_key,
             )
 
 
@@ -332,6 +361,7 @@ class PostgresOutboundStore:
         recipient_id: str,
         text: str,
         buttons: Sequence[OutboundButton] = (),
+        consumer_key: str = "",
     ) -> bool:
         encoded_buttons = [_button_to_dict(button) for button in buttons]
         async with self._pool.acquire() as connection:
@@ -339,8 +369,8 @@ class PostgresOutboundStore:
                 """
                 INSERT INTO outbound_messages (
                     deduplication_key, organization_id, provider,
-                    recipient_id, text_body, buttons
-                ) VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                    recipient_id, text_body, buttons, consumer_key
+                ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
                 ON CONFLICT (deduplication_key) DO NOTHING
                 """,
                 deduplication_key,
@@ -349,6 +379,7 @@ class PostgresOutboundStore:
                 recipient_id,
                 text,
                 _json_text(encoded_buttons),
+                consumer_key,
             )
         return result == "INSERT 0 1"
 
@@ -356,11 +387,16 @@ class PostgresOutboundStore:
         self,
         provider: Provider,
         *,
+        consumer_key: str = "",
+        consumer_keys: Sequence[str] | None = None,
         limit: int = 50,
         stale_after_seconds: int = 120,
     ) -> tuple[OutboundEnvelope, ...]:
         if not 1 <= limit <= 1000:
             raise ValueError("claim limit must be between 1 and 1000")
+        routed_consumer_keys = tuple(dict.fromkeys(consumer_keys or (consumer_key,)))
+        if not routed_consumer_keys:
+            raise ValueError("at least one outbound consumer key is required")
         async with self._pool.acquire() as connection:
             async with connection.transaction():
                 rows = await connection.fetch(
@@ -368,7 +404,8 @@ class PostgresOutboundStore:
                     WITH candidates AS (
                         SELECT id
                         FROM outbound_messages
-                        WHERE provider = $1 AND (
+                        WHERE provider = $1
+                          AND consumer_key = ANY($4::text[]) AND (
                             (status = 'pending' AND next_attempt_at <= now())
                             OR (
                                 status = 'processing'
@@ -391,6 +428,7 @@ class PostgresOutboundStore:
                     provider.value,
                     limit,
                     stale_after_seconds,
+                    list(routed_consumer_keys),
                 )
         return tuple(_outbound_from_row(row) for row in rows)
 
@@ -484,7 +522,7 @@ class PostgresCallbackStore:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
                 """
-                SELECT * FROM callback_actions
+                UPDATE callback_actions SET revoked_at = now()
                 WHERE token = $1
                   AND organization_id = $2
                   AND revoked_at IS NULL
@@ -494,6 +532,7 @@ class PostgresCallbackStore:
                       OR allowed_role = $3
                       OR $3 = 'admin'
                   )
+                RETURNING *
                 """,
                 token,
                 organization_id,
@@ -509,6 +548,25 @@ class PostgresCallbackStore:
             allowed_role=row["allowed_role"],
             expires_at=row["expires_at"],
         )
+
+    async def peek_action(
+        self,
+        *,
+        token: str,
+        organization_id: str,
+    ) -> str | None:
+        """Identify a callback route without authorizing or consuming it."""
+        async with self._pool.acquire() as connection:
+            action = await connection.fetchval(
+                """
+                SELECT action FROM callback_actions
+                WHERE token = $1 AND organization_id = $2
+                  AND revoked_at IS NULL AND expires_at > now()
+                """,
+                token,
+                organization_id,
+            )
+        return str(action) if action is not None else None
 
 
 def _json_text(value: Any) -> str:
@@ -540,4 +598,5 @@ def _outbound_from_row(row: asyncpg.Record) -> OutboundEnvelope:
         text=row["text_body"],
         buttons=tuple(OutboundButton(**item) for item in buttons_data),
         attempts=row["attempts"],
+        consumer_key=row.get("consumer_key") or "",
     )

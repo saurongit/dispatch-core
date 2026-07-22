@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, TypedDict
 
 from dispatch_core.application.async_service import AsyncDispatchService
 from dispatch_core.application.identity import ActorIdentity
+from dispatch_core.infrastructure.messaging import PostgresOutboundStore
 from dispatch_core.infrastructure.pack_store import PostgresPackStore
-from dispatch_core.infrastructure.workflow_store import PostgresIntakeSessionStore
+from dispatch_core.infrastructure.workflow_store import (
+    PostgresIdentityStore,
+    PostgresIntakeSessionStore,
+)
 from dispatch_core.messaging.cards import CardRenderer
 from dispatch_core.messaging.replies import Reply, ReplyButton
 from dispatch_core.packs.catalog import PackDefinition
+
+logger = logging.getLogger(__name__)
 
 INTAKE_PICK_SERVICE = "intake_pick_service"
 INTAKE_SERVICES_DONE = "intake_services_done"
@@ -18,28 +25,40 @@ INTAKE_ACTIONS = frozenset(
     {INTAKE_PICK_SERVICE, INTAKE_SERVICES_DONE, INTAKE_CONFIRM, INTAKE_CANCEL}
 )
 
-_CANCEL_BUTTON = ReplyButton("Отмена", INTAKE_CANCEL, {}, "requester")
+_CANCEL_BUTTON = ReplyButton("Отмена", INTAKE_CANCEL, {}, "client")
+
+
+class _PhoneState(TypedDict, total=False):
+    step: str  # "phone"
+
+
+class _AddressState(TypedDict, total=False):
+    step: str  # "address"
+    field_values: dict[str, str]
 
 
 class _ServicesState(TypedDict, total=False):
-    step: str  # literal "services"
+    step: str  # "services"
+    field_values: dict[str, str]
     selected: list[str]
 
 
 class _FieldsState(TypedDict, total=False):
-    step: str  # literal "fields"
+    step: str  # "fields"
     selected: list[str]
     field_index: int
     field_values: dict[str, str]
 
 
 class _ConfirmState(TypedDict, total=False):
-    step: str  # literal "confirm"
+    step: str  # "confirm"
     selected: list[str]
     field_values: dict[str, str]
 
 
-IntakeState = _ServicesState | _FieldsState | _ConfirmState
+IntakeState = (
+    _PhoneState | _AddressState | _ServicesState | _FieldsState | _ConfirmState
+)
 
 
 class IntakeCoordinator:
@@ -51,22 +70,22 @@ class IntakeCoordinator:
         packs: PostgresPackStore,
         sessions: PostgresIntakeSessionStore,
         service: AsyncDispatchService,
+        outbound: PostgresOutboundStore | None = None,
+        identities: PostgresIdentityStore | None = None,
     ) -> None:
         self._packs = packs
         self._sessions = sessions
         self._service = service
+        self._outbound = outbound
+        self._identities = identities
 
     async def start(self, identity: ActorIdentity) -> Reply:
         pack = await self._packs.active(identity.organization_id)
         if pack is None:
             return Reply(_NOT_CONFIGURED)
-        state = {"step": "services", "selected": [], "field_values": {}}
+        state: dict[str, Any] = {"step": "phone", "field_values": {}}
         await self._save(identity, state)
-        renderer = CardRenderer(pack)
-        return Reply(
-            renderer.greeting(),
-            buttons=_service_buttons(pack, ()),
-        )
+        return Reply("Введите ваш телефон:", buttons=(_CANCEL_BUTTON,))
 
     async def handle_text(self, identity: ActorIdentity, text: str) -> Reply:
         state = await self._sessions.get(
@@ -78,11 +97,15 @@ class IntakeCoordinator:
         if pack is None:
             return Reply(_NOT_CONFIGURED)
         step = state.get("step")
+        if step == "phone":
+            return await self._fill_phone(identity, pack, state, text)
+        if step == "address":
+            return await self._fill_address(identity, pack, state, text)
         if step == "fields":
             return await self._fill_field(identity, pack, state, text)
         if step == "confirm":
             return Reply(
-                "Нажмите «Подтвердить» или «Отмена».",
+                "Нажмите «Отправить» или «Отмена».",
                 buttons=_confirm_buttons(),
             )
         return Reply(
@@ -130,6 +153,51 @@ class IntakeCoordinator:
             return await self._confirm(identity, pack, state)
         return Reply("Неизвестное действие.")
 
+    # -- hardcoded phone / address ----------------------------------------
+
+    async def _fill_phone(
+        self,
+        identity: ActorIdentity,
+        pack: PackDefinition,
+        state: dict[str, Any],
+        text: str,
+    ) -> Reply:
+        value = text.strip()[:500]
+        if not value or len(value.replace(" ", "").replace("-", "")) < 7:
+            return Reply(
+                "Введите корректный номер телефона (минимум 7 цифр):",
+                buttons=(_CANCEL_BUTTON,),
+            )
+        state.setdefault("field_values", {})["phone"] = value
+        state["step"] = "address"
+        await self._save(identity, state)
+        return Reply("Введите адрес объекта:", buttons=(_CANCEL_BUTTON,))
+
+    async def _fill_address(
+        self,
+        identity: ActorIdentity,
+        pack: PackDefinition,
+        state: dict[str, Any],
+        text: str,
+    ) -> Reply:
+        value = text.strip()[:500]
+        if not value or len(value) < 5:
+            return Reply(
+                "Введите адрес подробнее (минимум 5 символов):",
+                buttons=(_CANCEL_BUTTON,),
+            )
+        state.setdefault("field_values", {})["address"] = value
+        state["step"] = "services"
+        state.setdefault("selected", [])
+        await self._save(identity, state)
+        renderer = CardRenderer(pack)
+        return Reply(
+            renderer.greeting(),
+            buttons=_service_buttons(pack, ()),
+        )
+
+    # -- services / fields / confirm --------------------------------------
+
     async def _pick_service(
         self,
         identity: ActorIdentity,
@@ -169,13 +237,20 @@ class IntakeCoordinator:
                 buttons=_service_buttons(pack, selected),
             )
         state["step"] = "fields"
-        state["field_index"] = 0
         state.setdefault("field_values", {})
         fields = pack.ordered_fields()
+        start = 0
+        for i, f in enumerate(fields):
+            if f.key not in state["field_values"]:
+                start = i
+                break
+        else:
+            return await self._to_confirmation(identity, pack, state)
+        state["field_index"] = start
         if not fields:
             return await self._to_confirmation(identity, pack, state)
         await self._save(identity, state)
-        return _ask_field(fields[0])
+        return _ask_field(fields[start])
 
     async def _fill_field(
         self,
@@ -185,7 +260,10 @@ class IntakeCoordinator:
         text: str,
     ) -> Reply:
         fields = pack.ordered_fields()
-        index = int(state.get("field_index", 0))
+        try:
+            index = int(state.get("field_index", 0))
+        except (ValueError, TypeError):
+            return await self._to_confirmation(identity, pack, state)
         if index < 0 or index >= len(fields):
             return await self._to_confirmation(identity, pack, state)
         definition = fields[index]
@@ -200,6 +278,11 @@ class IntakeCoordinator:
             state.setdefault("field_values", {})[definition.key] = value
         index += 1
         state["field_index"] = index
+        fields = pack.ordered_fields()
+        fv = state.get("field_values", {})
+        while index < len(fields) and fields[index].key in fv:
+            index += 1
+            state["field_index"] = index
         if index >= len(fields):
             return await self._to_confirmation(identity, pack, state)
         await self._save(identity, state)
@@ -222,12 +305,20 @@ class IntakeCoordinator:
             pack.service_catalog.label_for(key)
             for key in state.get("selected", [])
         ]
-        renderer = CardRenderer(pack)
-        card = renderer.confirmation_card(
-            service_labels=labels,
-            field_values=state.get("field_values", {}),
-        )
-        return Reply(card, buttons=_confirm_buttons())
+        fv = state.get("field_values", {})
+        lines = ["Заявка:", ""]
+        if fv.get("phone"):
+            lines.append(f"Телефон: {fv['phone']}")
+        if fv.get("address"):
+            lines.append(f"Адрес: {fv['address']}")
+        if labels:
+            lines.append(f"Услуги: {', '.join(labels)}")
+        for key, val in fv.items():
+            if key not in ("phone", "address"):
+                lines.append(f"{key}: {val}")
+        lines.append("")
+        lines.append("Подтвердить отправку?")
+        return Reply("\n".join(lines), buttons=_confirm_buttons())
 
     async def _confirm(
         self,
@@ -245,8 +336,9 @@ class IntakeCoordinator:
             "service_keys": selected,
             **field_values,
         }
+        order = None
         try:
-            await self._service.create_order(
+            order = await self._service.create_order(
                 organization_id=identity.organization_id,
                 work_type=",".join(selected),
                 source=f"{identity.provider.value}:{identity.external_user_id}",
@@ -256,7 +348,60 @@ class IntakeCoordinator:
             )
         finally:
             await self._sessions.clear(identity.organization_id, identity.actor_id)
-        return Reply("Заявка создана. Оператор скоро свяжется с вами.")
+
+        if order is not None and self._outbound is not None:
+            await self._notify_operators(identity, order, field_values, labels)
+
+        return Reply(
+            "Заявка отправлена. Оperator свяжется с вами в ближайшее время."
+        )
+
+    async def _notify_operators(
+        self,
+        identity: ActorIdentity,
+        order: Any,
+        field_values: dict[str, str],
+        service_labels: list[str],
+    ) -> None:
+        phone = field_values.get("phone", "не указан")
+        address = field_values.get("address", "не указан")
+        lines = [
+            f"Новая заявка #{order.id[:8]}",
+            "",
+            f"Клиент: {identity.display_name}",
+            f"Телефон: {phone}",
+            f"Адрес: {address}",
+            f"Услуги: {', '.join(service_labels)}",
+            "",
+            "Статус: Новая",
+        ]
+        extra = [
+            f"{k}: {v}"
+            for k, v in field_values.items()
+            if k not in ("phone", "address")
+        ]
+        if extra:
+            lines.extend(extra)
+        text = "\n".join(lines)
+
+        if self._identities is not None and self._outbound is not None:
+            external_ids = await self._identities.external_ids_for_role(
+                organization_id=identity.organization_id,
+                provider=identity.provider,
+                role="operator",
+                consumer_key="operator",
+            )
+            for external_id in external_ids:
+                if not external_id:
+                    continue
+                await self._outbound.enqueue(
+                    deduplication_key=f"order:{order.id}:op:{external_id}",
+                    organization_id=identity.organization_id,
+                    provider=identity.provider,
+                    recipient_id=external_id,
+                    text=text,
+                    consumer_key="operator",
+                )
 
     async def _save(
         self, identity: ActorIdentity, state: dict[str, Any]
@@ -289,7 +434,7 @@ def _service_buttons(
                 f"{mark}{category.label}",
                 INTAKE_PICK_SERVICE,
                 {"service": category.key},
-                "requester",
+                "client",
                 row=row,
             )
         )
@@ -299,7 +444,7 @@ def _service_buttons(
                 "Готово",
                 INTAKE_SERVICES_DONE,
                 {},
-                "requester",
+                "client",
                 row=len(buttons),
             )
         )
@@ -308,6 +453,6 @@ def _service_buttons(
 
 def _confirm_buttons() -> tuple[ReplyButton, ...]:
     return (
-        ReplyButton("Подтвердить", INTAKE_CONFIRM, {}, "requester"),
-        ReplyButton("Отмена", INTAKE_CANCEL, {}, "requester", row=1),
+        ReplyButton("Отправить", INTAKE_CONFIRM, {}, "client"),
+        ReplyButton("Отмена", INTAKE_CANCEL, {}, "client", row=1),
     )

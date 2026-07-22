@@ -16,15 +16,22 @@ class OutboundSender:
         self,
         store: PostgresOutboundStore,
         transports: dict[Provider, Transport],
+        *,
+        consumer_key: str = "",
     ) -> None:
         self._store = store
         self._transports = transports
+        self._consumer_key = consumer_key
 
     async def run_once(self, provider: Provider, *, limit: int = 50) -> int:
         transport = self._transports.get(provider)
         if transport is None:
             return 0
-        messages = await self._store.claim(provider, limit=limit)
+        messages = await self._store.claim(
+            provider,
+            consumer_keys=_outbound_consumer_keys(provider, self._consumer_key),
+            limit=limit,
+        )
         delivered = 0
         for message in messages:
             try:
@@ -47,3 +54,12 @@ class OutboundSender:
             )
             delivered += 1
         return delivered
+
+
+def _outbound_consumer_keys(
+    provider: Provider,
+    consumer_key: str,
+) -> tuple[str, ...]:
+    if provider is Provider.MAX and consumer_key == "staff":
+        return ("staff", "admin", "operator", "master")
+    return (consumer_key,)

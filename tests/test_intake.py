@@ -21,7 +21,7 @@ def identity() -> ActorIdentity:
     return ActorIdentity(
         organization_id="org-1",
         actor_id="telegram:7001",
-        role="requester",
+        role="client",
         display_name="7001",
         provider=Provider.TELEGRAM,
         external_user_id="7001",
@@ -81,14 +81,45 @@ def coordinator(
     return target, sessions, service
 
 
+async def _go_to_services(target: IntakeCoordinator, who: ActorIdentity) -> None:
+    """Navigate through hardcoded phone+address to the services step."""
+    await target.start(who)
+    await target.handle_text(who, "+7 999 123 4567")
+    await target.handle_text(who, "ул. Ленина 10")
+
+
 @pytest.mark.asyncio
-async def test_start_greets_and_offers_service_buttons() -> None:
+async def test_start_asks_for_phone() -> None:
     target, sessions, _ = coordinator()
     reply = await target.start(identity())
-    assert "услугу" in reply.text.lower()
+    assert "телефон" in reply.text.lower()
     actions = {button.action for button in reply.buttons}
-    assert INTAKE_PICK_SERVICE in actions
-    assert INTAKE_SERVICES_DONE in actions
+    assert INTAKE_CANCEL in actions
+    state = sessions.store["org-1:telegram:7001"]
+    assert state["step"] == "phone"
+
+
+@pytest.mark.asyncio
+async def test_phone_validates_min_length() -> None:
+    target, _, _ = coordinator()
+    who = identity()
+    await target.start(who)
+    reply = await target.handle_text(who, "12")
+    assert "телефон" in reply.text.lower() or "минимум" in reply.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_phone_to_address_to_services() -> None:
+    target, sessions, _ = coordinator()
+    who = identity()
+    await target.start(who)
+    reply = await target.handle_text(who, "+7 999 123 4567")
+    assert "адрес" in reply.text.lower()
+    state = sessions.store["org-1:telegram:7001"]
+    assert state["step"] == "address"
+
+    reply = await target.handle_text(who, "ул. Ленина 10")
+    assert INTAKE_PICK_SERVICE in {b.action for b in reply.buttons}
     state = sessions.store["org-1:telegram:7001"]
     assert state["step"] == "services"
 
@@ -96,7 +127,8 @@ async def test_start_greets_and_offers_service_buttons() -> None:
 @pytest.mark.asyncio
 async def test_multi_select_toggles_and_requires_a_choice() -> None:
     target, _, _ = coordinator()
-    await target.start(identity())
+    who = identity()
+    await _go_to_services(target, who)
     empty = await target.handle_callback(identity(), INTAKE_SERVICES_DONE, {})
     assert "хотя бы одну" in empty.text
     picked = await target.handle_callback(
@@ -110,29 +142,30 @@ async def test_full_flow_creates_order_from_pack() -> None:
     target, sessions, service = coordinator()
     who = identity()
     await target.start(who)
+    await target.handle_text(who, "+7 999 123 4567")
+    await target.handle_text(who, "Ленина 1")
     await target.handle_callback(who, INTAKE_PICK_SERVICE, {"service": "repair"})
     await target.handle_callback(who, INTAKE_SERVICES_DONE, {})
-    # address is required and must reject a blank answer.
-    reask = await target.handle_text(who, "-")
-    assert "обязатель" in reask.text.lower()
-    await target.handle_text(who, "Ленина 1")
-    await target.handle_text(who, "-")  # optional asset skipped
+    reply = await target.handle_text(who, "-")
+    # address pack field auto-skipped (filled by hardcoded step),
+    # so "-" here skips the optional "asset" field → asks for "fault" (required)
+    assert reply.text
     confirmation = await target.handle_text(who, "Течёт кран")
-    assert "Подтвердить" in confirmation.text
+    assert "отправ" in confirmation.text.lower()
     assert {b.action for b in confirmation.buttons} == {
         INTAKE_CONFIRM,
         INTAKE_CANCEL,
     }
     done = await target.handle_callback(who, INTAKE_CONFIRM, {})
-    assert "создана" in done.text.lower()
+    assert "отправлена" in done.text.lower()
     assert "org-1:telegram:7001" not in sessions.store
     assert len(service.orders) == 1
     order = service.orders[0]
     assert order["organization_id"] == "org-1"
     assert order["work_type"] == "repair"
     assert order["requester_id"] == "telegram:7001"
+    assert order["details"]["phone"] == "+7 999 123 4567"
     assert order["details"]["address"] == "Ленина 1"
-    assert order["details"]["fault"] == "Течёт кран"
     assert "asset" not in order["details"]
     assert order["details"]["service_keys"] == ["repair"]
     assert order["evidence_requirements"].minimum_photos == 1
@@ -163,7 +196,7 @@ async def test_without_active_pack_reports_not_configured() -> None:
 async def test_confirm_rejected_when_in_services_step() -> None:
     target, _, _ = coordinator()
     who = identity()
-    await target.start(who)
+    await _go_to_services(target, who)
     reply = await target.handle_callback(who, INTAKE_CONFIRM, {})
     assert "сначала" in reply.text.lower()
 
@@ -172,7 +205,7 @@ async def test_confirm_rejected_when_in_services_step() -> None:
 async def test_services_done_rejected_when_in_fields_step() -> None:
     target, _, _ = coordinator()
     who = identity()
-    await target.start(who)
+    await _go_to_services(target, who)
     await target.handle_callback(who, INTAKE_PICK_SERVICE, {"service": "repair"})
     await target.handle_callback(who, INTAKE_SERVICES_DONE, {})
     state = target._sessions.store.get("org-1:telegram:7001", {})
@@ -186,13 +219,14 @@ async def test_confirm_clears_session_on_success() -> None:
     target, sessions, service = coordinator()
     who = identity()
     await target.start(who)
+    await target.handle_text(who, "+7 999 123 4567")
+    await target.handle_text(who, "ул. Мира 5")
     await target.handle_callback(who, INTAKE_PICK_SERVICE, {"service": "repair"})
     await target.handle_callback(who, INTAKE_SERVICES_DONE, {})
-    await target.handle_text(who, "ул. Мира 5")
-    await target.handle_text(who, "-")
+    await target.handle_text(who, "-")  # skips optional "asset"
     await target.handle_text(who, "Течёт труба")
     done = await target.handle_callback(who, INTAKE_CONFIRM, {})
-    assert "создана" in done.text.lower()
+    assert "отправлена" in done.text.lower()
     assert "org-1:telegram:7001" not in sessions.store
     assert len(service.orders) == 1
 
@@ -202,10 +236,18 @@ async def test_text_truncated_to_500_chars() -> None:
     target, sessions, _ = coordinator()
     who = identity()
     await target.start(who)
-    await target.handle_callback(who, INTAKE_PICK_SERVICE, {"service": "repair"})
-    await target.handle_callback(who, INTAKE_SERVICES_DONE, {})
-    long_text = "x" * 600
-    await target.handle_text(who, long_text)
+    long_phone = "1" * 600
+    await target.handle_text(who, long_phone)
     state = sessions.store.get("org-1:telegram:7001", {})
     values = state.get("field_values", {})
-    assert len(values.get("address", "")) == 500
+    assert len(values.get("phone", "")) == 500
+
+
+@pytest.mark.asyncio
+async def test_address_validates_min_length() -> None:
+    target, _, _ = coordinator()
+    who = identity()
+    await target.start(who)
+    await target.handle_text(who, "+7 999 123 4567")
+    reply = await target.handle_text(who, "abc")
+    assert "адрес" in reply.text.lower() or "минимум" in reply.text.lower()

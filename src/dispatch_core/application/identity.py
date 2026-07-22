@@ -14,6 +14,11 @@ class ActorIdentity:
     display_name: str
     provider: Provider
     external_user_id: str
+    roles: frozenset[str] = frozenset()
+
+    def has_role(self, role: str) -> bool:
+        """Return whether the actor may enter the requested role frontend."""
+        return role == self.role or role in self.roles
 
 
 class IdentityResolver(Protocol):
@@ -23,4 +28,5 @@ class IdentityResolver(Protocol):
         organization_id: str,
         provider: Provider,
         external_user_id: str,
+        consumer_key: str = "",
     ) -> ActorIdentity | None: ...

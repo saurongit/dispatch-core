@@ -12,7 +12,10 @@ from dispatch_core.infrastructure.pack_store import (
     PackValidationError,
     PostgresPackStore,
 )
-from dispatch_core.infrastructure.workflow_store import PostgresConfigSessionStore
+from dispatch_core.infrastructure.workflow_store import (
+    PostgresConfigSessionStore,
+    PostgresIdentityStore,
+)
 from dispatch_core.messaging.cards import CardRenderer
 from dispatch_core.messaging.replies import Reply, ReplyButton
 from dispatch_core.packs.catalog import (
@@ -42,6 +45,14 @@ CONFIG_EVIDENCE_CODE = "config_evidence_code"
 CONFIG_PREVIEW = "config_preview"
 CONFIG_PUBLISH = "config_publish"
 CONFIG_CANCEL = "config_cancel"
+CONFIG_ADD_OPERATOR = "config_add_operator"
+CONFIG_LIST_OPERATORS = "config_list_operators"
+CONFIG_DEL_OPERATOR = "config_del_operator"
+CONFIG_DEL_OPERATOR_CONFIRM = "config_del_operator_confirm"
+CONFIG_OWNER_ROLES = "config_owner_roles"
+CONFIG_OWNER_ADD_OPERATOR = "config_owner_add_operator"
+CONFIG_OWNER_ADD_MASTER = "config_owner_add_master"
+CONFIG_OWNER_NANO = "config_owner_nano"
 
 CONFIG_ACTIONS = frozenset(
     {
@@ -64,6 +75,14 @@ CONFIG_ACTIONS = frozenset(
         CONFIG_PREVIEW,
         CONFIG_PUBLISH,
         CONFIG_CANCEL,
+        CONFIG_ADD_OPERATOR,
+        CONFIG_LIST_OPERATORS,
+        CONFIG_DEL_OPERATOR,
+        CONFIG_DEL_OPERATOR_CONFIRM,
+        CONFIG_OWNER_ROLES,
+        CONFIG_OWNER_ADD_OPERATOR,
+        CONFIG_OWNER_ADD_MASTER,
+        CONFIG_OWNER_NANO,
     }
 )
 
@@ -73,6 +92,7 @@ MENU_COMMANDS: tuple[tuple[str, str], ...] = (
     ("services", "Услуги: каталог заявок"),
     ("fields", "Поля заявки"),
     ("evidence", "Требования к закрытию"),
+    ("operators", "Операторы"),
     ("preview", "Предпросмотр глазами клиента"),
     ("publish", "Опубликовать версию"),
 )
@@ -101,9 +121,11 @@ class ConfigCoordinator:
         *,
         packs: PostgresPackStore,
         sessions: PostgresConfigSessionStore,
+        identities: PostgresIdentityStore | None = None,
     ) -> None:
         self._packs = packs
         self._sessions = sessions
+        self._identities = identities
         self._dispatch: dict[str, _ConfigHandler] = {
             CONFIG_CANCEL: self._on_cancel,
             CONFIG_MENU: self._on_menu,
@@ -119,6 +141,14 @@ class ConfigCoordinator:
             CONFIG_EVIDENCE: self._on_evidence,
             CONFIG_PREVIEW: self._on_preview,
             CONFIG_PUBLISH: self._on_publish,
+            CONFIG_ADD_OPERATOR: self._on_add_operator,
+            CONFIG_LIST_OPERATORS: self._on_list_operators,
+            CONFIG_DEL_OPERATOR: self._on_del_operator,
+            CONFIG_DEL_OPERATOR_CONFIRM: self._on_del_operator_confirm,
+            CONFIG_OWNER_ROLES: self._on_owner_roles,
+            CONFIG_OWNER_ADD_OPERATOR: self._on_owner_add_operator,
+            CONFIG_OWNER_ADD_MASTER: self._on_owner_add_master,
+            CONFIG_OWNER_NANO: self._on_owner_nano,
         }
         for action in _EVIDENCE_ACTIONS:
             self._dispatch[action] = self._make_evidence_toggle(action)
@@ -242,6 +272,7 @@ class ConfigCoordinator:
             "services": self._services,
             "fields": self._fields,
             "evidence": self._evidence,
+            "operators": self._list_operators_cmd,
             "preview": self._preview,
             "publish": self._publish,
         }
@@ -255,12 +286,20 @@ class ConfigCoordinator:
     ) -> Reply:
         flow = session.get("flow")
         step = session.get("step")
-        if flow == "brand":
-            return await self._brand_step(identity, step, text)
-        if flow == "service_add" and step == "label":
-            return await self._service_save(identity, text)
-        if flow == "field_add" and step == "label":
-            return await self._field_label(identity, session, text)
+        try:
+            if flow == "brand":
+                return await self._brand_step(identity, step, text)
+            if flow == "service_add" and step == "label":
+                return await self._service_save(identity, text)
+            if flow == "field_add" and step == "label":
+                return await self._field_label(identity, session, text)
+            if flow == "add_operator" and step == "name":
+                return await self._add_operator_save(identity, text)
+        except Exception:
+            await self._sessions.clear(
+                identity.organization_id, identity.actor_id
+            )
+            raise
         return Reply(
             "Выберите вариант кнопкой ниже.", buttons=(_CANCEL_BUTTON,)
         )
@@ -643,6 +682,12 @@ class ConfigCoordinator:
             ReplyButton("Закрытие", CONFIG_EVIDENCE, {}, "admin", row=1),
             ReplyButton("Предпросмотр", CONFIG_PREVIEW, {}, "admin", row=2),
             ReplyButton("Опубликовать", CONFIG_PUBLISH, {}, "admin", row=2),
+            ReplyButton(
+                "Операторы", CONFIG_LIST_OPERATORS, {}, "admin", row=3
+            ),
+            ReplyButton(
+                "Мои роли", CONFIG_OWNER_ROLES, {}, "admin", row=3
+            ),
         )
         return Reply("\n".join(lines), buttons=buttons)
 
@@ -674,6 +719,271 @@ class ConfigCoordinator:
             state=state,
         )
 
+    # -- operator management -----------------------------------------------
+
+    async def _on_owner_roles(
+        self, identity: ActorIdentity, _payload: dict[str, Any]
+    ) -> Reply:
+        return await self._owner_roles(identity)
+
+    async def _on_owner_add_operator(
+        self, identity: ActorIdentity, _payload: dict[str, Any]
+    ) -> Reply:
+        return await self._grant_owner_role(identity, "operator")
+
+    async def _on_owner_add_master(
+        self, identity: ActorIdentity, _payload: dict[str, Any]
+    ) -> Reply:
+        return await self._grant_owner_role(identity, "master")
+
+    async def _on_owner_nano(
+        self, identity: ActorIdentity, _payload: dict[str, Any]
+    ) -> Reply:
+        if self._identities is None:
+            return Reply("Управление ролями недоступно.")
+        for role in ("operator", "master"):
+            await self._identities.grant_role(
+                organization_id=identity.organization_id,
+                actor_id=identity.actor_id,
+                role=role,
+            )
+        return await self._owner_roles(
+            identity,
+            note=(
+                "Нано-режим включён: вам доступны роли администратора, "
+                "оператора и мастера."
+            ),
+        )
+
+    async def _grant_owner_role(
+        self, identity: ActorIdentity, role: str
+    ) -> Reply:
+        if self._identities is None:
+            return Reply("Управление ролями недоступно.")
+        granted = await self._identities.grant_role(
+            organization_id=identity.organization_id,
+            actor_id=identity.actor_id,
+            role=role,
+        )
+        note = (
+            "Роль добавлена."
+            if granted
+            else "Не удалось добавить роль: профиль администратора не найден."
+        )
+        return await self._owner_roles(identity, note=note)
+
+    async def _owner_roles(
+        self, identity: ActorIdentity, *, note: str | None = None
+    ) -> Reply:
+        if self._identities is None:
+            return Reply("Управление ролями недоступно.")
+        actor = await self._identities.get_actor(
+            organization_id=identity.organization_id,
+            actor_id=identity.actor_id,
+        )
+        if actor is None:
+            return Reply("Профиль администратора не найден.")
+        roles = set(actor.get("roles") or (actor.get("role"),))
+        labels = {
+            "admin": "администратор",
+            "operator": "оператор",
+            "master": "мастер",
+            "client": "клиент",
+        }
+        ordered = ("admin", "operator", "master", "client")
+        lines = []
+        if note:
+            lines.extend((note, ""))
+        lines.append("Ваши роли: " + ", ".join(
+            labels[role] for role in ordered if role in roles
+        ))
+        lines.extend((
+            "",
+            "Роль определяет ролевой бот. Открытие бота само по себе права не выдаёт.",
+        ))
+        buttons: list[ReplyButton] = []
+        if "operator" not in roles:
+            buttons.append(ReplyButton(
+                "Добавить роль оператора",
+                CONFIG_OWNER_ADD_OPERATOR,
+                {},
+                "admin",
+            ))
+        if "master" not in roles:
+            buttons.append(ReplyButton(
+                "Добавить роль мастера",
+                CONFIG_OWNER_ADD_MASTER,
+                {},
+                "admin",
+                row=len(buttons),
+            ))
+        if not {"operator", "master"}.issubset(roles):
+            buttons.append(ReplyButton(
+                "Включить нано-режим",
+                CONFIG_OWNER_NANO,
+                {},
+                "admin",
+                row=len(buttons),
+            ))
+        buttons.append(ReplyButton(
+            "В меню", CONFIG_MENU, {}, "admin", row=len(buttons)
+        ))
+        return Reply("\n".join(lines), buttons=tuple(buttons))
+
+    async def _on_add_operator(
+        self, identity: ActorIdentity, _payload: dict[str, Any]
+    ) -> Reply:
+        return await self._add_operator(identity)
+
+    async def _on_list_operators(
+        self, identity: ActorIdentity, _payload: dict[str, Any]
+    ) -> Reply:
+        return await self._list_operators(identity)
+
+    async def _on_del_operator(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        return await self._del_operator(identity, payload)
+
+    async def _on_del_operator_confirm(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        return await self._del_operator_confirm(identity, payload)
+
+    async def _add_operator(self, identity: ActorIdentity) -> Reply:
+        if self._identities is None:
+            return Reply("Управление операторами недоступно.")
+        await self._set_session(
+            identity, {"flow": "add_operator", "step": "name"}
+        )
+        return Reply("Введите имя оператора:", buttons=(_CANCEL_BUTTON,))
+
+    async def _add_operator_save(
+        self, identity: ActorIdentity, text: str
+    ) -> Reply:
+        if self._identities is None:
+            return Reply("Управление операторами недоступно.")
+        name = text.strip()[:200]
+        if not name:
+            return Reply(
+                "Имя не может быть пустым. Введите имя оператора:",
+                buttons=(_CANCEL_BUTTON,),
+            )
+        result = await self._identities.create_staff_actor(
+            organization_id=identity.organization_id,
+            role="operator",
+            name=name,
+        )
+        await self._sessions.clear(identity.organization_id, identity.actor_id)
+        return Reply(
+            f"Оператор создан!\n\n"
+            f"Имя: {result['name']}\n"
+            f"Код привязки: {result['bind_code']}\n\n"
+            f"Передайте код оператору. Он должен открыть бота, "
+            f"нажать /start и ввести код."
+        )
+
+    async def _list_operators(self, identity: ActorIdentity) -> Reply:
+        if self._identities is None:
+            return Reply("Управление операторами недоступно.")
+        actors = await self._identities.list_actors(
+            organization_id=identity.organization_id,
+            role="operator",
+        )
+        if not actors:
+            return Reply(
+                "Операторов пока нет.",
+                buttons=(
+                    ReplyButton(
+                        "Добавить оператора",
+                        CONFIG_ADD_OPERATOR,
+                        {},
+                        "admin",
+                    ),
+                    ReplyButton("В меню", CONFIG_MENU, {}, "admin", row=1),
+                ),
+            )
+        lines = ["Операторы:"]
+        buttons: list[ReplyButton] = []
+        for index, actor in enumerate(actors, start=1):
+            status = "✅" if actor["active"] else "❌"
+            channels = ", ".join(actor.get("channels") or [])
+            bind_note = " (ожидает привязки)" if actor.get("has_bind_code") else ""
+            lines.append(
+                f"• {actor['display_name']} | {status}{bind_note}"
+                + (f" | {channels}" if channels else "")
+            )
+            buttons.append(
+                ReplyButton(
+                    f"Убрать роль: {actor['display_name']}",
+                    CONFIG_DEL_OPERATOR,
+                    {"actor_id": actor["id"]},
+                    "admin",
+                    row=index,
+                )
+            )
+        buttons.append(
+            ReplyButton(
+                "Добавить оператора",
+                CONFIG_ADD_OPERATOR,
+                {},
+                "admin",
+                row=len(buttons) + 1,
+            )
+        )
+        buttons.append(
+            ReplyButton(
+                "В меню", CONFIG_MENU, {}, "admin", row=len(buttons) + 2
+            )
+        )
+        return Reply("\n".join(lines), buttons=tuple(buttons))
+
+    async def _list_operators_cmd(
+        self, identity: ActorIdentity
+    ) -> Reply:
+        return await self._list_operators(identity)
+
+    async def _del_operator(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        if self._identities is None:
+            return Reply("Управление операторами недоступно.")
+        actor_id = str(payload.get("actor_id") or "")
+        if not actor_id:
+            return await self._list_operators(identity)
+        actor = await self._identities.get_actor(
+            organization_id=identity.organization_id,
+            actor_id=actor_id,
+        )
+        if actor is None:
+            return await self._list_operators(identity)
+        return Reply(
+            f"Убрать роль оператора у «{actor['display_name']}»?",
+            buttons=(
+                ReplyButton(
+                    "Да, убрать роль",
+                    CONFIG_DEL_OPERATOR_CONFIRM,
+                    {"actor_id": actor_id},
+                    "admin",
+                ),
+                ReplyButton("Отмена", CONFIG_CANCEL, {}, "admin", row=1),
+            ),
+        )
+
+    async def _del_operator_confirm(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        if self._identities is None:
+            return Reply("Управление операторами недоступно.")
+        actor_id = str(payload.get("actor_id") or "")
+        if actor_id:
+            await self._identities.revoke_role(
+                organization_id=identity.organization_id,
+                actor_id=actor_id,
+                role="operator",
+            )
+        return await self._list_operators(identity)
+
 
 _EVIDENCE_ACTIONS = frozenset(
     {
@@ -691,7 +1001,11 @@ def _yes_no(value: bool) -> str:
 
 
 def _slug(label: str, prefix: str, taken: set[str]) -> str:
-    base = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
+    import unicodedata
+
+    normalized = unicodedata.normalize("NFKD", label)
+    ascii_label = normalized.encode("ascii", "ignore").decode("ascii")
+    base = re.sub(r"[^a-z0-9]+", "_", ascii_label.lower()).strip("_")
     if not base:
         base = prefix
     key = base

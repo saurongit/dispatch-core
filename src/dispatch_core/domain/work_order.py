@@ -333,7 +333,7 @@ class WorkOrder:
     ) -> None:
         self._require_not_terminal()
         self._require_coordinator_if_present(actor_id)
-        if not reason.strip():
+        if not reason or not reason.strip():
             raise ValueError("cancellation reason is required")
         self.status = WorkOrderStatus.CANCELLED
         self._record(

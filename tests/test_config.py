@@ -9,8 +9,11 @@ from dispatch_core.application.identity import ActorIdentity
 from dispatch_core.domain.errors import NotFound
 from dispatch_core.domain.work_order import EvidenceRequirements
 from dispatch_core.messaging.config import (
+    CONFIG_ADD_OPERATOR,
     CONFIG_BRAND,
     CONFIG_CANCEL,
+    CONFIG_DEL_OPERATOR,
+    CONFIG_DEL_OPERATOR_CONFIRM,
     CONFIG_EVIDENCE,
     CONFIG_EVIDENCE_CODE,
     CONFIG_EVIDENCE_COMMENT,
@@ -22,7 +25,10 @@ from dispatch_core.messaging.config import (
     CONFIG_FIELD_REQUIRED,
     CONFIG_FIELD_TYPE,
     CONFIG_FIELDS,
+    CONFIG_LIST_OPERATORS,
     CONFIG_MENU,
+    CONFIG_OWNER_NANO,
+    CONFIG_OWNER_ROLES,
     CONFIG_PUBLISH,
     CONFIG_SERVICE_ADD,
     CONFIG_SERVICE_DELETE,
@@ -152,15 +158,94 @@ class FakeSessionStore:
         self.store.pop(f"{organization_id}:{actor_id}", None)
 
 
+@dataclass
+class FakeIdentityStore:
+    actors: dict[str, dict[str, Any]] = field(default_factory=dict)
+    next_id: int = 1
+
+    async def create_staff_actor(
+        self,
+        *,
+        organization_id: str,
+        role: str,
+        name: str,
+        phone: str | None = None,
+        provider: Provider | None = None,
+        external_user_id: str | None = None,
+    ) -> dict[str, Any]:
+        actor_id = f"operator:{self.next_id}"
+        self.next_id += 1
+        actor = {
+            "actor_id": actor_id,
+            "role": role,
+            "name": name,
+            "phone": phone,
+            "bind_code": "1234",
+            "display_name": name,
+            "active": True,
+            "has_bind_code": True,
+            "channels": [],
+            "roles": [role],
+        }
+        self.actors[actor_id] = actor
+        return actor
+
+    async def list_actors(
+        self, *, organization_id: str, role: str
+    ) -> list[dict[str, Any]]:
+        return [
+            {**actor, "id": actor_id}
+            for actor_id, actor in self.actors.items()
+            if role in actor["roles"] and actor["active"]
+        ]
+
+    async def get_actor(
+        self, *, organization_id: str, actor_id: str
+    ) -> dict[str, Any] | None:
+        actor = self.actors.get(actor_id)
+        return {**actor, "id": actor_id} if actor is not None else None
+
+    async def delete_actor(
+        self, *, organization_id: str, actor_id: str
+    ) -> bool:
+        return self.actors.pop(actor_id, None) is not None
+
+    async def revoke_role(
+        self, *, organization_id: str, actor_id: str, role: str
+    ) -> bool:
+        actor = self.actors.get(actor_id)
+        if actor is None or role not in actor["roles"]:
+            return False
+        actor["roles"].remove(role)
+        if not actor["roles"]:
+            self.actors.pop(actor_id)
+        return True
+
+    async def grant_role(
+        self, *, organization_id: str, actor_id: str, role: str
+    ) -> bool:
+        actor = self.actors.get(actor_id)
+        if actor is None:
+            return False
+        if role not in actor["roles"]:
+            actor["roles"].append(role)
+        return True
+
+
 def coordinator(
     *,
     draft: PackDefinition | None = None,
     active: PackDefinition | None = None,
     publish_error: Exception | None = None,
+    identities: FakeIdentityStore | None = None,
 ) -> tuple[ConfigCoordinator, FakePackStore, FakeSessionStore]:
     packs = FakePackStore(_draft=draft, _active=active, _publish_error=publish_error)
     sessions = FakeSessionStore()
-    target = ConfigCoordinator(packs=packs, sessions=sessions)  # type: ignore[arg-type]
+    target = ConfigCoordinator(
+        packs=packs,
+        sessions=sessions,  # type: ignore[arg-type]
+        identities=identities,  # type: ignore[arg-type]
+    )
     return target, packs, sessions
 
 
@@ -181,6 +266,71 @@ async def test_start_shows_menu_with_no_pack() -> None:
     assert CONFIG_FIELDS in actions
     assert CONFIG_EVIDENCE in actions
     assert CONFIG_PUBLISH in actions
+    assert CONFIG_LIST_OPERATORS in actions
+
+
+@pytest.mark.asyncio
+async def test_admin_creates_lists_and_deletes_operator() -> None:
+    identities = FakeIdentityStore()
+    target, _, _ = coordinator(identities=identities)
+    who = admin()
+
+    reply = await target.handle_callback(who, CONFIG_ADD_OPERATOR, {})
+    assert "имя оператора" in reply.text.lower()
+
+    reply = await target.handle_text(who, "Анна")
+    assert "код привязки: 1234" in reply.text.lower()
+
+    reply = await target.handle_callback(who, CONFIG_LIST_OPERATORS, {})
+    assert "Анна" in reply.text
+    delete = next(
+        button for button in reply.buttons
+        if button.action == CONFIG_DEL_OPERATOR
+    )
+
+    reply = await target.handle_callback(who, delete.action, delete.payload)
+    confirm = next(
+        button for button in reply.buttons
+        if button.action == CONFIG_DEL_OPERATOR_CONFIRM
+    )
+    reply = await target.handle_callback(who, confirm.action, confirm.payload)
+
+    assert "операторов пока нет" in reply.text.lower()
+    assert identities.actors == {}
+
+
+@pytest.mark.asyncio
+async def test_admin_can_enable_explicit_nano_role_preset() -> None:
+    identities = FakeIdentityStore(
+        actors={
+            "admin:100": {
+                "actor_id": "admin:100",
+                "role": "admin",
+                "roles": ["admin"],
+                "name": "Admin",
+                "display_name": "Admin",
+                "phone": None,
+                "bind_code": None,
+                "active": True,
+                "has_bind_code": False,
+                "channels": ["telegram"],
+            }
+        }
+    )
+    target, _, _ = coordinator(identities=identities)
+    who = admin()
+
+    reply = await target.handle_callback(who, CONFIG_OWNER_ROLES, {})
+    assert "администратор" in reply.text.lower()
+    assert CONFIG_OWNER_NANO in {button.action for button in reply.buttons}
+
+    reply = await target.handle_callback(who, CONFIG_OWNER_NANO, {})
+    assert "нано-режим включён" in reply.text.lower()
+    assert set(identities.actors["admin:100"]["roles"]) == {
+        "admin",
+        "operator",
+        "master",
+    }
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,9 @@ from dispatch_core.domain.tracking import LocationSource
 from dispatch_core.domain.work_order import PoolMode, WorkOrder
 from dispatch_core.messaging.models import Provider
 
+_MAX_DETAILS_KEYS = 50
+_MAX_DETAIL_VALUE_LEN = 1000
+
 
 class EvidenceRequirementsInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -30,6 +33,19 @@ class CreateOrderInput(BaseModel):
         default_factory=EvidenceRequirementsInput
     )
 
+    @model_validator(mode="after")
+    def validate_details(self) -> CreateOrderInput:
+        if len(self.details) > _MAX_DETAILS_KEYS:
+            raise ValueError(
+                f"details must not contain more than {_MAX_DETAILS_KEYS} keys"
+            )
+        for key, value in self.details.items():
+            if isinstance(value, str) and len(value) > _MAX_DETAIL_VALUE_LEN:
+                raise ValueError(
+                    f"detail value for {key!r} exceeds {_MAX_DETAIL_VALUE_LEN} chars"
+                )
+        return self
+
 
 class ActorInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -41,7 +57,7 @@ class ActorCreateInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     actor_id: str = Field(min_length=1, max_length=200)
-    role: str = Field(pattern="^(admin|coordinator|executor|requester)$")
+    role: str = Field(pattern="^(admin|operator|master|client)$")
     display_name: str = Field(min_length=1, max_length=200)
     provider: Provider | None = None
     external_user_id: str | None = Field(default=None, min_length=1, max_length=200)
@@ -155,3 +171,13 @@ class LocationRecordedResponse(BaseModel):
     tracking_session_id: str
     point_count: int
     version: int
+
+
+class ExecutorTokenRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    actor_id: str = Field(min_length=1, max_length=200)
+
+
+class ExecutorTokenResponse(BaseModel):
+    token: str
+    expires_at: int

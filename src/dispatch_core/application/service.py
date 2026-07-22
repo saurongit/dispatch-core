@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+from dispatch_core.domain.errors import InvalidTransition
 from dispatch_core.domain.tracking import (
     LocationSource,
     TrackingPoint,
@@ -18,6 +19,8 @@ from dispatch_core.domain.work_order import (
 )
 
 from .ports import UnitOfWorkFactory
+
+OrderChange = Callable[[WorkOrder], None]
 
 
 class DispatchService:
@@ -52,87 +55,117 @@ class DispatchService:
             uow.commit()
         return order
 
-    def claim_coordination(self, order_id: str, coordinator_id: str) -> WorkOrder:
+    def claim_coordination(
+        self, organization_id: str, order_id: str, coordinator_id: str
+    ) -> WorkOrder:
         return self._change_order(
+            organization_id,
             order_id,
             lambda order: order.claim_coordination(coordinator_id),
         )
 
     def publish_pool(
         self,
+        organization_id: str,
         order_id: str,
         mode: PoolMode,
         *,
         actor_id: str | None = None,
     ) -> WorkOrder:
         return self._change_order(
+            organization_id,
             order_id,
             lambda order: order.publish_pool(mode, actor_id=actor_id),
         )
 
-    def express_interest(self, order_id: str, executor_id: str) -> WorkOrder:
+    def express_interest(
+        self, organization_id: str, order_id: str, executor_id: str
+    ) -> WorkOrder:
         return self._change_order(
+            organization_id,
             order_id,
             lambda order: order.express_interest(executor_id),
         )
 
-    def withdraw_interest(self, order_id: str, executor_id: str) -> WorkOrder:
+    def withdraw_interest(
+        self, organization_id: str, order_id: str, executor_id: str
+    ) -> WorkOrder:
         return self._change_order(
+            organization_id,
             order_id,
             lambda order: order.withdraw_interest(executor_id),
         )
 
-    def claim_first(self, order_id: str, executor_id: str) -> WorkOrder:
+    def claim_first(
+        self, organization_id: str, order_id: str, executor_id: str
+    ) -> WorkOrder:
         return self._change_order(
+            organization_id,
             order_id,
             lambda order: order.claim_first(executor_id),
         )
 
     def assign_order(
         self,
+        organization_id: str,
         order_id: str,
         executor_id: str,
         *,
         actor_id: str | None = None,
     ) -> WorkOrder:
         return self._change_order(
+            organization_id,
             order_id,
             lambda order: order.assign(executor_id, actor_id=actor_id),
         )
 
-    def accept_order(self, order_id: str, executor_id: str) -> WorkOrder:
+    def accept_order(
+        self, organization_id: str, order_id: str, executor_id: str
+    ) -> WorkOrder:
         return self._change_order(
-            order_id, lambda order: order.accept(executor_id)
+            organization_id,
+            order_id,
+            lambda order: order.accept(executor_id),
         )
 
-    def reject_assignment(self, order_id: str, executor_id: str) -> WorkOrder:
+    def reject_assignment(
+        self, organization_id: str, order_id: str, executor_id: str
+    ) -> WorkOrder:
         return self._change_order(
+            organization_id,
             order_id,
             lambda order: order.reject_assignment(executor_id),
         )
 
     def cancel_order(
         self,
+        organization_id: str,
         order_id: str,
         reason: str,
         *,
         actor_id: str | None = None,
     ) -> WorkOrder:
         return self._change_order(
+            organization_id,
             order_id,
             lambda order: order.cancel(reason, actor_id=actor_id),
         )
 
     def start_travel(
-        self, order_id: str, executor_id: str, *, session_id: str | None = None
+        self,
+        organization_id: str,
+        order_id: str,
+        executor_id: str,
+        *,
+        session_id: str | None = None,
     ) -> tuple[WorkOrder, TrackingSession]:
         with self._unit_of_work() as uow:
-            order = uow.orders.get(order_id)
+            order = uow.orders.get(organization_id, order_id)
             expected_order_version = order.version
             order.start_travel(executor_id)
             session = TrackingSession.start(
                 session_id=session_id or str(uuid4()),
-                organization_id=order.organization_id,
+                organization_id=organization_id,
                 work_order_id=order.id,
                 executor_id=executor_id,
             )
@@ -145,6 +178,8 @@ class DispatchService:
     def record_location(
         self,
         *,
+        organization_id: str,
+        executor_id: str,
         session_id: str,
         latitude: float,
         longitude: float,
@@ -154,7 +189,11 @@ class DispatchService:
         source_event_id: str | None = None,
     ) -> TrackingSession:
         with self._unit_of_work() as uow:
-            session = uow.tracking.get(session_id)
+            session = uow.tracking.get(organization_id, session_id)
+            if session.executor_id != executor_id:
+                raise InvalidTransition(
+                    "session does not belong to this executor"
+                )
             expected_version = session.version
             now = datetime.now(UTC)
             session.add_point(
@@ -173,20 +212,30 @@ class DispatchService:
             uow.commit()
             return session
 
-    def start_work(self, order_id: str, executor_id: str) -> WorkOrder:
+    def start_work(
+        self, organization_id: str, order_id: str, executor_id: str
+    ) -> WorkOrder:
         return self._change_order(
-            order_id, lambda order: order.start_work(executor_id)
+            organization_id,
+            order_id,
+            lambda order: order.start_work(executor_id),
         )
 
     def complete_order(
-        self, order_id: str, executor_id: str, report: CompletionReport
+        self,
+        organization_id: str,
+        order_id: str,
+        executor_id: str,
+        report: CompletionReport,
     ) -> WorkOrder:
         with self._unit_of_work() as uow:
-            order = uow.orders.get(order_id)
+            order = uow.orders.get(organization_id, order_id)
             expected_order_version = order.version
             order.complete(executor_id, report)
             uow.orders.save(order, expected_version=expected_order_version)
-            session = uow.tracking.find_active_for_order(order_id)
+            session = uow.tracking.find_active_for_order(
+                organization_id, order_id
+            )
             events = list(order.pull_events())
             if session is not None:
                 expected_session_version = session.version
@@ -199,9 +248,14 @@ class DispatchService:
             uow.commit()
             return order
 
-    def _change_order(self, order_id: str, change: Any) -> WorkOrder:
+    def _change_order(
+        self,
+        organization_id: str,
+        order_id: str,
+        change: OrderChange,
+    ) -> WorkOrder:
         with self._unit_of_work() as uow:
-            order = uow.orders.get(order_id)
+            order = uow.orders.get(organization_id, order_id)
             expected_version = order.version
             change(order)
             uow.orders.save(order, expected_version=expected_version)

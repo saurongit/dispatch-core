@@ -18,10 +18,12 @@ from dispatch_core.messaging.models import (
     Provider,
 )
 from dispatch_core.messaging.processor import InboundProcessor
+from dispatch_core.messaging.replies import Reply
+from dispatch_core.messaging.workspaces import MASTER_MENU, OPERATOR_MENU
 from dispatch_core.transports.contracts import EventKind, InboundEvent
 
 
-def identity(role: str = "executor") -> ActorIdentity:
+def identity(role: str = "master") -> ActorIdentity:
     return ActorIdentity(
         organization_id="org-1",
         actor_id="actor-1",
@@ -50,7 +52,8 @@ class FakeInbox:
     processed: list[str] = field(default_factory=list)
     failed: list[tuple[str, str]] = field(default_factory=list)
 
-    async def claim(self, *, limit: int) -> tuple[InboundEnvelope, ...]:
+    async def claim(self, **values: Any) -> tuple[InboundEnvelope, ...]:
+        limit = int(values["limit"])
         return self.items[:limit]
 
     async def mark_processed(self, item: InboundEnvelope) -> None:
@@ -63,20 +66,77 @@ class FakeInbox:
 @dataclass
 class FakeIdentities:
     value: ActorIdentity | None = None
+    bound_value: ActorIdentity | None = None
     error: Exception | None = None
+    bind_calls: list[dict[str, Any]] = field(default_factory=list)
 
     async def resolve(self, **values: Any) -> ActorIdentity | None:
         if self.error:
             raise self.error
         return self.value
 
+    async def bind_actor_by_code(self, **values: Any) -> ActorIdentity | None:
+        self.bind_calls.append(values)
+        return self.bound_value
+
+
+@dataclass
+class FakeBindingSessions:
+    active: bool = True
+    attempts: int = 0
+    begun: list[dict[str, Any]] = field(default_factory=list)
+    cleared: list[dict[str, Any]] = field(default_factory=list)
+
+    MAX_ATTEMPTS = 5
+
+    async def begin(self, **values: Any) -> None:
+        self.begun.append(values)
+        self.active = True
+        self.attempts = 0
+
+    async def is_active(self, **values: Any) -> bool:
+        return self.active and self.attempts < self.MAX_ATTEMPTS
+
+    async def take_attempt(self, **values: Any) -> int | None:
+        if not self.active or self.attempts >= self.MAX_ATTEMPTS:
+            return None
+        self.attempts += 1
+        return self.attempts
+
+    async def clear(self, **values: Any) -> None:
+        self.cleared.append(values)
+        self.active = False
+
+
+@dataclass
+class FakeRoleCoordinator:
+    label: str
+    started: list[str] = field(default_factory=list)
+    texts: list[str] = field(default_factory=list)
+    callbacks: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+
+    async def start(self, actor: ActorIdentity) -> Reply:
+        self.started.append(actor.actor_id)
+        return Reply(f"{self.label} start")
+
+    async def handle_text(self, actor: ActorIdentity, text: str) -> Reply:
+        self.texts.append(text)
+        return Reply(f"{self.label} text")
+
+    async def handle_callback(
+        self,
+        actor: ActorIdentity,
+        action: str,
+        payload: dict[str, Any],
+    ) -> Reply:
+        self.callbacks.append((action, payload))
+        return Reply(f"{self.label} callback")
+
 
 @dataclass
 class FakeCallbacks:
     action: str = "accept"
-    payload: dict[str, Any] = field(
-        default_factory=lambda: {"order_id": "order-1"}
-    )
+    payload: dict[str, Any] = field(default_factory=lambda: {"order_id": "order-1"})
     value: CallbackAction | None = None
 
     async def resolve(self, **values: Any) -> CallbackAction | None:
@@ -150,6 +210,9 @@ class FakeService:
     async def claim_first(self, *args: Any, **kwargs: Any) -> None:
         await self._call("claim_first", *args, **kwargs)
 
+    async def publish_pool(self, *args: Any, **kwargs: Any) -> None:
+        await self._call("publish_pool", *args, **kwargs)
+
     async def assign_order(self, *args: Any, **kwargs: Any) -> None:
         await self._call("assign_order", *args, **kwargs)
 
@@ -189,9 +252,7 @@ class FakeTransport:
     def parse(self, payload: dict[str, Any]) -> tuple[InboundEvent, ...]:
         return self.events
 
-    async def answer_callback(
-        self, callback_id: str, text: str | None = None
-    ) -> None:
+    async def answer_callback(self, callback_id: str, text: str | None = None) -> None:
         if self.callback_error:
             raise RuntimeError("callback expired")
         self.callback_answers.append((callback_id, text))
@@ -218,6 +279,10 @@ def processor(
     service: FakeService | None = None,
     reader: FakeReader | None = None,
     transport: FakeTransport | None = None,
+    binding_sessions: FakeBindingSessions | None = None,
+    operator: FakeRoleCoordinator | None = None,
+    master: FakeRoleCoordinator | None = None,
+    consumer_key: str = "",
     include_transport: bool = True,
 ) -> tuple[InboundProcessor, dict[str, Any]]:
     values = {
@@ -234,6 +299,10 @@ def processor(
             if include_transport
             else {}
         ),
+        "binding_sessions": binding_sessions,
+        "operator": operator,
+        "master": master,
+        "consumer_key": consumer_key,
     }
     return InboundProcessor(**values), values  # type: ignore[arg-type]
 
@@ -261,7 +330,7 @@ async def test_dispatch_informational_branches(
     elif kind is EventKind.LOCATION:
         values.update(latitude=1.0, longitude=2.0)
     target, _ = processor(executions=FakeExecutions(execution))
-    assert expected in await target._dispatch(identity(), event(kind, **values))
+    assert expected in (await target._dispatch(identity(), event(kind, **values))).text
 
 
 @pytest.mark.asyncio
@@ -278,8 +347,8 @@ async def test_dispatch_saves_report_photo_and_comment() -> None:
     comment_result = await target._dispatch(
         identity(), event(EventKind.MESSAGE, text="work done")
     )
-    assert photo_result == "Фото добавлено в отчёт: 1."
-    assert comment_result == "Комментарий отчёта сохранён."
+    assert photo_result.text == "Фото добавлено в отчёт: 1."
+    assert comment_result.text == "Комментарий отчёта сохранён."
     assert drafts.photos == ["telegram:photo-1"]
     assert drafts.comments == ["work done"]
 
@@ -296,7 +365,7 @@ async def test_dispatch_saves_location_to_active_tracking_session() -> None:
         identity(),
         event(EventKind.LOCATION, latitude=53.75, longitude=87.1),
     )
-    assert result == "Геопозиция сохранена."
+    assert result.text == "Геопозиция сохранена."
     name, _, kwargs = service.calls[0]
     assert name == "record_location"
     assert kwargs["session_id"] == "track-1"
@@ -307,23 +376,23 @@ async def test_dispatch_saves_location_to_active_tracking_session() -> None:
 @pytest.mark.asyncio
 async def test_dispatch_accepts_contact_as_neutral_event() -> None:
     target, _ = processor()
-    assert await target._dispatch(
-        identity(), event(EventKind.CONTACT)
-    ) == "Событие принято."
+    assert (
+        await target._dispatch(identity(), event(EventKind.CONTACT))
+    ).text == "Событие принято."
 
 
 @pytest.mark.parametrize(
     ("action", "role", "expected_method"),
     [
-        ("pool_interest", "executor", "express_interest"),
-        ("pool_claim", "executor", "claim_first"),
-        ("accept", "executor", "accept_order"),
-        ("reject", "executor", "reject_assignment"),
-        ("start_travel", "executor", "start_travel"),
-        ("start_work", "executor", "start_work"),
-        ("assign", "coordinator", "assign_order"),
+        ("pool_interest", "master", "express_interest"),
+        ("pool_claim", "master", "claim_first"),
+        ("accept", "master", "accept_order"),
+        ("reject", "master", "reject_assignment"),
+        ("start_travel", "master", "start_travel"),
+        ("start_work", "master", "start_work"),
+        ("assign", "operator", "assign_order"),
         ("assign", "admin", "assign_order"),
-        ("submit_report", "executor", "complete_order"),
+        ("submit_report", "master", "complete_order"),
     ],
 )
 @pytest.mark.asyncio
@@ -372,10 +441,21 @@ async def test_callback_rejects_unknown_expired_and_wrong_role_actions() -> None
             event(EventKind.CALLBACK, callback_token="token"),
         )
 
+
+@pytest.mark.asyncio
+async def test_operator_can_publish_order_to_pool() -> None:
+    service = FakeService()
+    target, _ = processor(service=service)
+
+    reply = await target._publish_pool(identity("operator"), {"order_id": "order-1"})
+
+    assert reply.text == "Заявка опубликована в пул."
+    assert service.calls[0][0] == "publish_pool"
+
     wrong_role, _ = processor(callbacks=FakeCallbacks(action="pool_claim"))
     with pytest.raises(Exception, match="роли"):
         await wrong_role._callback(
-            identity("coordinator"),
+            identity("operator"),
             event(EventKind.CALLBACK, callback_token="token"),
         )
 
@@ -386,9 +466,7 @@ async def test_callback_rejects_unknown_expired_and_wrong_role_actions() -> None
             event(EventKind.CALLBACK, callback_token="token"),
         )
 
-    missing_order, _ = processor(
-        callbacks=FakeCallbacks(action="accept", payload={})
-    )
+    missing_order, _ = processor(callbacks=FakeCallbacks(action="accept", payload={}))
     with pytest.raises(InvalidTransition, match="does not reference"):
         await missing_order._callback(
             identity(),
@@ -465,7 +543,7 @@ async def test_callback_retries_are_idempotent_after_command_was_committed(
         service=service,
         reader=FakeReader(persisted()),
     )
-    role = "coordinator" if action == "assign" else "executor"
+    role = "operator" if action == "assign" else "master"
     result = await target._callback(
         identity(role),
         event(EventKind.CALLBACK, callback_token="token"),
@@ -518,14 +596,14 @@ async def test_start_travel_retry_detects_existing_execution() -> None:
     service = FakeService()
     target, _ = processor(
         callbacks=FakeCallbacks(action="start_travel"),
-        executions=FakeExecutions(
-            ActiveExecution("order-1", "en_route", "track-1")
-        ),
+        executions=FakeExecutions(ActiveExecution("order-1", "en_route", "track-1")),
         service=service,
     )
-    assert await target._callback(
-        identity(), event(EventKind.CALLBACK, callback_token="token")
-    ) == "Выезд уже начат."
+    assert (
+        await target._callback(
+            identity(), event(EventKind.CALLBACK, callback_token="token")
+        )
+    ).text == "Выезд уже начат."
     assert service.calls == []
 
 
@@ -555,6 +633,173 @@ async def test_run_once_replies_to_unregistered_callback() -> None:
     assert inbox.processed == ["telegram:1"]
     assert "не зарегистрирован" in outbound.values[0]["text"]
     assert transport.callback_answers[0][0] == "cb-1"
+
+
+@pytest.mark.asyncio
+async def test_unregistered_staff_start_opens_binding_session() -> None:
+    inbound = InboundEnvelope(
+        provider=Provider.TELEGRAM,
+        external_event_id="telegram:bind-start",
+        organization_id="org-1",
+        payload={},
+    )
+    sessions = FakeBindingSessions(active=False)
+    outbound = FakeOutbound()
+    target, _ = processor(
+        inbox=FakeInbox(items=(inbound,)),
+        identities=FakeIdentities(None),
+        outbound=outbound,
+        transport=FakeTransport(events=(event(EventKind.START),)),
+        binding_sessions=sessions,
+        consumer_key="operator",
+    )
+
+    assert await target.run_once() == 1
+    assert len(sessions.begun) == 1
+    assert "4-значный код" in outbound.values[0]["text"]
+    assert outbound.values[0]["consumer_key"] == "operator"
+
+
+@pytest.mark.asyncio
+async def test_reply_deduplication_is_scoped_to_the_frontend() -> None:
+    def inbound(consumer_key: str) -> InboundEnvelope:
+        return InboundEnvelope(
+            provider=Provider.TELEGRAM,
+            external_event_id="telegram:same-update",
+            organization_id="org-1",
+            payload={},
+            consumer_key=consumer_key,
+        )
+
+    keys: list[str] = []
+    for consumer_key in ("operator", "master"):
+        outbound = FakeOutbound()
+        target, _ = processor(
+            inbox=FakeInbox(items=(inbound(consumer_key),)),
+            identities=FakeIdentities(identity(consumer_key)),
+            outbound=outbound,
+            transport=FakeTransport(events=(event(EventKind.START),)),
+            consumer_key=consumer_key,
+        )
+        assert await target.run_once() == 1
+        keys.append(outbound.values[0]["deduplication_key"])
+
+    assert len(set(keys)) == 2
+    assert ":operator:" in keys[0]
+    assert ":master:" in keys[1]
+
+
+@pytest.mark.asyncio
+async def test_staff_code_binds_identity_without_counting_a_failure() -> None:
+    inbound = InboundEnvelope(
+        provider=Provider.TELEGRAM,
+        external_event_id="telegram:bind-code",
+        organization_id="org-1",
+        payload={},
+    )
+    bound = identity("operator")
+    identities = FakeIdentities(None, bound_value=bound)
+    sessions = FakeBindingSessions()
+    outbound = FakeOutbound()
+    target, _ = processor(
+        inbox=FakeInbox(items=(inbound,)),
+        identities=identities,
+        outbound=outbound,
+        transport=FakeTransport(events=(event(EventKind.MESSAGE, text=" 0123 "),)),
+        binding_sessions=sessions,
+        consumer_key="operator",
+    )
+
+    assert await target.run_once() == 1
+    assert identities.bind_calls[0]["bind_code"] == "0123"
+    assert sessions.attempts == 0
+    assert len(sessions.cleared) == 1
+    assert "Привязка выполнена" in outbound.values[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_successful_master_binding_opens_master_workspace() -> None:
+    bound = identity("master")
+    master = FakeRoleCoordinator("master")
+    target, _ = processor(
+        identities=FakeIdentities(None, bound_value=bound),
+        binding_sessions=FakeBindingSessions(),
+        consumer_key="master",
+        master=master,
+    )
+    item = InboundEnvelope(
+        provider=Provider.TELEGRAM,
+        external_event_id="telegram:bind-master",
+        organization_id="org-1",
+        payload={},
+        consumer_key="master",
+    )
+
+    identity_value, reply = await target._maybe_bind_staff(
+        item,
+        event(EventKind.MESSAGE, text="0123"),
+    )
+
+    assert identity_value == bound
+    assert reply is not None
+    assert "Привязка выполнена" in reply.text
+    assert "master start" in reply.text
+    assert master.started == ["actor-1"]
+
+
+@pytest.mark.asyncio
+async def test_role_workspaces_receive_start_text_and_callback() -> None:
+    operator = FakeRoleCoordinator("operator")
+    master = FakeRoleCoordinator("master")
+    target, _ = processor(operator=operator, master=master)
+
+    assert (
+        await target._dispatch(identity("operator"), event(EventKind.START))
+    ).text == "operator start"
+    assert (
+        await target._dispatch(
+            identity("operator"), event(EventKind.MESSAGE, text="/masters")
+        )
+    ).text == "operator text"
+
+    target._callbacks = FakeCallbacks(action=OPERATOR_MENU)
+    assert (
+        await target._callback(
+            identity("operator"),
+            event(EventKind.CALLBACK, callback_token="operator-token"),
+        )
+    ).text == "operator callback"
+    target._callbacks = FakeCallbacks(action=MASTER_MENU)
+    assert (
+        await target._callback(
+            identity("master"),
+            event(EventKind.CALLBACK, callback_token="master-token"),
+        )
+    ).text == "master callback"
+
+
+@pytest.mark.asyncio
+async def test_staff_binding_locks_after_five_failed_codes() -> None:
+    target, _ = processor(
+        identities=FakeIdentities(None),
+        binding_sessions=FakeBindingSessions(attempts=4),
+        consumer_key="master",
+    )
+    item = InboundEnvelope(
+        provider=Provider.TELEGRAM,
+        external_event_id="telegram:bind-fail",
+        organization_id="org-1",
+        payload={},
+    )
+
+    bound, reply = await target._maybe_bind_staff(
+        item,
+        event(EventKind.MESSAGE, text="xxxx"),
+    )
+
+    assert bound is None
+    assert reply is not None
+    assert "Попытки закончились" in reply.text
 
 
 @pytest.mark.asyncio

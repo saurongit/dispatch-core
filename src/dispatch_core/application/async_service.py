@@ -164,6 +164,7 @@ class AsyncDispatchService:
         self,
         *,
         organization_id: str,
+        executor_id: str,
         session_id: str,
         latitude: float,
         longitude: float,
@@ -174,6 +175,12 @@ class AsyncDispatchService:
     ) -> TrackingSession:
         async with self._unit_of_work() as uow:
             session = await uow.tracking.get(organization_id, session_id)
+            if session.executor_id != executor_id:
+                from dispatch_core.domain.errors import InvalidTransition
+
+                raise InvalidTransition(
+                    "session does not belong to this executor"
+                )
             expected_version = session.version
             now = datetime.now(UTC)
             session.add_point(

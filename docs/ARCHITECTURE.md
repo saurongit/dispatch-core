@@ -3,8 +3,8 @@
 ## Stable centre, replaceable edges
 
 ```text
- REQUEST GENERATORS                 WORKER/OPERATOR TRANSPORTS
- phone UI | web | API | bot          Telegram | MAX | future PWA
+ REQUEST GENERATORS                   MESSENGER ROLE FRONTENDS
+ site | phone intake | API | bot       Telegram | MAX
           |                                      |
           v                                      v
  +------------------- durable ingress / FastAPI -------------------+
@@ -28,6 +28,12 @@
 
 No provider adapter writes domain tables. A Telegram callback, MAX button or
 HTTP request reaches the same application service and domain invariants.
+Client, operator, master and admin user interfaces live in messenger
+frontends; an operator web board is deliberately outside the target product.
+
+The behavioural baseline is `dez_core_dr`. Industry packs generalise its
+terminology, fields and evidence requirements, but do not replace its proven
+client/operator/master/admin workflows.
 
 ## Work allocation policies
 
@@ -96,12 +102,40 @@ accuracy. PostgreSQL appends only new points; recording a new location does not
 delete or rewrite earlier history. One active tracking session per order is
 enforced by a partial unique index.
 
-### Capabilities and identities
+### Capabilities, actors and bindings
 
 Messenger button payloads contain opaque expiring tokens, not trusted role or
 order commands. The database resolves a token within its organisation and role
-scope. External Telegram/MAX user IDs map to internal actors; unregistered
-users receive their external ID and no business command is executed.
+scope. A production actor represents one person and may have several explicit
+memberships in `actor_roles`, plus controlled Telegram and MAX bindings. A
+channel or bot frontend selects the effective role for the current interaction;
+it does not grant that role.
+
+This supports an optional nano preset where one owner is admin, operator and
+master. Removing one membership preserves the actor, their other roles,
+bindings and history. A shared MAX staff bot asks a multi-role actor to choose
+the current mode; separate Telegram role bots derive it from the frontend.
+
+Inbound identity includes `organization_id + provider + consumer_key +
+external_event_id`. Client and staff bots can therefore receive the same
+provider update ID without deduplicating or claiming each other's event. The
+same routing boundary applies to polling cursors and outbound queues. A MAX
+staff sender is the deliberate exception on egress: it claims `staff`, `admin`,
+`operator` and `master` messages through one physical token, never `client`.
+
+An unknown operator/master account first enters a durable pre-authentication
+session. `/start` opens a 15-minute window with five failed attempts. The
+administrator-issued four-digit code is consumed only if its active membership
+matches the role selected by the frontend. A mismatch is rejected before an
+external identity or membership is mutated. Successful binding clears both the
+one-time code and the pre-authentication session; the same flow is parsed by
+Telegram and MAX transports.
+
+Operator workflow state is scoped by organisation, actor, effective role and
+provider. This prevents a nano-owner's admin configuration flow, Telegram
+operator flow and MAX operator flow from overwriting each other. Master
+creation carries a durable request key protected by a PostgreSQL advisory lock
+and unique index, so an inbound retry cannot create a second actor.
 
 ## Scale model
 
@@ -141,6 +175,8 @@ profile for MAX. Profiles are packaging choices, not product forks.
 - application containers run as a fixed non-root user, read-only, without Linux
   capabilities;
 - cross-organisation reads and token resolution are scoped in SQL;
+- staff enrollment is time-bound, attempt-limited and role/frontend scoped;
+- provider updates are durably isolated by organisation and logical frontend;
 - network calls never hold a database transaction open;
 - no location is accepted without an active tracking session;
 - regulated-industry suitability is not claimed without a separate compliance

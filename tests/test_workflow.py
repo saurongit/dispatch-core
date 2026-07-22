@@ -49,34 +49,37 @@ class DispatchWorkflowTests(unittest.TestCase):
 
     def test_complete_vertical_slice_closes_tracking_and_writes_outbox(self) -> None:
         order = self.create_order()
-        self.service.claim_coordination(order.id, "dispatcher-1")
+        self.service.claim_coordination("org-1", order.id, "dispatcher-1")
         self.service.publish_pool(
-            order.id, PoolMode.CURATED, actor_id="dispatcher-1"
+            "org-1", order.id, PoolMode.CURATED, actor_id="dispatcher-1"
         )
-        self.service.express_interest(order.id, "worker-1")
+        self.service.express_interest("org-1", order.id, "worker-1")
         self.service.assign_order(
-            order.id, "worker-1", actor_id="dispatcher-1"
+            "org-1", order.id, "worker-1", actor_id="dispatcher-1"
         )
-        self.service.accept_order(order.id, "worker-1")
+        self.service.accept_order("org-1", order.id, "worker-1")
         _, session = self.service.start_travel(
-            order.id, "worker-1", session_id="track-1"
+            "org-1", order.id, "worker-1", session_id="track-1"
         )
         self.service.record_location(
+            organization_id="org-1",
+            executor_id="worker-1",
             session_id=session.id,
             latitude=53.7557,
             longitude=87.1099,
             source=LocationSource.TELEGRAM,
             accuracy_m=9.5,
         )
-        self.service.start_work(order.id, "worker-1")
+        self.service.start_work("org-1", order.id, "worker-1")
         completed = self.service.complete_order(
+            "org-1",
             order.id,
             "worker-1",
             CompletionReport(photo_refs=("photo://1",), comment="Repaired"),
         )
 
         self.assertEqual(WorkOrderStatus.COMPLETED, completed.status)
-        stored_session = self.factory.store.tracking_sessions[session.id]
+        stored_session = self.factory.store.tracking_sessions[("org-1", session.id)]
         self.assertEqual(TrackingStatus.COMPLETED, stored_session.status)
         self.assertEqual(1, len(stored_session.points))
         event_names = [item.name for item in self.factory.store.outbox_events]
@@ -102,12 +105,14 @@ class DispatchWorkflowTests(unittest.TestCase):
 
     def test_duplicate_location_source_event_is_idempotent(self) -> None:
         order = self.create_order()
-        self.service.assign_order(order.id, "worker-1")
-        self.service.accept_order(order.id, "worker-1")
+        self.service.assign_order("org-1", order.id, "worker-1")
+        self.service.accept_order("org-1", order.id, "worker-1")
         _, session = self.service.start_travel(
-            order.id, "worker-1", session_id="track-idempotent"
+            "org-1", order.id, "worker-1", session_id="track-idempotent"
         )
         first = self.service.record_location(
+            organization_id="org-1",
+            executor_id="worker-1",
             session_id=session.id,
             latitude=53.75,
             longitude=87.1,
@@ -115,6 +120,8 @@ class DispatchWorkflowTests(unittest.TestCase):
             source_event_id="telegram:update-77",
         )
         duplicate = self.service.record_location(
+            organization_id="org-1",
+            executor_id="worker-1",
             session_id=session.id,
             latitude=1.0,
             longitude=2.0,
@@ -128,25 +135,27 @@ class DispatchWorkflowTests(unittest.TestCase):
 
     def test_completion_rejects_missing_evidence_without_persisting(self) -> None:
         order = self.create_order()
-        self.service.assign_order(order.id, "worker-1")
-        self.service.accept_order(order.id, "worker-1")
-        self.service.start_work(order.id, "worker-1")
+        self.service.assign_order("org-1", order.id, "worker-1")
+        self.service.accept_order("org-1", order.id, "worker-1")
+        self.service.start_work("org-1", order.id, "worker-1")
 
         with self.assertRaises(EvidenceMissing):
-            self.service.complete_order(order.id, "worker-1", CompletionReport())
+            self.service.complete_order(
+                "org-1", order.id, "worker-1", CompletionReport()
+            )
 
         stored = self.factory.store.orders[order.id]
         self.assertEqual(WorkOrderStatus.IN_PROGRESS, stored.status)
 
     def test_assigned_order_rejects_another_executor(self) -> None:
         order = self.create_order()
-        self.service.assign_order(order.id, "worker-1")
+        self.service.assign_order("org-1", order.id, "worker-1")
         with self.assertRaises(InvalidTransition):
-            self.service.accept_order(order.id, "worker-2")
+            self.service.accept_order("org-1", order.id, "worker-2")
 
     def test_optimistic_lock_allows_only_first_claim(self) -> None:
         order = self.create_order()
-        self.service.publish_pool(order.id, PoolMode.FIRST_CLAIM)
+        self.service.publish_pool("org-1", order.id, PoolMode.FIRST_CLAIM)
         first_copy = deepcopy(self.factory.store.orders[order.id])
         second_copy = deepcopy(self.factory.store.orders[order.id])
         expected = first_copy.version
@@ -168,8 +177,8 @@ class DispatchWorkflowTests(unittest.TestCase):
 
     def test_curated_interest_does_not_assign_executor(self) -> None:
         order = self.create_order()
-        self.service.publish_pool(order.id, PoolMode.CURATED)
-        interested = self.service.express_interest(order.id, "worker-1")
+        self.service.publish_pool("org-1", order.id, PoolMode.CURATED)
+        interested = self.service.express_interest("org-1", order.id, "worker-1")
 
         self.assertIsNone(interested.assignee_id)
         self.assertEqual(WorkOrderStatus.POOL_OPEN, interested.status)
@@ -180,15 +189,15 @@ class DispatchWorkflowTests(unittest.TestCase):
 
     def test_curated_operator_selects_among_interested_executors(self) -> None:
         order = self.create_order()
-        self.service.claim_coordination(order.id, "dispatcher-1")
+        self.service.claim_coordination("org-1", order.id, "dispatcher-1")
         self.service.publish_pool(
-            order.id, PoolMode.CURATED, actor_id="dispatcher-1"
+            "org-1", order.id, PoolMode.CURATED, actor_id="dispatcher-1"
         )
-        self.service.express_interest(order.id, "worker-1")
-        self.service.express_interest(order.id, "worker-2")
+        self.service.express_interest("org-1", order.id, "worker-1")
+        self.service.express_interest("org-1", order.id, "worker-2")
 
         assigned = self.service.assign_order(
-            order.id, "worker-2", actor_id="dispatcher-1"
+            "org-1", order.id, "worker-2", actor_id="dispatcher-1"
         )
 
         self.assertEqual("worker-2", assigned.assignee_id)

@@ -20,12 +20,18 @@ from dispatch_core.infrastructure.postgres import (
     PostgresUnitOfWorkFactory,
 )
 from dispatch_core.infrastructure.read_models import PostgresOrderReader
+from dispatch_core.infrastructure.staff_workflows import (
+    PostgresStaffViewStore,
+    PostgresStaffWorkflowSessionStore,
+)
 from dispatch_core.infrastructure.workflow_store import (
     PostgresConfigSessionStore,
     PostgresExecutionStore,
     PostgresIdentityStore,
     PostgresIntakeSessionStore,
     PostgresReportDraftStore,
+    PostgresStaffBindingSessionStore,
+    PostgresStaffRoleSelectionStore,
 )
 from dispatch_core.messaging.config import MENU_COMMANDS, ConfigCoordinator
 from dispatch_core.messaging.intake import IntakeCoordinator
@@ -36,6 +42,13 @@ from dispatch_core.messaging.projector import (
     PostgresNotificationProjector,
 )
 from dispatch_core.messaging.sender import OutboundSender
+from dispatch_core.messaging.staff import StaffRoleCoordinator
+from dispatch_core.messaging.workspaces import (
+    MASTER_MENU_COMMANDS,
+    OPERATOR_MENU_COMMANDS,
+    MasterCoordinator,
+    OperatorCoordinator,
+)
 from dispatch_core.packs.catalog import seed_definition
 from dispatch_core.transports.max import MaxTransport
 from dispatch_core.transports.polling import DurablePollingReceiver
@@ -86,16 +99,30 @@ async def run_worker(
     )
     intake_sessions = PostgresIntakeSessionStore(pool)
     config_sessions = PostgresConfigSessionStore(pool)
+    binding_sessions = PostgresStaffBindingSessionStore(pool)
+    staff_workflow_sessions = PostgresStaffWorkflowSessionStore(pool)
+    staff_roles = StaffRoleCoordinator(PostgresStaffRoleSelectionStore(pool))
+    staff_views = PostgresStaffViewStore(pool)
+    identities = PostgresIdentityStore(pool)
     intake = IntakeCoordinator(
         packs=packs,
         sessions=intake_sessions,
         service=service,
+        outbound=outbound,
+        identities=identities,
     )
     config = ConfigCoordinator(
         packs=packs,
         sessions=config_sessions,
+        identities=identities,
     )
-    identities = PostgresIdentityStore(pool)
+    operator = OperatorCoordinator(
+        identities=identities,
+        sessions=staff_workflow_sessions,
+        views=staff_views,
+        packs=packs,
+    )
+    master = MasterCoordinator(views=staff_views, packs=packs)
     processor = InboundProcessor(
         inbox=inbox,
         identities=identities,
@@ -109,17 +136,26 @@ async def run_worker(
         packs=packs,
         intake=intake,
         config=config,
+        binding_sessions=binding_sessions,
+        staff_roles=staff_roles,
+        operator=operator,
+        master=master,
+        organization_id=settings.organization_id,
+        consumer_key=settings.consumer_key,
     )
     projector = OutboxProjectorWorker(
         PostgresOutboxStore(pool),
         PostgresNotificationProjector(pool, packs),
     )
-    sender = OutboundSender(outbound, transports)
+    sender = OutboundSender(outbound, transports, consumer_key=settings.consumer_key)
     polling = DurablePollingReceiver(inbox)
     telegram = transports.get(Provider.TELEGRAM)
     if isinstance(telegram, TelegramTransport):
-        await _register_admin_commands(
-            telegram, identities, settings.organization_id
+        await _register_frontend_commands(
+            telegram,
+            identities,
+            settings.organization_id,
+            settings.consumer_key,
         )
     stop = stop_event or asyncio.Event()
     if stop_event is None:
@@ -136,7 +172,12 @@ async def run_worker(
             )
             tasks.create_task(
                 _periodic(
-                    lambda: _cleanup_sessions(intake_sessions, config_sessions),
+                    lambda: _cleanup_sessions(
+                        intake_sessions,
+                        config_sessions,
+                        binding_sessions,
+                        staff_workflow_sessions,
+                    ),
                     stop,
                     _SESSION_CLEANUP_INTERVAL_SECONDS,
                 )
@@ -150,32 +191,30 @@ async def run_worker(
                     )
                 )
             telegram_poll = transports.get(Provider.TELEGRAM)
-            if (
-                settings.telegram_receive_mode == "polling"
-                and isinstance(telegram_poll, TelegramTransport)
+            if settings.telegram_receive_mode == "polling" and isinstance(
+                telegram_poll, TelegramTransport
             ):
                 tasks.create_task(
                     _repeat(
                         lambda: polling.telegram_once(
                             telegram_poll,
                             organization_id=settings.organization_id,
-                            consumer_key=f"{settings.organization_id}:telegram",
+                            consumer_key=settings.consumer_key,
                         ),
                         stop,
                         settings.worker_idle_seconds,
                     )
                 )
             maximum = transports.get(Provider.MAX)
-            if (
-                settings.max_receive_mode == "polling"
-                and isinstance(maximum, MaxTransport)
+            if settings.max_receive_mode == "polling" and isinstance(
+                maximum, MaxTransport
             ):
                 tasks.create_task(
                     _repeat(
                         lambda: polling.max_once(
                             maximum,
                             organization_id=settings.organization_id,
-                            consumer_key=f"{settings.organization_id}:max",
+                            consumer_key=settings.consumer_key,
                         ),
                         stop,
                         settings.worker_idle_seconds,
@@ -188,24 +227,37 @@ async def run_worker(
         await database.close()
 
 
-async def _register_admin_commands(
+async def _register_frontend_commands(
     telegram: TelegramTransport,
     identities: PostgresIdentityStore,
     organization_id: str,
+    consumer_key: str,
 ) -> None:
+    role_commands = {
+        "admin": MENU_COMMANDS,
+        "operator": OPERATOR_MENU_COMMANDS,
+        "master": MASTER_MENU_COMMANDS,
+    }
+    commands = role_commands.get(consumer_key)
+    if commands is None:
+        return
     try:
-        admin_ids = await identities.external_ids_for_role(
+        external_ids = await identities.external_ids_for_role(
             organization_id=organization_id,
             provider=Provider.TELEGRAM,
-            role="admin",
+            role=consumer_key,
         )
-        for admin_id in admin_ids:
+        for external_id in external_ids:
             await telegram.set_my_commands(
-                MENU_COMMANDS,
-                scope={"type": "chat", "chat_id": int(admin_id)},
+                commands,
+                scope={"type": "chat", "chat_id": int(external_id)},
             )
     except Exception:
-        logger.warning("failed to register admin bot commands", exc_info=True)
+        logger.warning(
+            "failed to register %s bot commands",
+            consumer_key,
+            exc_info=True,
+        )
 
 
 async def _repeat(
@@ -250,18 +302,18 @@ async def _periodic(
     interval_seconds: float,
 ) -> None:
     while not stop.is_set():
-        await _wait_or_stop(stop, interval_seconds)
-        if stop.is_set():
-            break
         try:
             await operation()
         except Exception:
             logger.exception("periodic operation failed")
+        await _wait_or_stop(stop, interval_seconds)
 
 
 async def _cleanup_sessions(
     intake_sessions: PostgresIntakeSessionStore,
     config_sessions: PostgresConfigSessionStore,
+    binding_sessions: PostgresStaffBindingSessionStore,
+    staff_workflow_sessions: PostgresStaffWorkflowSessionStore,
 ) -> None:
     intake_deleted = await intake_sessions.cleanup_stale(
         max_age_hours=_SESSION_TTL_HOURS,
@@ -269,13 +321,22 @@ async def _cleanup_sessions(
     config_deleted = await config_sessions.cleanup_stale(
         max_age_hours=_SESSION_TTL_HOURS,
     )
-    total = intake_deleted + config_deleted
+    binding_deleted = await binding_sessions.cleanup_expired()
+    staff_deleted = await staff_workflow_sessions.cleanup_stale(
+        max_age_hours=_SESSION_TTL_HOURS,
+    )
+    total = intake_deleted + config_deleted + binding_deleted + staff_deleted
     if total:
         logger.info(
-            "cleaned up %d stale sessions (intake=%d, config=%d)",
+            (
+                "cleaned up %d stale sessions "
+                "(intake=%d, config=%d, binding=%d, staff=%d)"
+            ),
             total,
             intake_deleted,
             config_deleted,
+            binding_deleted,
+            staff_deleted,
         )
 
 

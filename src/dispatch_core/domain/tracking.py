@@ -57,6 +57,8 @@ class TrackingSession:
     status: TrackingStatus = TrackingStatus.ACTIVE
     points: list[TrackingPoint] = field(default_factory=list)
     version: int = 0
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     _events: list[DomainEvent] = field(default_factory=list, repr=False)
 
     @classmethod
@@ -102,6 +104,16 @@ class TrackingSession:
         self.status = TrackingStatus.COMPLETED
         self._record("tracking.completed", {"point_count": len(self.points)}, now)
 
+    def cancel(
+        self, reason: str = "", *, now: datetime | None = None
+    ) -> None:
+        if self.status is not TrackingStatus.ACTIVE:
+            raise InvalidTransition("tracking session is not active")
+        self.status = TrackingStatus.CANCELLED
+        self._record(
+            "tracking.cancelled", {"reason": reason}, now
+        )
+
     def latest_point(self) -> TrackingPoint | None:
         return self.points[-1] if self.points else None
 
@@ -118,6 +130,7 @@ class TrackingSession:
     ) -> None:
         instant = now or datetime.now(UTC)
         self.version += 1
+        self.updated_at = instant
         self._events.append(
             DomainEvent.create(
                 organization_id=self.organization_id,

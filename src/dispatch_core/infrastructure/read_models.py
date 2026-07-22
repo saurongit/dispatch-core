@@ -33,6 +33,6 @@ class PostgresOrderReader:
 
     async def get(self, organization_id: str, order_id: str) -> WorkOrder:
         async with self._pool.acquire() as connection:
-            return await PostgresOrderRepository(connection).get(
+            return await PostgresOrderRepository(connection).get_for_read(
                 organization_id, order_id
             )
