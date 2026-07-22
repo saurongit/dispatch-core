@@ -8,6 +8,10 @@
 - PostgreSQL migrations, optimistic locking and race-preventing constraints;
 - durable inbox/cursors, transactional outbox and durable outbound queue;
 - Telegram and MAX polling/webhook transports, buttons, photos and locations;
+- native/map/manual client address intake with an atomic one-time map
+  capability;
+- read-only client map, native Telegram/MAX location requests and a browser GPS
+  fallback with independent read/write capabilities;
 - durable, role-scoped `/start -> code` staff enrollment with expiry and an
   attempt limit;
 - frontend-isolated inbox/cursors and the two-bot MAX topology with a durable
@@ -16,7 +20,7 @@
   order navigation and paired Telegram/MAX PostgreSQL E2E;
 - FastAPI command/configuration surface and health endpoints;
 - Docker Compose packaging and file-based provider secrets;
-- 579 tests, including 37 live PostgreSQL race/E2E tests, and a 90% branch
+- 670 tests, including 44 live PostgreSQL race/E2E tests, and a 90% branch
   coverage gate.
 
 This milestone is usable as an integration backend and a technical portfolio.
@@ -32,7 +36,8 @@ non-negotiable product contract. There is deliberately no dispatcher web board.
   from `core_dr` into the implemented operator workspace;
 - port master travel/location/report flow and operator report approval/final
   close;
-- port client tracking, chat, status and review flows;
+- port the remaining client chat, status and review flows around the implemented
+  tracking link;
 - support explicitly assigned multi-role actors and the nano onboarding preset;
 - add automatic card/button/FSM parity checks between Telegram and MAX;
 - add attachment storage, retention, queue health, backup and recovery checks.
@@ -47,7 +52,7 @@ week without a web board, YAML edits or a source fork.
 - tray/launcher installer and guided first-run wizard that provisions messenger
   frontends;
 - field service, local delivery, property and tourism starter packs;
-- route/customer status view with explicit retention and access policy;
+- configurable tile provider and explicit GPS retention/erasure policy;
 - signed, versioned connectivity bundle delivery with rollback;
 - import/export and upgrade-safe backup migration.
 

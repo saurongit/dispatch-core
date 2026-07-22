@@ -200,12 +200,32 @@ class TelegramTransport:
             "disable_web_page_preview": True,
         }
         if message.buttons:
-            payload["reply_markup"] = {
-                "inline_keyboard": [
-                    [self._button(button) for button in row]
-                    for row in group_buttons(message.buttons)
-                ]
-            }
+            location_buttons = [
+                button for button in message.buttons if button.request_location
+            ]
+            if location_buttons:
+                if len(location_buttons) != len(message.buttons):
+                    raise ValueError(
+                        "Telegram cannot mix inline and reply keyboard buttons"
+                    )
+                payload["reply_markup"] = {
+                    "keyboard": [
+                        [
+                            {"text": button.text, "request_location": True}
+                            for button in row
+                        ]
+                        for row in group_buttons(message.buttons)
+                    ],
+                    "resize_keyboard": True,
+                    "one_time_keyboard": True,
+                }
+            else:
+                payload["reply_markup"] = {
+                    "inline_keyboard": [
+                        [self._button(button) for button in row]
+                        for row in group_buttons(message.buttons)
+                    ]
+                }
         response = await self._client.post(
             f"{self._bot_url()}/sendMessage",
             json=payload,

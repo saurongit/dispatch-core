@@ -271,6 +271,52 @@ async def test_telegram_send_serializes_inline_buttons() -> None:
 
 
 @pytest.mark.asyncio
+async def test_telegram_send_serializes_location_reply_keyboard() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["json"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 89}})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = TelegramTransport("secret-token", client=client)
+
+    await transport.send(
+        outbound(
+            Provider.TELEGRAM,
+            buttons=(OutboundButton("Отправить геопозицию", request_location=True),),
+        )
+    )
+    await client.aclose()
+
+    assert captured["json"]["reply_markup"] == {
+        "keyboard": [
+            [{"text": "Отправить геопозицию", "request_location": True}]
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_telegram_rejects_mixed_inline_and_reply_keyboard() -> None:
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: None))
+    transport = TelegramTransport("secret-token", client=client)
+
+    with pytest.raises(ValueError, match="cannot mix"):
+        await transport.send(
+            outbound(
+                Provider.TELEGRAM,
+                buttons=(
+                    OutboundButton("Принять", callback_token="accept-token"),
+                    OutboundButton("Геопозиция", request_location=True),
+                ),
+            )
+        )
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_telegram_get_updates_returns_durable_next_offset() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)

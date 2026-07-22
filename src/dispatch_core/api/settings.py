@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -22,6 +23,10 @@ class Settings(BaseSettings):
     database_url: SecretStr
     organization_id: str = "default"
     organization_name: str = "Dispatch Core"
+    public_base_url: str | None = None
+    default_map_latitude: float = Field(default=55.7558, ge=-90, le=90)
+    default_map_longitude: float = Field(default=37.6173, ge=-180, le=180)
+    default_map_zoom: int = Field(default=11, ge=2, le=18)
     default_pack: str = "field_service"
     admin_api_key: SecretStr
     auto_migrate: bool = True
@@ -58,6 +63,19 @@ class Settings(BaseSettings):
         if not value.strip():
             raise ValueError("organization fields cannot be blank")
         return value.strip()
+
+    @field_validator("public_base_url")
+    @classmethod
+    def validate_public_base_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip().rstrip("/")
+        parsed = urlsplit(cleaned)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("public_base_url must be an absolute HTTP(S) URL")
+        if parsed.query or parsed.fragment:
+            raise ValueError("public_base_url cannot contain query or fragment")
+        return cleaned
 
     @model_validator(mode="after")
     def validate_webhook_secrets(self) -> Settings:

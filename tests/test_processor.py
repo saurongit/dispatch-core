@@ -18,7 +18,7 @@ from dispatch_core.messaging.models import (
     Provider,
 )
 from dispatch_core.messaging.processor import InboundProcessor
-from dispatch_core.messaging.replies import Reply
+from dispatch_core.messaging.replies import Reply, ReplyButton
 from dispatch_core.messaging.workspaces import MASTER_MENU, OPERATOR_MENU
 from dispatch_core.transports.contracts import EventKind, InboundEvent
 
@@ -305,6 +305,28 @@ def processor(
         "consumer_key": consumer_key,
     }
     return InboundProcessor(**values), values  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_reply_buttons_can_mint_url_and_native_location_actions() -> None:
+    target, _ = processor()
+
+    buttons = await target._mint_buttons(
+        "org-1",
+        (
+            ReplyButton(
+                "Карта",
+                "",
+                url="https://dispatch.example/address#token",
+            ),
+            ReplyButton("Геопозиция", "", request_location=True, row=1),
+        ),
+    )
+
+    assert buttons[0].url == "https://dispatch.example/address#token"
+    assert buttons[0].callback_token is None
+    assert buttons[1].request_location
+    assert buttons[1].row == 1
 
 
 @pytest.mark.parametrize(

@@ -10,6 +10,10 @@ from typing import Any
 
 import asyncpg
 
+from dispatch_core.application.tracking_links import (
+    location_submission_url,
+    public_tracking_url,
+)
 from dispatch_core.infrastructure.messaging import (
     PendingDomainEvent,
     PostgresOutboxStore,
@@ -24,10 +28,19 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True, slots=True)
 class PlannedButton:
     text: str
-    action: str
+    action: str | None
     payload: dict[str, Any]
     allowed_role: str | None
     row: int = 0
+    url: str | None = None
+    request_location: bool = False
+
+    def __post_init__(self) -> None:
+        destinations = sum(
+            (self.action is not None, self.url is not None, self.request_location)
+        )
+        if destinations != 1:
+            raise ValueError("planned button requires exactly one destination")
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,10 +57,15 @@ class PostgresNotificationProjector:
     """Atomically turns domain events into callback tokens and outbound messages."""
 
     def __init__(
-        self, pool: asyncpg.Pool, packs: PostgresPackStore | None = None
+        self,
+        pool: asyncpg.Pool,
+        packs: PostgresPackStore | None = None,
+        *,
+        public_base_url: str | None = None,
     ) -> None:
         self._pool = pool
         self._packs = packs
+        self._public_base_url = public_base_url
 
     async def project(self, event: PendingDomainEvent) -> int:
         async with self._pool.acquire() as connection:
@@ -62,7 +80,29 @@ class PostgresNotificationProjector:
                 )
                 pack = await self._active_pack(event.organization_id)
                 card = self._card(order, pack)
-                plans = self._plans(event, order, card)
+                public_token = None
+                location_token = None
+                if event.name == "work_order.travel_started" and order is not None:
+                    capabilities = await connection.fetchrow(
+                        """
+                        SELECT public_token, location_token
+                        FROM tracking_sessions
+                        WHERE organization_id = $1 AND work_order_id = $2
+                          AND status = 'active'
+                        """,
+                        event.organization_id,
+                        event.aggregate_id,
+                    )
+                    if capabilities is not None:
+                        public_token = capabilities["public_token"]
+                        location_token = capabilities["location_token"]
+                plans = self._plans(
+                    event,
+                    order,
+                    card,
+                    public_token=public_token,
+                    location_token=location_token,
+                )
                 inserted = 0
                 for plan in plans:
                     buttons = await self._buttons(connection, event, plan.buttons)
@@ -117,6 +157,28 @@ class PostgresNotificationProjector:
     ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         for button in buttons:
+            if button.url is not None:
+                result.append(
+                    {
+                        "text": button.text,
+                        "callback_token": None,
+                        "url": button.url,
+                        "request_location": False,
+                        "row": button.row,
+                    }
+                )
+                continue
+            if button.request_location:
+                result.append(
+                    {
+                        "text": button.text,
+                        "callback_token": None,
+                        "url": None,
+                        "request_location": True,
+                        "row": button.row,
+                    }
+                )
+                continue
             token = token_urlsafe(18)
             await connection.execute(
                 """
@@ -209,6 +271,9 @@ class PostgresNotificationProjector:
         event: PendingDomainEvent,
         order: asyncpg.Record | None,
         card: str,
+        *,
+        public_token: str | None = None,
+        location_token: str | None = None,
     ) -> tuple[RecipientPlan, ...]:
         if event.aggregate_type != "work_order" or order is None:
             return ()
@@ -375,6 +440,24 @@ class PostgresNotificationProjector:
                     purpose="travel",
                     delivery_role="master",
                 ),
+                RecipientPlan(
+                    actor_ids=(assignee,) if assignee else (),
+                    text=(
+                        "Отправьте геопозицию. Для движения используйте "
+                        "трансляцию геопозиции в мессенджере."
+                    ),
+                    buttons=(
+                        PlannedButton(
+                            "Отправить геопозицию",
+                            None,
+                            {},
+                            "master",
+                            request_location=True,
+                        ),
+                    ),
+                    purpose="travel:location",
+                    delivery_role="master",
+                ),
             ]
             if coordinators:
                 plans.append(
@@ -383,6 +466,51 @@ class PostgresNotificationProjector:
                         text=f"Мастер выехал на заявку.\n{card}",
                         purpose="coordinator_travel",
                         delivery_role="operator",
+                    )
+                )
+            if requester and self._public_base_url and public_token:
+                plans.append(
+                    RecipientPlan(
+                        actor_ids=(requester,),
+                        text="Мастер выехал. Положение можно смотреть по ссылке.",
+                        buttons=(
+                            PlannedButton(
+                                "Открыть карту",
+                                None,
+                                {},
+                                "client",
+                                url=public_tracking_url(
+                                    self._public_base_url,
+                                    public_token,
+                                ),
+                            ),
+                        ),
+                        purpose="travel:client",
+                        delivery_role="client",
+                    )
+                )
+            if assignee and self._public_base_url and location_token:
+                plans.append(
+                    RecipientPlan(
+                        actor_ids=(assignee,),
+                        text=(
+                            "Если мессенджер не передаёт геопозицию, откройте "
+                            "резервную передачу GPS."
+                        ),
+                        buttons=(
+                            PlannedButton(
+                                "Передавать GPS",
+                                None,
+                                {},
+                                "master",
+                                url=location_submission_url(
+                                    self._public_base_url,
+                                    location_token,
+                                ),
+                            ),
+                        ),
+                        purpose="travel:browser_location",
+                        delivery_role="master",
                     )
                 )
             return tuple(plans)

@@ -21,6 +21,13 @@ Include the affected version, impact, reproduction and any suggested fix.
 - Run supported PostgreSQL/Python/container versions and apply updates.
 - Encrypt backups and test restoration.
 - Define retention and access rules before collecting GPS or customer data.
+- Keep tracking capabilities out of query strings, analytics and proxy logs;
+  terminal transitions revoke access but retained GPS rows still require an
+  explicit deletion/retention policy.
+- Treat address-picker capabilities the same way: keep fragments and
+  `X-Intake-Token` out of logs. A successful save consumes the token, but the
+  resulting address and coordinates remain personal data under the deployment's
+  retention policy.
 
 The project has not undergone a third-party penetration test. It must not be
 presented as certified for emergency, medical, financial or other regulated

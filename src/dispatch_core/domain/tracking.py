@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from math import isfinite
+from secrets import token_urlsafe
 from typing import Any
 
 from .errors import InvalidTransition
@@ -54,12 +55,31 @@ class TrackingSession:
     organization_id: str
     work_order_id: str
     executor_id: str
+    public_token: str | None = None
+    location_token: str | None = None
     status: TrackingStatus = TrackingStatus.ACTIVE
     points: list[TrackingPoint] = field(default_factory=list)
     version: int = 0
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     _events: list[DomainEvent] = field(default_factory=list, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.public_token is not None and (
+            len(self.public_token) < 43 or not self.public_token.strip()
+        ):
+            raise ValueError("public tracking token must contain at least 256 bits")
+        if self.location_token is not None and (
+            len(self.location_token) < 43 or not self.location_token.strip()
+        ):
+            raise ValueError(
+                "location submission token must contain at least 256 bits"
+            )
+        if (
+            self.public_token is not None
+            and self.public_token == self.location_token
+        ):
+            raise ValueError("tracking capability tokens must be distinct")
 
     @classmethod
     def start(
@@ -69,12 +89,37 @@ class TrackingSession:
         organization_id: str,
         work_order_id: str,
         executor_id: str,
+        public_token: str | None = None,
+        location_token: str | None = None,
         now: datetime | None = None,
     ) -> TrackingSession:
         if not all((session_id, organization_id, work_order_id, executor_id)):
             raise ValueError("tracking session identifiers are required")
-        session = cls(session_id, organization_id, work_order_id, executor_id)
-        session._record("tracking.started", {}, now)
+        token = public_token if public_token is not None else token_urlsafe(32)
+        if len(token) < 43 or not token.strip():
+            raise ValueError("public tracking token must contain at least 256 bits")
+        sender_token = (
+            location_token if location_token is not None else token_urlsafe(32)
+        )
+        if len(sender_token) < 43 or not sender_token.strip():
+            raise ValueError(
+                "location submission token must contain at least 256 bits"
+            )
+        if sender_token == token:
+            raise ValueError("tracking capability tokens must be distinct")
+        session = cls(
+            session_id,
+            organization_id,
+            work_order_id,
+            executor_id,
+            public_token=token,
+            location_token=sender_token,
+        )
+        session._record(
+            "tracking.started",
+            {"browser_location": True, "public_tracking": True},
+            now,
+        )
         return session
 
     def add_point(self, point: TrackingPoint) -> None:
@@ -102,6 +147,8 @@ class TrackingSession:
         if self.status is not TrackingStatus.ACTIVE:
             raise InvalidTransition("tracking session is not active")
         self.status = TrackingStatus.COMPLETED
+        self.public_token = None
+        self.location_token = None
         self._record("tracking.completed", {"point_count": len(self.points)}, now)
 
     def cancel(
@@ -110,6 +157,8 @@ class TrackingSession:
         if self.status is not TrackingStatus.ACTIVE:
             raise InvalidTransition("tracking session is not active")
         self.status = TrackingStatus.CANCELLED
+        self.public_token = None
+        self.location_token = None
         self._record(
             "tracking.cancelled", {"reason": reason}, now
         )

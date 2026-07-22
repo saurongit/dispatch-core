@@ -12,6 +12,10 @@ release yet.
 - Added FastAPI commands and actor identity configuration.
 - Added Telegram and MAX polling/webhook transports.
 - Added evidence-backed completion and append-only, source-idempotent tracking.
+- Added client tracking map, native location prompts and browser GPS fallback
+  with independent read/write capabilities revoked on terminal transitions.
+- Added native/map/manual address intake with an atomic one-time map capability
+  and a scroll-safe, visibly attributed OpenStreetMap picker.
 - Added non-root Docker packaging, CI across Python 3.12–3.14 and a 90% branch
   coverage gate.
 - Licensed the public repository under AGPL-3.0-only.

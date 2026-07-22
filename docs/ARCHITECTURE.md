@@ -102,6 +102,21 @@ accuracy. PostgreSQL appends only new points; recording a new location does not
 delete or rewrite earlier history. One active tracking session per order is
 enforced by a partial unique index.
 
+Each active session owns two unrelated 256-bit bearer capabilities. The client
+capability reads only a safe latest-point projection; the master capability may
+append browser GPS points but cannot read the client view. Tokens live in URL
+fragments, travel to the API only in headers and are cleared atomically when an
+order completes or is cancelled. Telegram/MAX native location remains the
+primary path; `/track/share` is the provider-neutral browser fallback.
+
+Address collection is a separate capability flow. After the client supplies a
+phone number, the intake FSM offers messenger-native location, manual text and
+a one-time `/address#…` map. The browser sends the token only in a header. A
+single PostgreSQL transaction locks the matching intake session, stores the
+object coordinates, advances the FSM to services and removes the token. The
+service point is copied into order details only after confirmation and is then
+available to the safe tracking projection; no IP geolocation is used.
+
 ### Capabilities, actors and bindings
 
 Messenger button payloads contain opaque expiring tokens, not trusted role or
@@ -179,5 +194,7 @@ profile for MAX. Profiles are packaging choices, not product forks.
 - provider updates are durably isolated by organisation and logical frontend;
 - network calls never hold a database transaction open;
 - no location is accepted without an active tracking session;
+- client read and master write tracking capabilities are distinct, rate-limited
+  and revoked on every terminal transition;
 - regulated-industry suitability is not claimed without a separate compliance
   and threat review.

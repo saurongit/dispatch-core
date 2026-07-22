@@ -20,6 +20,16 @@ class ActiveExecution:
     tracking_session_id: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class IntakeAddressSelection:
+    organization_id: str
+    actor_id: str
+    provider: Provider
+    address: str
+    latitude: float
+    longitude: float
+
+
 class PostgresIdentityStore:
     _roles = frozenset({"admin", "operator", "master", "client"})
 
@@ -1239,6 +1249,72 @@ class _PostgresSessionStore:
 
 class PostgresIntakeSessionStore(_PostgresSessionStore):
     _table = "intake_sessions"
+
+    async def select_address_by_token(
+        self,
+        *,
+        token: str,
+        latitude: float,
+        longitude: float,
+        address: str | None = None,
+    ) -> IntakeAddressSelection | None:
+        label = (address or "").strip()[:500]
+        if not label:
+            label = f"Точка на карте: {latitude:.5f}, {longitude:.5f}"
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    """
+                    SELECT organization_id, actor_id, provider, state
+                    FROM intake_sessions
+                    WHERE state ->> 'address_token' = $1
+                      AND state ->> 'step' = 'address'
+                    FOR UPDATE
+                    """,
+                    token,
+                )
+                if row is None:
+                    return None
+                raw_state = row["state"]
+                state = (
+                    json.loads(raw_state)
+                    if isinstance(raw_state, str)
+                    else dict(raw_state)
+                )
+                field_values = dict(state.get("field_values") or {})
+                field_values["address"] = label
+                state["field_values"] = field_values
+                state["service_location"] = {
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "method": "map",
+                }
+                state["step"] = "services"
+                state.setdefault("selected", [])
+                state.pop("address_token", None)
+                state.pop("address_mode", None)
+                await connection.execute(
+                    """
+                    UPDATE intake_sessions
+                    SET state = $3::jsonb, updated_at = now()
+                    WHERE organization_id = $1 AND actor_id = $2
+                    """,
+                    row["organization_id"],
+                    row["actor_id"],
+                    json.dumps(
+                        state,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                )
+        return IntakeAddressSelection(
+            organization_id=row["organization_id"],
+            actor_id=row["actor_id"],
+            provider=Provider(row["provider"]),
+            address=label,
+            latitude=latitude,
+            longitude=longitude,
+        )
 
 
 class PostgresConfigSessionStore(_PostgresSessionStore):

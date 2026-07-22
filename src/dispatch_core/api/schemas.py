@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from dispatch_core.domain.tracking import LocationSource
 from dispatch_core.domain.work_order import PoolMode, WorkOrder
@@ -109,6 +109,38 @@ class LocationInput(BaseModel):
     source: LocationSource
 
 
+class BrowserLocationInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    accuracy_m: float | None = Field(default=None, ge=0, le=100_000)
+    captured_at: datetime | None = None
+    event_id: str = Field(min_length=8, max_length=200)
+
+    @field_validator("captured_at")
+    @classmethod
+    def captured_at_requires_timezone(
+        cls, value: datetime | None
+    ) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("captured_at must include a timezone")
+        return value
+
+
+class IntakeAddressLocationInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    address: str | None = Field(default=None, max_length=500)
+
+
+class IntakeAddressLocationResponse(BaseModel):
+    saved: bool
+    address: str
+
+
 class CompleteInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -165,6 +197,7 @@ class WorkOrderResponse(BaseModel):
 class TravelStartedResponse(BaseModel):
     order: WorkOrderResponse
     tracking_session_id: str
+    tracking_url: str
 
 
 class LocationRecordedResponse(BaseModel):
@@ -181,3 +214,28 @@ class ExecutorTokenRequest(BaseModel):
 class ExecutorTokenResponse(BaseModel):
     token: str
     expires_at: int
+
+
+class PublicTrackingPointResponse(BaseModel):
+    latitude: float
+    longitude: float
+    captured_at: datetime
+    accuracy_m: float | None
+
+
+class PublicMapPointResponse(BaseModel):
+    latitude: float
+    longitude: float
+
+
+class PublicTrackingResponse(BaseModel):
+    brand: str
+    work_type: str
+    address: str | None
+    client_point: PublicMapPointResponse | None
+    master_name: str | None
+    order_status: str
+    tracking_status: str
+    point_count: int
+    latest_point: PublicTrackingPointResponse | None
+    updated_at: datetime

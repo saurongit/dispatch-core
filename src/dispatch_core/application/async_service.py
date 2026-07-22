@@ -183,11 +183,15 @@ class AsyncDispatchService:
                 )
             expected_version = session.version
             now = datetime.now(UTC)
+            observed_at = captured_at or now
+            latest = session.latest_point()
+            if latest is not None and observed_at < latest.captured_at:
+                observed_at = now
             session.add_point(
                 TrackingPoint(
                     latitude=latitude,
                     longitude=longitude,
-                    captured_at=captured_at or now,
+                    captured_at=observed_at,
                     ingested_at=now,
                     source=source,
                     accuracy_m=accuracy_m,
@@ -243,11 +247,25 @@ class AsyncDispatchService:
         *,
         actor_id: str | None = None,
     ) -> WorkOrder:
-        return await self._change_order(
-            organization_id,
-            order_id,
-            lambda order: order.cancel(reason, actor_id=actor_id),
-        )
+        async with self._unit_of_work() as uow:
+            order = await uow.orders.get(organization_id, order_id)
+            expected_order_version = order.version
+            order.cancel(reason, actor_id=actor_id)
+            await uow.orders.save(order, expected_version=expected_order_version)
+            session = await uow.tracking.find_active_for_order(
+                organization_id, order_id
+            )
+            events = list(order.pull_events())
+            if session is not None:
+                expected_session_version = session.version
+                session.cancel(reason)
+                await uow.tracking.save(
+                    session, expected_version=expected_session_version
+                )
+                events.extend(session.pull_events())
+            await uow.outbox.add(tuple(events))
+            await uow.commit()
+        return order
 
     async def _change_order(
         self,

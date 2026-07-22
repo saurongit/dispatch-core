@@ -378,6 +378,24 @@ class InboundProcessor:
     ) -> tuple[OutboundButton, ...]:
         minted: list[OutboundButton] = []
         for button in buttons:
+            if button.url is not None:
+                minted.append(
+                    OutboundButton(
+                        text=button.text,
+                        url=button.url,
+                        row=button.row,
+                    )
+                )
+                continue
+            if button.request_location:
+                minted.append(
+                    OutboundButton(
+                        text=button.text,
+                        request_location=True,
+                        row=button.row,
+                    )
+                )
+                continue
             callback = await self._callbacks.create(
                 organization_id=organization_id,
                 action=button.action,
@@ -411,6 +429,13 @@ class InboundProcessor:
                 return await self._intake.start(identity)
             if event.kind is EventKind.MESSAGE and event.text:
                 return await self._intake.handle_text(identity, event.text)
+            if event.kind is EventKind.LOCATION:
+                return await self._intake.handle_location(
+                    identity,
+                    latitude=event.latitude,
+                    longitude=event.longitude,
+                    method=event.provider.value,
+                )
         if identity.role == "master" and self._master is not None:
             if event.kind is EventKind.START:
                 return await self._master.start(identity)

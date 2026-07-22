@@ -11,24 +11,34 @@ from pathlib import Path
 from typing import Annotated, Any
 from uuid import NAMESPACE_URL, uuid5
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from dispatch_core.application.async_service import AsyncDispatchService
 from dispatch_core.application.identity import ActorIdentity
+from dispatch_core.application.tracking_links import public_tracking_url
 from dispatch_core.domain.errors import (
     ConcurrencyConflict,
     DomainError,
     NotFound,
 )
+from dispatch_core.domain.tracking import LocationSource
 from dispatch_core.domain.work_order import CompletionReport, EvidenceRequirements
 from dispatch_core.infrastructure.messaging import PostgresInboxStore
 from dispatch_core.infrastructure.postgres import (
     PostgresDatabase,
     PostgresUnitOfWorkFactory,
 )
-from dispatch_core.infrastructure.read_models import OrderReader, PostgresOrderReader
-from dispatch_core.infrastructure.workflow_store import PostgresIdentityStore
+from dispatch_core.infrastructure.read_models import (
+    OrderReader,
+    PostgresOrderReader,
+    PostgresTrackingViewReader,
+    TrackingViewReader,
+)
+from dispatch_core.infrastructure.workflow_store import (
+    PostgresIdentityStore,
+    PostgresIntakeSessionStore,
+)
 from dispatch_core.messaging.models import Provider
 from dispatch_core.transports.common import (
     decode_executor_token,
@@ -36,24 +46,32 @@ from dispatch_core.transports.common import (
 )
 from dispatch_core.transports.contracts import Transport
 
+from .address_page import render_address_page
 from .schemas import (
     ActorCreateInput,
     ActorInput,
     ActorResponse,
     AssignInput,
+    BrowserLocationInput,
     CancelInput,
     CompleteInput,
     CreateOrderInput,
     ExecutorTokenRequest,
     ExecutorTokenResponse,
+    IntakeAddressLocationInput,
+    IntakeAddressLocationResponse,
     LocationInput,
     LocationRecordedResponse,
+    PublicMapPointResponse,
+    PublicTrackingPointResponse,
+    PublicTrackingResponse,
     PublishPoolInput,
     TravelInput,
     TravelStartedResponse,
     WorkOrderResponse,
 )
 from .settings import Settings
+from .tracking_page import render_location_share_page, render_tracking_page
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +79,9 @@ _AUTH_ATTEMPTS: dict[str, list[float]] = defaultdict(list)
 _AUTH_WINDOW = 60.0
 _AUTH_MAX_ATTEMPTS = 10
 _AUTH_SWEEPCounter: int = 0
+_TRACKING_ATTEMPTS: dict[str, list[float]] = defaultdict(list)
+_TRACKING_WINDOW = 60.0
+_TRACKING_MAX_ATTEMPTS = 30
 
 
 def create_app(
@@ -68,6 +89,8 @@ def create_app(
     *,
     service: AsyncDispatchService | None = None,
     reader: OrderReader | None = None,
+    tracking_reader: TrackingViewReader | None = None,
+    intake_sessions: PostgresIntakeSessionStore | None = None,
     inbox: PostgresInboxStore | None = None,
     identities: PostgresIdentityStore | None = None,
     transports: dict[Provider, Transport] | None = None,
@@ -78,7 +101,8 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        nonlocal database, service, reader, inbox, identities
+        nonlocal database, service, reader, tracking_reader, intake_sessions
+        nonlocal inbox, identities
         if not injected:
             database = PostgresDatabase(
                 resolved_settings.database_url.get_secret_value()
@@ -105,11 +129,15 @@ def create_app(
                 )
             service = AsyncDispatchService(PostgresUnitOfWorkFactory(database.pool))
             reader = PostgresOrderReader(database.pool)
+            tracking_reader = PostgresTrackingViewReader(database.pool)
+            intake_sessions = PostgresIntakeSessionStore(database.pool)
             inbox = PostgresInboxStore(database.pool)
             identities = PostgresIdentityStore(database.pool)
         app.state.database = database
         app.state.service = service
         app.state.reader = reader
+        app.state.tracking_reader = tracking_reader
+        app.state.intake_sessions = intake_sessions
         app.state.inbox = inbox
         app.state.identities = identities
         try:
@@ -267,6 +295,18 @@ def create_app(
             raise HTTPException(status_code=503, detail="Reader is not ready")
         return value
 
+    def get_tracking_reader(request: Request) -> TrackingViewReader:
+        value = request.app.state.tracking_reader
+        if value is None:
+            raise HTTPException(status_code=503, detail="Tracking view is not ready")
+        return value
+
+    def get_intake_sessions(request: Request) -> PostgresIntakeSessionStore:
+        value = request.app.state.intake_sessions
+        if value is None:
+            raise HTTPException(status_code=503, detail="Intake map is not ready")
+        return value
+
     @app.get("/health/live", tags=["health"])
     async def live() -> dict[str, str]:
         return {"status": "alive"}
@@ -279,6 +319,274 @@ def create_app(
         if active_database is not None and await active_database.health():
             return JSONResponse(status_code=200, content={"status": "ready"})
         return JSONResponse(status_code=503, content={"status": "not_ready"})
+
+    @app.get("/track", include_in_schema=False, response_class=HTMLResponse)
+    async def tracking_page() -> HTMLResponse:
+        nonce = secrets.token_urlsafe(18)
+        csp = (
+            "default-src 'none'; "
+            f"script-src 'nonce-{nonce}' https://unpkg.com; "
+            f"style-src 'nonce-{nonce}' https://unpkg.com; "
+            "style-src-attr 'unsafe-inline'; "
+            "img-src data: https://tile.openstreetmap.org; "
+            "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; "
+            "form-action 'none'"
+        )
+        return HTMLResponse(
+            render_tracking_page(nonce),
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Security-Policy": csp,
+                "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+                "Referrer-Policy": "strict-origin-when-cross-origin",
+                "X-Content-Type-Options": "nosniff",
+                "X-Frame-Options": "DENY",
+                "X-Robots-Tag": "noindex, nofollow, noarchive",
+            },
+        )
+
+    @app.get("/address", include_in_schema=False, response_class=HTMLResponse)
+    async def address_page() -> HTMLResponse:
+        nonce = secrets.token_urlsafe(18)
+        csp = (
+            "default-src 'none'; "
+            f"script-src 'nonce-{nonce}' https://unpkg.com; "
+            f"style-src 'nonce-{nonce}' https://unpkg.com; "
+            "style-src-attr 'unsafe-inline'; "
+            "img-src data: https://tile.openstreetmap.org; "
+            "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; "
+            "form-action 'none'"
+        )
+        return HTMLResponse(
+            render_address_page(
+                nonce,
+                latitude=resolved_settings.default_map_latitude,
+                longitude=resolved_settings.default_map_longitude,
+                zoom=resolved_settings.default_map_zoom,
+            ),
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Security-Policy": csp,
+                "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+                "Referrer-Policy": "no-referrer",
+                "X-Content-Type-Options": "nosniff",
+                "X-Frame-Options": "DENY",
+                "X-Robots-Tag": "noindex, nofollow, noarchive",
+            },
+        )
+
+    @app.post(
+        "/v1/public/intake/location",
+        response_model=IntakeAddressLocationResponse,
+        tags=["intake"],
+    )
+    async def select_intake_address(
+        body: IntakeAddressLocationInput,
+        request: Request,
+        response: Response,
+        intake_token: Annotated[
+            str | None, Header(alias="X-Intake-Token")
+        ] = None,
+    ) -> IntakeAddressLocationResponse:
+        client_ip = request.client.host if request.client else "unknown"
+        now = time.monotonic()
+        attempts = [
+            instant
+            for instant in _TRACKING_ATTEMPTS[client_ip]
+            if now - instant < _TRACKING_WINDOW
+        ]
+        if attempts:
+            _TRACKING_ATTEMPTS[client_ip] = attempts
+        else:
+            _TRACKING_ATTEMPTS.pop(client_ip, None)
+        if len(attempts) >= _TRACKING_MAX_ATTEMPTS:
+            raise HTTPException(status_code=429, detail="Too many attempts")
+        if intake_token is None or len(intake_token) < 43:
+            _TRACKING_ATTEMPTS[client_ip].append(now)
+            raise HTTPException(status_code=404, detail="Address link is unavailable")
+        selection = await get_intake_sessions(request).select_address_by_token(
+            token=intake_token,
+            latitude=body.latitude,
+            longitude=body.longitude,
+            address=body.address,
+        )
+        if selection is None:
+            _TRACKING_ATTEMPTS[client_ip].append(now)
+            raise HTTPException(status_code=404, detail="Address link is unavailable")
+        _TRACKING_ATTEMPTS.pop(client_ip, None)
+        response.headers["Cache-Control"] = "no-store, private"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Robots-Tag"] = "noindex, nofollow"
+        return IntakeAddressLocationResponse(
+            saved=True,
+            address=selection.address,
+        )
+
+    @app.get(
+        "/track/share",
+        include_in_schema=False,
+        response_class=HTMLResponse,
+    )
+    async def location_share_page() -> HTMLResponse:
+        nonce = secrets.token_urlsafe(18)
+        csp = (
+            "default-src 'none'; "
+            f"script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
+            "style-src-attr 'unsafe-inline'; "
+            "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; "
+            "form-action 'none'"
+        )
+        return HTMLResponse(
+            render_location_share_page(nonce),
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Security-Policy": csp,
+                "Permissions-Policy": "camera=(), microphone=(), geolocation=(self)",
+                "Referrer-Policy": "no-referrer",
+                "X-Content-Type-Options": "nosniff",
+                "X-Frame-Options": "DENY",
+                "X-Robots-Tag": "noindex, nofollow, noarchive",
+            },
+        )
+
+    @app.get(
+        "/v1/public/tracking",
+        response_model=PublicTrackingResponse,
+        tags=["tracking"],
+    )
+    async def public_tracking(
+        request: Request,
+        response: Response,
+        tracking_token: Annotated[
+            str | None, Header(alias="X-Tracking-Token")
+        ] = None,
+    ) -> PublicTrackingResponse:
+        client_ip = request.client.host if request.client else "unknown"
+        now = time.monotonic()
+        attempts = [
+            instant
+            for instant in _TRACKING_ATTEMPTS[client_ip]
+            if now - instant < _TRACKING_WINDOW
+        ]
+        if attempts:
+            _TRACKING_ATTEMPTS[client_ip] = attempts
+        else:
+            _TRACKING_ATTEMPTS.pop(client_ip, None)
+        if len(attempts) >= _TRACKING_MAX_ATTEMPTS:
+            raise HTTPException(status_code=429, detail="Too many attempts")
+        if tracking_token is None or len(tracking_token) < 43:
+            _TRACKING_ATTEMPTS[client_ip].append(now)
+            raise HTTPException(
+                status_code=404, detail="Tracking link is unavailable"
+            )
+        view = await get_tracking_reader(request).resolve(tracking_token)
+        if view is None:
+            _TRACKING_ATTEMPTS[client_ip].append(now)
+            raise HTTPException(
+                status_code=404, detail="Tracking link is unavailable"
+            )
+        _TRACKING_ATTEMPTS.pop(client_ip, None)
+        response.headers["Cache-Control"] = "no-store, private"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Vary"] = "X-Tracking-Token"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Robots-Tag"] = "noindex, nofollow"
+        point = view.latest_point
+        return PublicTrackingResponse(
+            brand=resolved_settings.organization_name,
+            work_type=view.work_type,
+            address=view.address,
+            client_point=(
+                PublicMapPointResponse(
+                    latitude=view.client_location.latitude,
+                    longitude=view.client_location.longitude,
+                )
+                if view.client_location is not None
+                else None
+            ),
+            master_name=view.master_name,
+            order_status=view.order_status,
+            tracking_status=view.tracking_status.value,
+            point_count=view.point_count,
+            latest_point=(
+                PublicTrackingPointResponse(
+                    latitude=point.latitude,
+                    longitude=point.longitude,
+                    captured_at=point.captured_at,
+                    accuracy_m=point.accuracy_m,
+                )
+                if point is not None
+                else None
+            ),
+            updated_at=view.updated_at,
+        )
+
+    @app.post(
+        "/v1/public/location",
+        response_model=LocationRecordedResponse,
+        tags=["tracking"],
+    )
+    async def submit_browser_location(
+        body: BrowserLocationInput,
+        request: Request,
+        response: Response,
+        location_token: Annotated[
+            str | None, Header(alias="X-Location-Token")
+        ] = None,
+    ) -> LocationRecordedResponse:
+        client_ip = request.client.host if request.client else "unknown"
+        now = time.monotonic()
+        attempts = [
+            instant
+            for instant in _TRACKING_ATTEMPTS[client_ip]
+            if now - instant < _TRACKING_WINDOW
+        ]
+        if attempts:
+            _TRACKING_ATTEMPTS[client_ip] = attempts
+        else:
+            _TRACKING_ATTEMPTS.pop(client_ip, None)
+        if len(attempts) >= _TRACKING_MAX_ATTEMPTS:
+            raise HTTPException(status_code=429, detail="Too many attempts")
+        if location_token is None or len(location_token) < 43:
+            _TRACKING_ATTEMPTS[client_ip].append(now)
+            raise HTTPException(
+                status_code=404, detail="Location link is unavailable"
+            )
+        target = await get_tracking_reader(request).resolve_location_sender(
+            location_token
+        )
+        if target is None:
+            _TRACKING_ATTEMPTS[client_ip].append(now)
+            raise HTTPException(
+                status_code=404, detail="Location link is unavailable"
+            )
+        try:
+            tracking = await get_service(request).record_location(
+                organization_id=target.organization_id,
+                executor_id=target.executor_id,
+                session_id=target.session_id,
+                latitude=body.latitude,
+                longitude=body.longitude,
+                source=LocationSource.WEB,
+                captured_at=body.captured_at,
+                accuracy_m=body.accuracy_m,
+                source_event_id=body.event_id,
+            )
+        except (DomainError, NotFound):
+            raise HTTPException(
+                status_code=404, detail="Location link is unavailable"
+            ) from None
+        _TRACKING_ATTEMPTS.pop(client_ip, None)
+        response.headers["Cache-Control"] = "no-store, private"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Robots-Tag"] = "noindex, nofollow"
+        return LocationRecordedResponse(
+            tracking_session_id=tracking.id,
+            point_count=len(tracking.points),
+            version=tracking.version,
+        )
 
     @app.post(
         "/v1/orders",
@@ -500,6 +808,10 @@ def create_app(
         return TravelStartedResponse(
             order=WorkOrderResponse.from_domain(order),
             tracking_session_id=tracking.id,
+            tracking_url=public_tracking_url(
+                resolved_settings.public_base_url or str(request.base_url),
+                tracking.public_token or "",
+            ),
         )
 
     @app.post(

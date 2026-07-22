@@ -110,6 +110,7 @@ async def run_worker(
         service=service,
         outbound=outbound,
         identities=identities,
+        public_base_url=settings.public_base_url,
     )
     config = ConfigCoordinator(
         packs=packs,
@@ -145,7 +146,11 @@ async def run_worker(
     )
     projector = OutboxProjectorWorker(
         PostgresOutboxStore(pool),
-        PostgresNotificationProjector(pool, packs),
+        PostgresNotificationProjector(
+            pool,
+            packs,
+            public_base_url=settings.public_base_url,
+        ),
     )
     sender = OutboundSender(outbound, transports, consumer_key=settings.consumer_key)
     polling = DurablePollingReceiver(inbox)

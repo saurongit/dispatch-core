@@ -352,14 +352,17 @@ class PostgresTrackingRepository:
                     """
                     INSERT INTO tracking_sessions (
                         organization_id, id, work_order_id, executor_id,
-                        status, version, created_at, updated_at
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                        public_token, location_token, status, version,
+                        created_at, updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                     ON CONFLICT (organization_id, id) DO NOTHING
                     """,
                     session.organization_id,
                     session.id,
                     session.work_order_id,
                     session.executor_id,
+                    session.public_token,
+                    session.location_token,
                     session.status.value,
                     session.version,
                     session.created_at,
@@ -375,15 +378,19 @@ class PostgresTrackingRepository:
                     UPDATE tracking_sessions SET
                         work_order_id = $3,
                         executor_id = $4,
-                        status = $5,
-                        version = $6,
-                        updated_at = $7
-                    WHERE organization_id = $1 AND id = $2 AND version = $8
+                        public_token = $5,
+                        location_token = $6,
+                        status = $7,
+                        version = $8,
+                        updated_at = $9
+                    WHERE organization_id = $1 AND id = $2 AND version = $10
                     """,
                     session.organization_id,
                     session.id,
                     session.work_order_id,
                     session.executor_id,
+                    session.public_token,
+                    session.location_token,
                     session.status.value,
                     session.version,
                     session.updated_at,
@@ -557,6 +564,8 @@ def _tracking_from_rows(
         organization_id=row["organization_id"],
         work_order_id=row["work_order_id"],
         executor_id=row["executor_id"],
+        public_token=row["public_token"],
+        location_token=row["location_token"],
         status=TrackingStatus(row["status"]),
         points=[
             TrackingPoint(

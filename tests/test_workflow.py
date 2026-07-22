@@ -133,6 +133,61 @@ class DispatchWorkflowTests(unittest.TestCase):
         self.assertEqual(53.75, duplicate.points[0].latitude)
         self.assertEqual(first.version, duplicate.version)
 
+    def test_delayed_provider_point_is_appended_with_server_ordering(self) -> None:
+        order = self.create_order()
+        self.service.assign_order("org-1", order.id, "worker-1")
+        self.service.accept_order("org-1", order.id, "worker-1")
+        _, session = self.service.start_travel(
+            "org-1", order.id, "worker-1", session_id="track-delayed"
+        )
+        first_time = datetime.now(UTC)
+        self.service.record_location(
+            organization_id="org-1",
+            executor_id="worker-1",
+            session_id=session.id,
+            latitude=53.75,
+            longitude=87.1,
+            source=LocationSource.TELEGRAM,
+            captured_at=first_time,
+            source_event_id="telegram:newer",
+        )
+
+        updated = self.service.record_location(
+            organization_id="org-1",
+            executor_id="worker-1",
+            session_id=session.id,
+            latitude=53.76,
+            longitude=87.11,
+            source=LocationSource.WEB,
+            captured_at=first_time - timedelta(minutes=1),
+            source_event_id="browser:delayed",
+        )
+
+        self.assertEqual(2, len(updated.points))
+        self.assertEqual(53.76, updated.latest_point().latitude)
+        self.assertGreaterEqual(updated.points[1].captured_at, first_time)
+
+    def test_cancellation_closes_active_tracking_and_revokes_public_link(self) -> None:
+        order = self.create_order()
+        self.service.assign_order("org-1", order.id, "worker-1")
+        self.service.accept_order("org-1", order.id, "worker-1")
+        _, session = self.service.start_travel(
+            "org-1", order.id, "worker-1", session_id="track-cancelled"
+        )
+
+        cancelled = self.service.cancel_order(
+            "org-1", order.id, "client changed plans"
+        )
+
+        stored_session = self.factory.store.tracking_sessions[("org-1", session.id)]
+        self.assertEqual(WorkOrderStatus.CANCELLED, cancelled.status)
+        self.assertEqual(TrackingStatus.CANCELLED, stored_session.status)
+        self.assertIsNone(stored_session.public_token)
+        self.assertEqual(
+            ["work_order.cancelled", "tracking.cancelled"],
+            [event.name for event in self.factory.store.outbox_events[-2:]],
+        )
+
     def test_completion_rejects_missing_evidence_without_persisting(self) -> None:
         order = self.create_order()
         self.service.assign_order("org-1", order.id, "worker-1")

@@ -34,11 +34,23 @@ The project demonstrates a production-oriented FastAPI/PostgreSQL design:
 - idempotent API creation and retry-safe messenger callbacks;
 - append-only PostgreSQL GPS history;
 - Telegram and MAX polling/webhook parsing, buttons, location and photo reports;
+- address intake through native location, a protected map or manual text, with
+  an explicit VPN/GPS-spoofing accuracy warning;
+- a read-only customer map plus continuous browser GPS fallback when native
+  messenger location is unavailable;
+- separate 256-bit read/write capabilities kept out of query strings and
+  revoked when work completes or is cancelled;
 - non-root, read-only application containers with file-based Docker secrets.
 
 The source and Git history are clean and independent from the private system
 that inspired the workflow. No production credentials, customer data, fonts or
 branding are included.
+
+This is a public reference edition: it includes a runnable vertical slice for
+architectural review and independent integration work. Managed provisioning,
+customer infrastructure profiles, connectivity bundles, site generation and a
+future self-service installer remain outside this repository and may be
+delivered separately.
 
 ## Implemented vertical slice
 
@@ -96,7 +108,7 @@ python -m venv .venv
 
 The in-memory demo completes a curated operator/executor flow without external
 services. PostgreSQL integration tests run when `TEST_DATABASE_URL` is set.
-The verified suite currently contains 579 passing tests, including 37 live
+The verified suite currently contains 670 passing tests, including 44 live
 PostgreSQL integration tests. CI enforces 90% branch coverage across Python
 3.12, 3.13 and 3.14.
 
@@ -135,6 +147,19 @@ through `POST /v1/orders`. Set `DISPATCH_ENVIRONMENT=development` to expose
 environment. See
 [operations](docs/OPERATIONS.md) for exact examples, webhook registration,
 backup and limitations.
+
+Set `DISPATCH_PUBLIC_BASE_URL` to the public HTTPS origin for tracking. On
+travel start, the master receives a native location request and a browser GPS
+fallback link; the client receives a separate read-only map link. Both bearer
+capabilities stay in URL fragments and are sent to same-origin APIs only in
+headers.
+
+Customer intake accepts an address through messenger-native location, a
+one-time `/address#…` map link or text entry. The map uses a tap-to-unlock,
+tap-to-select and relock interaction so it does not trap page scrolling. Saving
+the point atomically consumes the capability. A VPN normally changes IP rather
+than GPS, but the UI asks the customer to verify the point and use map/manual
+entry when they are away from the service location or use GPS spoofing.
 
 ## Reliability semantics
 

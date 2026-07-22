@@ -31,12 +31,16 @@ from dispatch_core.infrastructure.postgres import (
     PostgresDatabase,
     PostgresUnitOfWorkFactory,
 )
-from dispatch_core.infrastructure.read_models import PostgresOrderReader
+from dispatch_core.infrastructure.read_models import (
+    PostgresOrderReader,
+    PostgresTrackingViewReader,
+)
 from dispatch_core.infrastructure.staff_workflows import (
     PostgresStaffViewStore,
     PostgresStaffWorkflowSessionStore,
 )
 from dispatch_core.infrastructure.workflow_store import (
+    PostgresConfigSessionStore,
     PostgresExecutionStore,
     PostgresIdentityStore,
     PostgresIntakeSessionStore,
@@ -217,6 +221,40 @@ async def test_create_round_trip_and_outbox_share_commit(
 
 
 @pytest.mark.asyncio
+async def test_pack_store_full_draft_publish_lifecycle(
+    database: PostgresDatabase,
+    organization: str,
+) -> None:
+    assert database.pool is not None
+    packs = PostgresPackStore(database.pool)
+    initial = seed_definition("field_service")
+    replacement = seed_definition("local_delivery")
+
+    assert await packs.active(organization) is None
+    assert await packs.draft(organization) is None
+    assert await packs.bootstrap_active(organization, seed=initial)
+    assert not await packs.bootstrap_active(organization, seed=replacement)
+    assert (await packs.active(organization)).to_json() == initial.to_json()
+
+    assert (await packs.ensure_draft(organization, seed=replacement)).to_json() == (
+        replacement.to_json()
+    )
+    assert (await packs.ensure_draft(organization, seed=initial)).to_json() == (
+        replacement.to_json()
+    )
+    await packs.update_draft(organization, initial)
+    assert (await packs.draft(organization)).to_json() == initial.to_json()
+    assert await packs.publish_draft(organization) == 2
+    assert await packs.draft(organization) is None
+    assert (await packs.active(organization)).to_json() == initial.to_json()
+
+    with pytest.raises(NotFound, match="no draft"):
+        await packs.update_draft(organization, replacement)
+    with pytest.raises(NotFound, match="no draft"):
+        await packs.publish_draft(organization)
+
+
+@pytest.mark.asyncio
 async def test_tenant_scope_hides_same_order_id_in_another_organization(
     database: PostgresDatabase,
     organization: str,
@@ -353,6 +391,68 @@ async def test_completed_order_releases_executor_capacity(
 
 
 @pytest.mark.asyncio
+async def test_intake_address_capability_is_consumed_atomically(
+    database: PostgresDatabase,
+    organization: str,
+) -> None:
+    assert database.pool is not None
+    identities = PostgresIdentityStore(database.pool)
+    await identities.upsert_actor(
+        organization_id=organization,
+        actor_id="address-client",
+        role="client",
+        display_name="Address Client",
+    )
+    sessions = PostgresIntakeSessionStore(database.pool)
+    token = "a" * 43
+    await sessions.put(
+        organization_id=organization,
+        actor_id="address-client",
+        provider=Provider.TELEGRAM,
+        state={
+            "step": "address",
+            "address_token": token,
+            "address_mode": "map",
+            "field_values": {"phone": "+7 900 000-00-00"},
+        },
+    )
+
+    selected = await sessions.select_address_by_token(
+        token=token,
+        latitude=53.7561,
+        longitude=87.1267,
+        address="  улица Кирова, 10  ",
+    )
+
+    assert selected is not None
+    assert selected.organization_id == organization
+    assert selected.actor_id == "address-client"
+    assert selected.provider is Provider.TELEGRAM
+    assert selected.address == "улица Кирова, 10"
+    state = await sessions.get(organization, "address-client")
+    assert state is not None
+    assert state["step"] == "services"
+    assert state["field_values"]["address"] == "улица Кирова, 10"
+    assert state["service_location"] == {
+        "latitude": 53.7561,
+        "longitude": 87.1267,
+        "method": "map",
+    }
+    assert "address_token" not in state
+    assert "address_mode" not in state
+
+    assert (
+        await sessions.select_address_by_token(
+            token=token,
+            latitude=1.0,
+            longitude=2.0,
+            address="attempted overwrite",
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
 async def test_tracking_and_completion_commit_all_events(
     database: PostgresDatabase,
     organization: str,
@@ -376,6 +476,20 @@ async def test_tracking_and_completion_commit_all_events(
         source=LocationSource.TELEGRAM,
         source_event_id="telegram:location-1",
     )
+    public_token = tracking.public_token
+    location_token = tracking.location_token
+    assert public_token is not None
+    assert location_token is not None
+    tracking_reader = PostgresTrackingViewReader(database.pool)
+    active_view = await tracking_reader.resolve(public_token)
+    assert active_view is not None
+    assert active_view.point_count == 1
+    assert active_view.latest_point is not None
+    assert active_view.latest_point.latitude == 53.75
+    sender = await tracking_reader.resolve_location_sender(location_token)
+    assert sender is not None
+    assert sender.session_id == "track-1"
+    assert sender.executor_id == "executor-1"
     await commands.start_work(organization, "order-1", "executor-1")
     await commands.complete_order(
         organization,
@@ -385,9 +499,9 @@ async def test_tracking_and_completion_commit_all_events(
     )
     assert database.pool is not None
     async with database.pool.acquire() as connection:
-        tracking_status = await connection.fetchval(
+        tracking_row = await connection.fetchrow(
             """
-            SELECT status FROM tracking_sessions
+            SELECT status, public_token, location_token FROM tracking_sessions
             WHERE organization_id = $1 AND id = 'track-1'
             """,
             organization,
@@ -403,9 +517,65 @@ async def test_tracking_and_completion_commit_all_events(
             "SELECT count(*) FROM outbox_events WHERE organization_id = $1",
             organization,
         )
-    assert tracking_status == "completed"
+    assert tracking_row["status"] == "completed"
+    assert tracking_row["public_token"] is None
+    assert tracking_row["location_token"] is None
+    assert await tracking_reader.resolve(public_token) is None
+    assert await tracking_reader.resolve_location_sender(location_token) is None
     assert point_count == 1
     assert event_count == 9
+
+
+@pytest.mark.asyncio
+async def test_cancellation_atomically_revokes_active_tracking(
+    database: PostgresDatabase,
+    organization: str,
+) -> None:
+    commands = service(database)
+    await create_order(database, organization, "order-cancel-tracking")
+    await commands.assign_order(
+        organization, "order-cancel-tracking", "executor-cancel"
+    )
+    await commands.accept_order(
+        organization, "order-cancel-tracking", "executor-cancel"
+    )
+    _, tracking = await commands.start_travel(
+        organization,
+        "order-cancel-tracking",
+        "executor-cancel",
+        session_id="track-cancel",
+    )
+    public_token = tracking.public_token
+    assert public_token is not None
+
+    await commands.cancel_order(
+        organization,
+        "order-cancel-tracking",
+        "client cancelled",
+    )
+
+    assert database.pool is not None
+    async with database.pool.acquire() as connection:
+        row = await connection.fetchrow(
+            """
+            SELECT orders.status AS order_status,
+                   tracking.status AS tracking_status,
+                   tracking.public_token
+            FROM work_orders AS orders
+            JOIN tracking_sessions AS tracking
+              ON tracking.organization_id = orders.organization_id
+             AND tracking.work_order_id = orders.id
+            WHERE orders.organization_id = $1 AND orders.id = $2
+            """,
+            organization,
+            "order-cancel-tracking",
+        )
+    assert dict(row) == {
+        "order_status": "cancelled",
+        "tracking_status": "cancelled",
+        "public_token": None,
+    }
+    assert await PostgresTrackingViewReader(database.pool).resolve(public_token) is None
 
 
 @pytest.mark.asyncio
@@ -789,6 +959,196 @@ async def test_staff_workspace_sessions_and_order_views_are_role_scoped(
     stats = await views.statistics(organization_id=organization)
     assert stats["active"] == 1
     assert stats["masters_total"] == 3
+
+
+@pytest.mark.asyncio
+async def test_staff_stores_cover_empty_clear_validation_and_cleanup(
+    database: PostgresDatabase,
+    organization: str,
+) -> None:
+    assert database.pool is not None
+    pool = database.pool
+    identities = PostgresIdentityStore(pool)
+    await identities.upsert_actor(
+        organization_id=organization,
+        actor_id="staff-store-actor",
+        role="master",
+        display_name="Staff Store Actor",
+    )
+    sessions = PostgresStaffWorkflowSessionStore(pool)
+    assert await sessions.get(
+        organization_id=organization,
+        actor_id="staff-store-actor",
+        role="master",
+        provider=Provider.MAX,
+    ) is None
+    with pytest.raises(ValueError, match="workflow role"):
+        await sessions.get(
+            organization_id=organization,
+            actor_id="staff-store-actor",
+            role="admin",
+            provider=Provider.MAX,
+        )
+    await sessions.put(
+        organization_id=organization,
+        actor_id="staff-store-actor",
+        role="master",
+        provider=Provider.MAX,
+        state={"step": "one"},
+    )
+    await sessions.clear(
+        organization_id=organization,
+        actor_id="staff-store-actor",
+        role="master",
+        provider=Provider.MAX,
+    )
+    assert await sessions.get(
+        organization_id=organization,
+        actor_id="staff-store-actor",
+        role="master",
+        provider=Provider.MAX,
+    ) is None
+    await sessions.put(
+        organization_id=organization,
+        actor_id="staff-store-actor",
+        role="master",
+        provider=Provider.MAX,
+        state={"step": "stale"},
+    )
+    assert await sessions.cleanup_stale(max_age_hours=-1) == 1
+
+    views = PostgresStaffViewStore(pool)
+    with pytest.raises(ValueError, match="view role"):
+        await views.list_active_orders(
+            organization_id=organization,
+            role="admin",
+            actor_id="staff-store-actor",
+        )
+    with pytest.raises(ValueError, match="limit"):
+        await views.list_active_orders(
+            organization_id=organization,
+            role="master",
+            actor_id="staff-store-actor",
+            limit=0,
+        )
+    assert await views.get_active_order(
+        organization_id=organization,
+        role="master",
+        actor_id="staff-store-actor",
+        order_id="missing",
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_identity_lists_external_ids_and_protects_admin_deletion(
+    database: PostgresDatabase,
+    organization: str,
+) -> None:
+    assert database.pool is not None
+    identities = PostgresIdentityStore(database.pool)
+    await identities.upsert_actor(
+        organization_id=organization,
+        actor_id="protected-admin",
+        role="admin",
+        display_name="Protected Admin",
+        provider=Provider.TELEGRAM,
+        external_user_id="admin-chat",
+    )
+    await identities.upsert_actor(
+        organization_id=organization,
+        actor_id="deletable-master",
+        role="master",
+        display_name="Deletable Master",
+        provider=Provider.TELEGRAM,
+        external_user_id="master-chat",
+    )
+
+    assert await identities.external_ids_for_role(
+        organization_id=organization,
+        provider=Provider.TELEGRAM,
+        role="master",
+    ) == ["master-chat"]
+    with pytest.raises(ValueError, match="unsupported actor role"):
+        await identities.external_ids_for_role(
+            organization_id=organization,
+            provider=Provider.TELEGRAM,
+            role="owner",
+        )
+    assert not await identities.delete_actor(
+        organization_id=organization,
+        actor_id="protected-admin",
+    )
+    assert await identities.delete_actor(
+        organization_id=organization,
+        actor_id="deletable-master",
+    )
+    assert not await identities.delete_actor(
+        organization_id=organization,
+        actor_id="missing-master",
+    )
+
+
+@pytest.mark.asyncio
+async def test_generic_workflow_sessions_and_empty_report_cleanup(
+    database: PostgresDatabase,
+    organization: str,
+) -> None:
+    assert database.pool is not None
+    pool = database.pool
+    await create_order(database, organization, "session-report-order")
+    drafts = PostgresReportDraftStore(pool)
+    report_args = {
+        "organization_id": organization,
+        "order_id": "session-report-order",
+        "executor_id": "missing-executor",
+    }
+    assert await drafts.get(**report_args) == CompletionReport()
+    await drafts.set_comment(**report_args, comment="temporary")
+    await drafts.clear(**report_args)
+    assert await drafts.get(**report_args) == CompletionReport()
+
+    intake = PostgresIntakeSessionStore(pool)
+    config = PostgresConfigSessionStore(pool)
+    identities = PostgresIdentityStore(pool)
+    for actor_id, role in (
+        ("client-1", "client"),
+        ("admin-1", "admin"),
+        ("admin-2", "admin"),
+    ):
+        await identities.upsert_actor(
+            organization_id=organization,
+            actor_id=actor_id,
+            role=role,
+            display_name=actor_id,
+        )
+    assert await intake.get(organization, "client-1") is None
+    await intake.put(
+        organization_id=organization,
+        actor_id="client-1",
+        provider=Provider.TELEGRAM,
+        state={"step": "address"},
+    )
+    assert await intake.get(organization, "client-1") == {"step": "address"}
+    await intake.clear(organization, "client-1")
+    assert await intake.get(organization, "client-1") is None
+
+    await config.put(
+        organization_id=organization,
+        actor_id="admin-1",
+        provider=Provider.MAX,
+        state={"flow": "brand"},
+    )
+    assert await config.cleanup_stale(
+        max_age_hours=-1,
+        organization_id=organization,
+    ) == 1
+    await config.put(
+        organization_id=organization,
+        actor_id="admin-2",
+        provider=Provider.MAX,
+        state={"flow": "services"},
+    )
+    assert await config.cleanup_stale(max_age_hours=-1) == 1
 
 
 @pytest.mark.asyncio
@@ -1831,16 +2191,124 @@ async def test_bind_code_does_not_implicitly_merge_two_established_people(
 async def project_all(
     database: PostgresDatabase,
     packs: PostgresPackStore | None = None,
+    public_base_url: str | None = None,
 ) -> int:
     assert database.pool is not None
     outbox = PostgresOutboxStore(database.pool)
-    projector = PostgresNotificationProjector(database.pool, packs)
+    projector = PostgresNotificationProjector(
+        database.pool,
+        packs,
+        public_base_url=public_base_url,
+    )
     projected = 0
     while events := await outbox.claim_events(limit=100):
         for event in events:
             await projector.project(event)
             projected += 1
     return projected
+
+
+@pytest.mark.asyncio
+async def test_travel_projects_location_request_and_client_tracking_link(
+    database: PostgresDatabase,
+    organization: str,
+) -> None:
+    assert database.pool is not None
+    identities = PostgresIdentityStore(database.pool)
+    for actor_id, role, external_id in (
+        ("tracking-client", "client", "client-chat"),
+        ("tracking-master", "master", "master-chat"),
+    ):
+        await identities.upsert_actor(
+            organization_id=organization,
+            actor_id=actor_id,
+            role=role,
+            display_name=actor_id,
+            provider=Provider.TELEGRAM,
+            external_user_id=external_id,
+        )
+    commands = service(database)
+    await commands.create_order(
+        organization_id=organization,
+        order_id="projected-tracking-order",
+        work_type="repair",
+        source="client_bot",
+        details={"address": "Building 7"},
+        requester_id="tracking-client",
+    )
+    await commands.assign_order(
+        organization,
+        "projected-tracking-order",
+        "tracking-master",
+    )
+    await commands.accept_order(
+        organization,
+        "projected-tracking-order",
+        "tracking-master",
+    )
+    await commands.start_travel(
+        organization,
+        "projected-tracking-order",
+        "tracking-master",
+        session_id="projected-tracking-session",
+    )
+
+    await project_all(
+        database,
+        public_base_url="https://dispatch.example",
+    )
+
+    async with database.pool.acquire() as connection:
+        rows = await connection.fetch(
+            """
+            SELECT recipient_id, buttons
+            FROM outbound_messages
+            WHERE organization_id = $1
+              AND recipient_id IN ('client-chat', 'master-chat')
+            ORDER BY id
+            """,
+            organization,
+        )
+    messages = [
+        {
+            "recipient_id": row["recipient_id"],
+            "buttons": (
+                json.loads(row["buttons"])
+                if isinstance(row["buttons"], str)
+                else row["buttons"]
+            ),
+        }
+        for row in rows
+    ]
+    assert any(
+        message["recipient_id"] == "master-chat"
+        and any(button["request_location"] for button in message["buttons"])
+        for message in messages
+    )
+    tracking_buttons = [
+        button
+        for message in messages
+        if message["recipient_id"] == "client-chat"
+        for button in message["buttons"]
+        if button["url"] is not None
+    ]
+    assert len(tracking_buttons) == 1
+    assert tracking_buttons[0]["url"].startswith(
+        "https://dispatch.example/track#"
+    )
+    assert "?" not in tracking_buttons[0]["url"]
+    sender_buttons = [
+        button
+        for message in messages
+        if message["recipient_id"] == "master-chat"
+        for button in message["buttons"]
+        if button["url"] is not None
+        and "/track/share#" in button["url"]
+    ]
+    assert len(sender_buttons) == 1
+    assert sender_buttons[0]["url"].startswith(
+        "https://dispatch.example/track/share#"
+    )
 
 
 @pytest.mark.asyncio

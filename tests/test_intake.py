@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -9,12 +10,15 @@ from dispatch_core.application.identity import ActorIdentity
 from dispatch_core.messaging.intake import (
     INTAKE_CANCEL,
     INTAKE_CONFIRM,
+    INTAKE_CONTINUE_AFTER_MAP,
     INTAKE_PICK_SERVICE,
+    INTAKE_REQUEST_LOCATION,
     INTAKE_SERVICES_DONE,
+    INTAKE_TYPE_ADDRESS,
     IntakeCoordinator,
 )
 from dispatch_core.messaging.models import Provider
-from dispatch_core.packs.catalog import PackDefinition, seed_definition
+from dispatch_core.packs.catalog import PackDefinition, ServiceCatalog, seed_definition
 
 
 def identity() -> ActorIdentity:
@@ -63,13 +67,34 @@ class FakeSessions:
 @dataclass
 class FakeService:
     orders: list[dict[str, Any]] = field(default_factory=list)
+    result: object | None = None
 
-    async def create_order(self, **values: Any) -> None:
+    async def create_order(self, **values: Any) -> object | None:
         self.orders.append(values)
+        return self.result
+
+
+@dataclass
+class FakeOutbound:
+    messages: list[dict[str, Any]] = field(default_factory=list)
+
+    async def enqueue(self, **values: Any) -> bool:
+        self.messages.append(values)
+        return True
+
+
+@dataclass
+class FakeIdentities:
+    external_ids: list[str]
+
+    async def external_ids_for_role(self, **values: Any) -> list[str]:
+        return self.external_ids
 
 
 def coordinator(
     pack: PackDefinition | None = None,
+    *,
+    public_base_url: str | None = None,
 ) -> tuple[IntakeCoordinator, FakeSessions, FakeService]:
     sessions = FakeSessions()
     service = FakeService()
@@ -77,6 +102,7 @@ def coordinator(
         packs=FakePacks(pack or seed_definition("field_service")),
         sessions=sessions,
         service=service,
+        public_base_url=public_base_url,
     )
     return target, sessions, service
 
@@ -122,6 +148,92 @@ async def test_phone_to_address_to_services() -> None:
     assert INTAKE_PICK_SERVICE in {b.action for b in reply.buttons}
     state = sessions.store["org-1:telegram:7001"]
     assert state["step"] == "services"
+
+
+@pytest.mark.asyncio
+async def test_address_card_warns_about_vpn_and_offers_all_methods() -> None:
+    target, sessions, _ = coordinator(
+        public_base_url="https://dispatch.example"
+    )
+    who = identity()
+    await target.start(who)
+
+    reply = await target.handle_text(who, "+7 999 123 4567")
+
+    assert "vpn" in reply.text.lower()
+    assert "gps" in reply.text.lower()
+    actions = {button.action for button in reply.buttons}
+    assert {INTAKE_REQUEST_LOCATION, INTAKE_TYPE_ADDRESS} <= actions
+    map_button = next(button for button in reply.buttons if button.url)
+    assert map_button.url.startswith("https://dispatch.example/address#")
+    assert "?" not in map_button.url
+    assert len(map_button.url.rsplit("#", maxsplit=1)[1]) >= 43
+    state = sessions.store["org-1:telegram:7001"]
+    assert state["address_token"] not in reply.text
+
+
+@pytest.mark.asyncio
+async def test_native_location_advances_to_services_and_is_saved() -> None:
+    target, sessions, _ = coordinator(
+        public_base_url="https://dispatch.example"
+    )
+    who = identity()
+    await target.start(who)
+    await target.handle_text(who, "+7 999 123 4567")
+    request = await target.handle_callback(who, INTAKE_REQUEST_LOCATION, {})
+    assert len(request.buttons) == 1
+    assert request.buttons[0].request_location
+
+    reply = await target.handle_location(
+        who,
+        latitude=53.75,
+        longitude=87.1,
+        method="telegram",
+    )
+
+    assert INTAKE_PICK_SERVICE in {button.action for button in reply.buttons}
+    state = sessions.store["org-1:telegram:7001"]
+    assert state["step"] == "services"
+    assert state["service_location"] == {
+        "latitude": 53.75,
+        "longitude": 87.1,
+        "method": "telegram",
+    }
+    assert state["field_values"]["address"].startswith("Точка на карте")
+    assert "address_token" not in state
+
+
+@pytest.mark.asyncio
+async def test_address_callbacks_reject_wrong_step_and_continue_after_map() -> None:
+    target, sessions, _ = coordinator(
+        public_base_url="https://dispatch.example"
+    )
+    who = identity()
+    wrong = await target.handle_callback(who, INTAKE_REQUEST_LOCATION, {})
+    assert "телефон" in wrong.text.lower()
+    await target.handle_text(who, "+7 999 123 4567")
+    typed = await target.handle_callback(who, INTAKE_TYPE_ADDRESS, {})
+    assert "город" in typed.text.lower()
+    waiting = await target.handle_callback(who, INTAKE_CONTINUE_AFTER_MAP, {})
+    assert "сначала" in waiting.text.lower()
+    sessions.store["org-1:telegram:7001"]["step"] = "services"
+    resumed = await target.handle_callback(who, INTAKE_CONTINUE_AFTER_MAP, {})
+    assert INTAKE_PICK_SERVICE in {button.action for button in resumed.buttons}
+
+
+@pytest.mark.asyncio
+async def test_invalid_native_location_does_not_advance() -> None:
+    target, sessions, _ = coordinator()
+    who = identity()
+    await target.start(who)
+    await target.handle_text(who, "+7 999 123 4567")
+    reply = await target.handle_location(
+        who,
+        latitude=91,
+        longitude=87.1,
+    )
+    assert "не удалось" in reply.text.lower()
+    assert sessions.store["org-1:telegram:7001"]["step"] == "address"
 
 
 @pytest.mark.asyncio
@@ -251,3 +363,195 @@ async def test_address_validates_min_length() -> None:
     await target.handle_text(who, "+7 999 123 4567")
     reply = await target.handle_text(who, "abc")
     assert "адрес" in reply.text.lower() or "минимум" in reply.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_text_without_session_restarts_and_confirm_text_shows_buttons() -> None:
+    target, sessions, _ = coordinator()
+    who = identity()
+    restarted = await target.handle_text(who, "hello")
+    assert "телефон" in restarted.text.lower()
+    sessions.store["org-1:telegram:7001"] = {
+        "step": "confirm",
+        "selected": ["repair"],
+        "field_values": {},
+    }
+    confirmation = await target.handle_text(who, "ignored")
+    assert {button.action for button in confirmation.buttons} == {
+        INTAKE_CONFIRM,
+        INTAKE_CANCEL,
+    }
+
+
+@pytest.mark.asyncio
+async def test_text_and_callback_report_pack_removed_mid_flow() -> None:
+    packs = FakePacks(seed_definition("field_service"))
+    sessions = FakeSessions()
+    target = IntakeCoordinator(packs=packs, sessions=sessions, service=FakeService())
+    who = identity()
+    await target.start(who)
+    packs.pack = None
+    text_reply = await target.handle_text(who, "79990000000")
+    callback_reply = await target.handle_callback(who, INTAKE_CONFIRM, {})
+    assert "не настроен" in text_reply.text.lower()
+    assert "не настроен" in callback_reply.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_callbacks_without_session_and_unknown_action_are_safe() -> None:
+    target, _, _ = coordinator()
+    who = identity()
+    restarted = await target.handle_callback(who, INTAKE_CONFIRM, {})
+    assert "телефон" in restarted.text.lower()
+    await target.start(who)
+    wrong_step = await target.handle_callback(
+        who, INTAKE_PICK_SERVICE, {"service": "repair"}
+    )
+    unknown = await target.handle_callback(who, "unknown", {})
+    assert "сначала" in wrong_step.text.lower()
+    assert "неизвест" in unknown.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_unknown_service_and_toggle_off_are_handled() -> None:
+    target, _, _ = coordinator()
+    who = identity()
+    await _go_to_services(target, who)
+    missing = await target.handle_callback(
+        who, INTAKE_PICK_SERVICE, {"service": "missing"}
+    )
+    await target.handle_callback(who, INTAKE_PICK_SERVICE, {"service": "repair"})
+    toggled_off = await target.handle_callback(
+        who, INTAKE_PICK_SERVICE, {"service": "repair"}
+    )
+    assert "недоступна" in missing.text.lower()
+    assert not any("✅" in button.text for button in toggled_off.buttons)
+
+
+@pytest.mark.asyncio
+async def test_single_select_service_moves_directly_to_fields() -> None:
+    base = seed_definition("field_service")
+    single = replace(
+        base,
+        service_catalog=ServiceCatalog(
+            categories=base.service_catalog.categories,
+            multi_select=False,
+        ),
+    )
+    target, sessions, _ = coordinator(single)
+    who = identity()
+    await _go_to_services(target, who)
+    reply = await target.handle_callback(
+        who, INTAKE_PICK_SERVICE, {"service": "repair"}
+    )
+    assert reply.text
+    assert sessions.store["org-1:telegram:7001"]["step"] == "fields"
+
+
+@pytest.mark.asyncio
+async def test_field_state_recovers_from_invalid_indexes_and_required_blank() -> None:
+    target, sessions, _ = coordinator()
+    who = identity()
+    key = "org-1:telegram:7001"
+    sessions.store[key] = {
+        "step": "fields",
+        "selected": ["repair"],
+        "field_values": {"phone": "79990000000", "address": "Ленина 1"},
+        "field_index": "bad",
+    }
+    malformed = await target.handle_text(who, "anything")
+    assert "подтверд" in malformed.text.lower()
+
+    sessions.store[key] = {
+        "step": "fields",
+        "selected": ["repair"],
+        "field_values": {"phone": "79990000000", "address": "Ленина 1"},
+        "field_index": 999,
+    }
+    out_of_range = await target.handle_text(who, "anything")
+    assert "подтверд" in out_of_range.text.lower()
+
+    sessions.store[key] = {
+        "step": "fields",
+        "selected": ["repair"],
+        "field_values": {"phone": "79990000000", "address": "Ленина 1"},
+        "field_index": 2,
+    }
+    required = await target.handle_text(who, "-")
+    assert "обязательно" in required.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_no_fields_and_already_filled_fields_go_to_confirmation() -> None:
+    base = seed_definition("field_service")
+    no_fields = replace(base, fields=())
+    target, sessions, _ = coordinator(no_fields)
+    who = identity()
+    key = "org-1:telegram:7001"
+    sessions.store[key] = {
+        "step": "services",
+        "selected": ["repair"],
+        "field_values": {},
+    }
+    empty_fields = await target.handle_callback(who, INTAKE_SERVICES_DONE, {})
+    assert "подтверд" in empty_fields.text.lower()
+
+    target, sessions, _ = coordinator(base)
+    sessions.store[key] = {
+        "step": "services",
+        "selected": ["repair"],
+        "field_values": {
+            "phone": "79990000000",
+            "address": "Ленина 1",
+            "asset": "A",
+            "fault": "B",
+        },
+    }
+    filled = await target.handle_callback(who, INTAKE_SERVICES_DONE, {})
+    assert "подтверд" in filled.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_confirm_without_service_restarts_intake() -> None:
+    target, sessions, _ = coordinator()
+    who = identity()
+    sessions.store["org-1:telegram:7001"] = {
+        "step": "confirm",
+        "selected": [],
+        "field_values": {},
+    }
+    reply = await target.handle_callback(who, INTAKE_CONFIRM, {})
+    assert "телефон" in reply.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_success_notifies_nonblank_operator_ids_with_extra_fields() -> None:
+    service = FakeService(result=SimpleNamespace(id="order-123456789"))
+    sessions = FakeSessions(
+        store={
+            "org-1:telegram:7001": {
+                "step": "confirm",
+                "selected": ["repair"],
+                "field_values": {
+                    "phone": "79990000000",
+                    "address": "Ленина 1",
+                    "fault": "Течь",
+                },
+            }
+        }
+    )
+    outbound = FakeOutbound()
+    target = IntakeCoordinator(
+        packs=FakePacks(seed_definition("field_service")),
+        sessions=sessions,
+        service=service,
+        outbound=outbound,
+        identities=FakeIdentities(["operator-chat", ""]),
+    )
+
+    reply = await target.handle_callback(identity(), INTAKE_CONFIRM, {})
+
+    assert "отправлена" in reply.text.lower()
+    assert len(outbound.messages) == 1
+    assert outbound.messages[0]["recipient_id"] == "operator-chat"
+    assert "fault: Течь" in outbound.messages[0]["text"]

@@ -21,6 +21,36 @@ curl http://127.0.0.1:8080/health/ready
 `/health/live` only proves that the API process answers. `/health/ready` also
 checks PostgreSQL.
 
+## Client address, tracking and master GPS
+
+Set `DISPATCH_PUBLIC_BASE_URL` to the externally reachable origin, for example
+`https://dispatch.example`. Production GPS sharing requires HTTPS; plain HTTP
+is suitable only for localhost development.
+
+After the phone step, client intake offers three address paths: native
+messenger location, a one-time `/address#…` map, or manual text. Configure the
+initial map region with `DISPATCH_DEFAULT_MAP_LATITUDE`,
+`DISPATCH_DEFAULT_MAP_LONGITUDE` and `DISPATCH_DEFAULT_MAP_ZOOM`. Saving the map
+point atomically advances the durable intake session and consumes its token;
+the client returns to the bot and presses «Продолжить после карты». The page
+does not infer location from IP. VPN normally does not alter GPS, but clients
+using spoofing or standing away from the object should use map/manual entry.
+
+When travel starts, the worker sends the client a read-only `/track#…` link and
+the master both a messenger-native location request and `/track/share#…` as a
+fallback. Viewer and sender use separate random capabilities. The fragment is
+not sent in the initial HTTP request; JavaScript passes it to same-origin API
+endpoints in a header. Completing or cancelling the order clears both tokens in
+the same transaction as the terminal state.
+
+Expose `/address`, `/track`, `/track/share`, `/v1/public/intake/location`,
+`/v1/public/tracking` and `/v1/public/location` through the TLS reverse proxy.
+Do not rewrite fragments into query parameters and do not place capability
+headers in access logs.
+OpenStreetMap attribution is visible on the map. The public OSM raster service
+has no SLA and can withdraw commercial access; use a suitable provider or
+self-hosted tiles before material paid traffic.
+
 ## Register actors
 
 The normal messenger flow does not require copying an external ID. The

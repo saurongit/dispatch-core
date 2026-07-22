@@ -16,6 +16,12 @@ ALTER TABLE actors ADD CONSTRAINT actors_role_check
 
 ALTER TABLE callback_actions
     DROP CONSTRAINT IF EXISTS callback_actions_allowed_role_check;
+UPDATE callback_actions SET allowed_role = 'operator'
+WHERE allowed_role = 'coordinator';
+UPDATE callback_actions SET allowed_role = 'master'
+WHERE allowed_role = 'executor';
+UPDATE callback_actions SET allowed_role = 'client'
+WHERE allowed_role = 'requester';
 ALTER TABLE callback_actions ADD CONSTRAINT callback_actions_allowed_role_check
     CHECK (
         allowed_role IS NULL

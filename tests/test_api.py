@@ -16,7 +16,11 @@ from dispatch_core.infrastructure.async_memory import (
     AsyncMemoryStore,
     AsyncMemoryUnitOfWorkFactory,
 )
-from dispatch_core.infrastructure.read_models import AsyncMemoryOrderReader
+from dispatch_core.infrastructure.read_models import (
+    AsyncMemoryOrderReader,
+    AsyncMemoryTrackingViewReader,
+)
+from dispatch_core.infrastructure.workflow_store import IntakeAddressSelection
 from dispatch_core.messaging.models import Provider
 from dispatch_core.transports.common import encode_executor_token
 
@@ -53,17 +57,31 @@ class FakeIdentityConfig:
         self.actors.append(values)
 
 
+@dataclass
+class FakeIntakeAddressStore:
+    selection: IntakeAddressSelection | None = None
+    calls: list[dict[str, Any]] = field(default_factory=list)
+
+    async def select_address_by_token(
+        self, **values: Any
+    ) -> IntakeAddressSelection | None:
+        self.calls.append(values)
+        return self.selection
+
+
 @asynccontextmanager
 async def api_client(
     *,
     inbox: FakeInbox | None = None,
     transports: dict[Provider, FakeTransport] | None = None,
     identities: FakeIdentityConfig | None = None,
+    intake_sessions: FakeIntakeAddressStore | None = None,
     telegram_secret: str | None = "telegram-webhook-secret",
     max_secret: str | None = "max-webhook-secret",
     webhook_max_body_bytes: int = 1_048_576,
     environment: str = "production",
     executor_token_secret: str | None = EXECUTOR_SECRET,
+    public_base_url: str | None = "https://dispatch.example",
 ) -> AsyncIterator[tuple[httpx.AsyncClient, AsyncMemoryStore]]:
     store = AsyncMemoryStore()
     factory = AsyncMemoryUnitOfWorkFactory(store)
@@ -77,11 +95,14 @@ async def api_client(
         webhook_max_body_bytes=webhook_max_body_bytes,
         environment=environment,
         executor_token_secret=executor_token_secret,
+        public_base_url=public_base_url,
     )
     app = create_app(
         settings,
         service=AsyncDispatchService(factory),
         reader=AsyncMemoryOrderReader(store),
+        tracking_reader=AsyncMemoryTrackingViewReader(store),
+        intake_sessions=intake_sessions,  # type: ignore[arg-type]
         inbox=inbox,  # type: ignore[arg-type]
         identities=identities,  # type: ignore[arg-type]
         transports=transports,  # type: ignore[arg-type]
@@ -113,7 +134,11 @@ def order_body(**overrides: Any) -> dict[str, Any]:
         "work_type": "lift_repair",
         "source": "phone",
         "requester_id": "resident-7",
-        "details": {"address": "Demo street", "asset": "lift-42"},
+        "details": {
+            "address": "Demo street",
+            "asset": "lift-42",
+            "service_location": {"latitude": 53.76, "longitude": 87.12},
+        },
         "evidence": {"minimum_photos": 1, "comment_required": True},
     }
     body.update(overrides)
@@ -131,6 +156,35 @@ async def create_order(
         headers=auth_headers(idempotency_key=key),
         json=body or order_body(),
     )
+
+
+async def start_tracking(
+    client: httpx.AsyncClient,
+    *,
+    key: str = "tracking-request-0001",
+    executor_id: str = "executor-1",
+) -> tuple[str, httpx.Response]:
+    created = await create_order(client, key=key)
+    order_id = created.json()["id"]
+    assigned = await client.post(
+        f"/v1/orders/{order_id}/assign",
+        headers=auth_headers(),
+        json={"executor_id": executor_id},
+    )
+    assert assigned.status_code == 200, assigned.text
+    accepted = await client.post(
+        f"/v1/orders/{order_id}/accept",
+        headers=auth_headers(),
+        json={"actor_id": executor_id},
+    )
+    assert accepted.status_code == 200, accepted.text
+    travel = await client.post(
+        f"/v1/orders/{order_id}/travel:start",
+        headers=auth_headers(),
+        json={"executor_id": executor_id},
+    )
+    assert travel.status_code == 200, travel.text
+    return order_id, travel
 
 
 @pytest.mark.asyncio
@@ -351,6 +405,265 @@ async def test_full_curated_api_flow_with_tracking_and_evidence() -> None:
     assert completed.status_code == 200
     assert completed.json()["status"] == "completed"
     assert len(store.outbox_events) == 13
+
+
+@pytest.mark.asyncio
+async def test_public_tracking_returns_only_latest_safe_snapshot() -> None:
+    async with api_client() as (client, _):
+        _, travel = await start_tracking(client)
+        tracking_url = travel.json()["tracking_url"]
+        token = tracking_url.split("#", maxsplit=1)[1]
+        recorded = await client.post(
+            f"/v1/tracking/{travel.json()['tracking_session_id']}/points",
+            headers=executor_headers("org-1", "executor-1"),
+            json={
+                "latitude": 53.7557,
+                "longitude": 87.1099,
+                "accuracy_m": 7.5,
+                "source": "telegram",
+            },
+        )
+        response = await client.get(
+            "/v1/public/tracking",
+            headers={"X-Tracking-Token": token},
+        )
+
+    assert recorded.status_code == 200
+    assert tracking_url.startswith("https://dispatch.example/track#")
+    assert "?" not in tracking_url
+    assert response.status_code == 200
+    assert response.json() == {
+        "brand": "Test Organization",
+        "work_type": "lift_repair",
+        "address": "Demo street",
+        "client_point": {"latitude": 53.76, "longitude": 87.12},
+        "master_name": "executor-1",
+        "order_status": "en_route",
+        "tracking_status": "active",
+        "point_count": 1,
+        "latest_point": {
+            "latitude": 53.7557,
+            "longitude": 87.1099,
+            "captured_at": response.json()["latest_point"]["captured_at"],
+            "accuracy_m": 7.5,
+        },
+        "updated_at": response.json()["updated_at"],
+    }
+    serialized = response.text
+    assert token not in serialized
+    assert "resident-7" not in serialized
+    assert "phone" not in serialized
+    assert response.headers["cache-control"] == "no-store, private"
+    assert response.headers["x-robots-tag"] == "noindex, nofollow"
+
+
+@pytest.mark.asyncio
+async def test_public_tracking_uses_generic_not_found_for_bad_credentials() -> None:
+    async with api_client() as (client, _):
+        missing = await client.get("/v1/public/tracking")
+        malformed = await client.get(
+            "/v1/public/tracking",
+            headers={"X-Tracking-Token": "short"},
+        )
+        unknown = await client.get(
+            "/v1/public/tracking",
+            headers={"X-Tracking-Token": "x" * 43},
+        )
+
+    assert {missing.status_code, malformed.status_code, unknown.status_code} == {404}
+    assert missing.json() == malformed.json() == unknown.json() == {
+        "detail": "Tracking link is unavailable"
+    }
+
+
+@pytest.mark.asyncio
+async def test_tracking_page_keeps_token_in_fragment_and_has_security_headers() -> None:
+    async with api_client() as (client, _):
+        response = await client.get("/track")
+
+    assert response.status_code == 200
+    assert "OpenStreetMap contributors" in response.text
+    assert "Место выполнения работы" in response.text
+    assert "🚗" in response.text
+    assert "status-flow" in response.text
+    assert "location.hash" in response.text
+    assert "X-Tracking-Token" in response.text
+    assert "tile.openstreetmap.org" in response.text
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-frame-options"] == "DENY"
+    assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
+    assert response.headers["referrer-policy"] == "strict-origin-when-cross-origin"
+
+
+@pytest.mark.asyncio
+async def test_address_page_explains_vpn_and_uses_locked_fragment_flow() -> None:
+    async with api_client() as (client, _):
+        response = await client.get("/address")
+
+    assert response.status_code == 200
+    assert "VPN обычно не меняет GPS" in response.text
+    assert "Первое нажатие разблокирует карту" in response.text
+    assert "location.hash" in response.text
+    assert "X-Intake-Token" in response.text
+    assert "OpenStreetMap contributors" in response.text
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["referrer-policy"] == "no-referrer"
+    assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
+
+
+@pytest.mark.asyncio
+async def test_address_capability_saves_point_without_echoing_token() -> None:
+    token = "i" * 43
+    store = FakeIntakeAddressStore(
+        selection=IntakeAddressSelection(
+            organization_id="org-1",
+            actor_id="client-1",
+            provider=Provider.TELEGRAM,
+            address="Ленина 10",
+            latitude=53.75,
+            longitude=87.1,
+        )
+    )
+    async with api_client(intake_sessions=store) as (client, _):
+        response = await client.post(
+            "/v1/public/intake/location",
+            headers={"X-Intake-Token": token},
+            json={
+                "latitude": 53.75,
+                "longitude": 87.1,
+                "address": "Ленина 10",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"saved": True, "address": "Ленина 10"}
+    assert token not in response.text
+    assert store.calls == [
+        {
+            "token": token,
+            "latitude": 53.75,
+            "longitude": 87.1,
+            "address": "Ленина 10",
+        }
+    ]
+    assert response.headers["cache-control"] == "no-store, private"
+
+
+@pytest.mark.asyncio
+async def test_address_capability_hides_missing_and_unknown_tokens() -> None:
+    store = FakeIntakeAddressStore()
+    async with api_client(intake_sessions=store) as (client, _):
+        missing = await client.post(
+            "/v1/public/intake/location",
+            json={"latitude": 53.75, "longitude": 87.1},
+        )
+        unknown = await client.post(
+            "/v1/public/intake/location",
+            headers={"X-Intake-Token": "u" * 43},
+            json={"latitude": 53.75, "longitude": 87.1},
+        )
+    assert missing.status_code == unknown.status_code == 404
+    assert missing.json() == unknown.json() == {
+        "detail": "Address link is unavailable"
+    }
+
+
+@pytest.mark.asyncio
+async def test_browser_location_capability_records_point_for_active_master() -> None:
+    async with api_client() as (client, store):
+        _, travel = await start_tracking(client)
+        session = next(iter(store.tracking_sessions.values()))
+        location_token = session.location_token
+        assert location_token is not None
+        submitted = await client.post(
+            "/v1/public/location",
+            headers={"X-Location-Token": location_token},
+            json={
+                "latitude": 53.8,
+                "longitude": 87.2,
+                "accuracy_m": 12.0,
+                "captured_at": "2026-07-22T09:30:00Z",
+                "event_id": "browser-fix-1",
+            },
+        )
+        viewer_token = travel.json()["tracking_url"].split("#", maxsplit=1)[1]
+        viewed = await client.get(
+            "/v1/public/tracking",
+            headers={"X-Tracking-Token": viewer_token},
+        )
+
+    assert submitted.status_code == 200
+    assert submitted.json()["point_count"] == 1
+    assert viewed.json()["latest_point"]["latitude"] == 53.8
+    assert location_token not in submitted.text
+
+
+@pytest.mark.asyncio
+async def test_tracking_capabilities_cannot_be_used_for_opposite_operation(
+) -> None:
+    async with api_client() as (client, store):
+        _, travel = await start_tracking(client)
+        viewer_token = travel.json()["tracking_url"].split("#", maxsplit=1)[1]
+        location_token = next(iter(store.tracking_sessions.values())).location_token
+        assert location_token is not None
+        viewer_cannot_write = await client.post(
+            "/v1/public/location",
+            headers={"X-Location-Token": viewer_token},
+            json={
+                "latitude": 53.8,
+                "longitude": 87.2,
+                "event_id": "wrong-capability",
+            },
+        )
+        sender_cannot_read = await client.get(
+            "/v1/public/tracking",
+            headers={"X-Tracking-Token": location_token},
+        )
+
+    assert viewer_cannot_write.status_code == 404
+    assert sender_cannot_read.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_location_share_page_uses_fragment_and_browser_geolocation() -> None:
+    async with api_client() as (client, _):
+        response = await client.get("/track/share")
+
+    assert response.status_code == 200
+    assert "location.hash" in response.text
+    assert "X-Location-Token" in response.text
+    assert "navigator.geolocation.watchPosition" in response.text
+    assert "geolocation=(self)" in response.headers["permissions-policy"]
+    assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.asyncio
+async def test_completion_immediately_revokes_public_tracking_link() -> None:
+    async with api_client() as (client, _):
+        order_id, travel = await start_tracking(client)
+        token = travel.json()["tracking_url"].split("#", maxsplit=1)[1]
+        started = await client.post(
+            f"/v1/orders/{order_id}/work:start",
+            headers=auth_headers(),
+            json={"actor_id": "executor-1"},
+        )
+        assert started.status_code == 200
+        completed = await client.post(
+            f"/v1/orders/{order_id}/complete",
+            headers=auth_headers(),
+            json={
+                "executor_id": "executor-1",
+                "photo_refs": ["object://proof"],
+                "comment": "done",
+            },
+        )
+        revoked = await client.get(
+            "/v1/public/tracking",
+            headers={"X-Tracking-Token": token},
+        )
+
+    assert completed.status_code == 200
+    assert revoked.status_code == 404
 
 
 @pytest.mark.asyncio

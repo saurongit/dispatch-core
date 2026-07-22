@@ -18,10 +18,11 @@ from dispatch_core.messaging.models import (
     Provider,
 )
 from dispatch_core.messaging.projector import OutboxProjectorWorker
+from dispatch_core.messaging.replies import ReplyButton
 from dispatch_core.messaging.sender import OutboundSender
 from dispatch_core.runtime import api as runtime_api
 from dispatch_core.runtime.factory import build_transports
-from dispatch_core.runtime.worker import _repeat, _wait_or_stop
+from dispatch_core.runtime.worker import _cleanup_sessions, _repeat, _wait_or_stop
 from dispatch_core.transports.contracts import SendResult
 from dispatch_core.transports.polling import DurablePollingReceiver
 
@@ -69,6 +70,25 @@ def test_webhook_mode_requires_non_empty_secret(
 def test_settings_reject_blank_identity_and_host(field: str, value: str) -> None:
     with pytest.raises(ValidationError, match="cannot be blank"):
         settings(**{field: value})
+
+
+def test_settings_normalizes_public_base_url() -> None:
+    configured = settings(public_base_url="https://dispatch.example/base/")
+    assert configured.public_base_url == "https://dispatch.example/base"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "dispatch.example",
+        "ftp://dispatch.example",
+        "https://dispatch.example/?token=bad",
+        "https://dispatch.example/#secret",
+    ],
+)
+def test_settings_rejects_invalid_public_base_url(value: str) -> None:
+    with pytest.raises(ValidationError, match="public_base_url"):
+        settings(public_base_url=value)
 
 
 def test_transport_factory_returns_empty_when_channels_disabled() -> None:
@@ -166,6 +186,22 @@ def test_outbound_button_rejects_blank_text_and_negative_row() -> None:
         OutboundButton("", callback_token="token")
     with pytest.raises(ValueError, match="row"):
         OutboundButton("button", callback_token="token", row=-1)
+
+
+def test_reply_button_validates_direct_action_shape() -> None:
+    with pytest.raises(ValueError, match="text"):
+        ReplyButton("", "action")
+    with pytest.raises(ValueError, match="row"):
+        ReplyButton("button", "action", row=-1)
+    with pytest.raises(ValueError, match="combine"):
+        ReplyButton(
+            "button",
+            "",
+            url="https://example.test",
+            request_location=True,
+        )
+    with pytest.raises(ValueError, match="action"):
+        ReplyButton("button", "")
 
 
 @pytest.mark.parametrize(
@@ -485,6 +521,65 @@ async def test_wait_or_stop_handles_pre_set_and_zero_timeout() -> None:
     stopped.set()
     await _wait_or_stop(stopped, 10)
     await _wait_or_stop(asyncio.Event(), 0)
+
+
+@dataclass
+class FakeStaleSessionStore:
+    deleted: int
+    max_ages: list[int] = field(default_factory=list)
+
+    async def cleanup_stale(self, *, max_age_hours: int) -> int:
+        self.max_ages.append(max_age_hours)
+        return self.deleted
+
+
+@dataclass
+class FakeBindingSessionStore:
+    deleted: int
+    calls: int = 0
+
+    async def cleanup_expired(self) -> int:
+        self.calls += 1
+        return self.deleted
+
+
+@pytest.mark.asyncio
+async def test_session_cleanup_covers_every_durable_workflow_store(caplog) -> None:
+    caplog.set_level("INFO", logger="dispatch_core.runtime.worker")
+    intake = FakeStaleSessionStore(1)
+    config = FakeStaleSessionStore(2)
+    binding = FakeBindingSessionStore(3)
+    staff = FakeStaleSessionStore(4)
+
+    await _cleanup_sessions(  # type: ignore[arg-type]
+        intake,
+        config,
+        binding,
+        staff,
+    )
+
+    assert intake.max_ages == [24]
+    assert config.max_ages == [24]
+    assert staff.max_ages == [24]
+    assert binding.calls == 1
+    assert "cleaned up 10 stale sessions" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_session_cleanup_does_not_log_when_nothing_expired(caplog) -> None:
+    intake = FakeStaleSessionStore(0)
+    config = FakeStaleSessionStore(0)
+    binding = FakeBindingSessionStore(0)
+    staff = FakeStaleSessionStore(0)
+
+    await _cleanup_sessions(  # type: ignore[arg-type]
+        intake,
+        config,
+        binding,
+        staff,
+    )
+
+    assert "cleaned up" not in caplog.text
 
 
 def test_demo_cli_executes_complete_curated_flow(capsys) -> None:
