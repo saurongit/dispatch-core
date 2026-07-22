@@ -13,6 +13,9 @@ from dispatch_core.infrastructure.messaging import (
     PendingDomainEvent,
     PostgresOutboxStore,
 )
+from dispatch_core.infrastructure.pack_store import PostgresPackStore
+from dispatch_core.messaging.cards import CardRenderer
+from dispatch_core.packs.catalog import PackDefinition
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,8 +39,11 @@ class RecipientPlan:
 class PostgresNotificationProjector:
     """Atomically turns domain events into callback tokens and outbound messages."""
 
-    def __init__(self, pool: asyncpg.Pool) -> None:
+    def __init__(
+        self, pool: asyncpg.Pool, packs: PostgresPackStore | None = None
+    ) -> None:
         self._pool = pool
+        self._packs = packs
 
     async def project(self, event: PendingDomainEvent) -> int:
         async with self._pool.acquire() as connection:
@@ -50,7 +56,9 @@ class PostgresNotificationProjector:
                     event.organization_id,
                     event.aggregate_id,
                 )
-                plans = self._plans(event, order)
+                pack = await self._active_pack(event.organization_id)
+                card = self._card(order, pack)
+                plans = self._plans(event, order, card)
                 inserted = 0
                 for plan in plans:
                     buttons = await self._buttons(connection, event, plan.buttons)
@@ -160,21 +168,41 @@ class PostgresNotificationProjector:
         self,
         event: PendingDomainEvent,
         order: asyncpg.Record | None,
+        card: str,
     ) -> tuple[RecipientPlan, ...]:
         if event.aggregate_type != "work_order" or order is None:
             return ()
         order_id = event.aggregate_id
-        details = _json_value(order["details"])
-        address = details.get("address") or details.get("destination") or ""
-        label = details.get("summary") or details.get("fault") or order["work_type"]
-        card = f"Заявка: {label}" + (
-            f"\nАдрес: {address}" if address else ""  # noqa: RUF001
-        )
         assignee = order["assignee_id"]
         coordinator = order["coordinator_id"]
         requester = order["requester_id"]
         coordinators = (coordinator,) if coordinator else ()
 
+        if event.name == "work_order.submitted":
+            return (
+                RecipientPlan(
+                    roles=("coordinator", "admin"),
+                    text=f"Новая заявка от клиента.\n{card}",
+                    buttons=(
+                        PlannedButton(
+                            "В пул",
+                            "pool_publish",
+                            {"order_id": order_id},
+                            "coordinator",
+                        ),
+                    ),
+                    purpose="submitted",
+                ),
+            )
+        if event.name == "work_order.coordination_claimed":
+            coordinator_id = str(event.payload.get("coordinator_id") or "")
+            return (
+                RecipientPlan(
+                    actor_ids=(coordinator_id,) if coordinator_id else (),
+                    text=f"Вы взяли заявку в работу.\n{card}",
+                    purpose="coordination_claimed",
+                ),
+            )
         if event.name == "work_order.pool_published":
             mode = event.payload.get("mode")
             action = "pool_interest" if mode == "curated" else "pool_claim"
@@ -200,7 +228,7 @@ class PostgresNotificationProjector:
                 RecipientPlan(
                     actor_ids=coordinators,
                     roles=() if coordinators else ("coordinator", "admin"),
-                    text=f"{card}\nМастер готов взять: {executor_id}",  # noqa: RUF001
+                    text=f"{card}\nМастер готов взять: {executor_id}",
                     buttons=(
                         PlannedButton(
                             "Выбрать мастера",
@@ -215,7 +243,7 @@ class PostgresNotificationProjector:
         if event.name in {"work_order.assigned", "work_order.first_claim_won"}:
             if not assignee:
                 return ()
-            return (
+            plans = [
                 RecipientPlan(
                     actor_ids=(assignee,),
                     text=f"Вам назначена заявка.\n{card}",
@@ -236,7 +264,21 @@ class PostgresNotificationProjector:
                     ),
                     purpose="assignment",
                 ),
-            )
+            ]
+            if coordinators:
+                label = (
+                    "Мастер закрепился за заявкой."
+                    if event.name == "work_order.first_claim_won"
+                    else "Мастер назначен на заявку."
+                )
+                plans.append(
+                    RecipientPlan(
+                        actor_ids=coordinators,
+                        text=f"{label}\n{card}",
+                        purpose="coordinator_assignment",
+                    )
+                )
+            return tuple(plans)
         if event.name == "work_order.accepted":
             plans = [
                 RecipientPlan(
@@ -270,7 +312,7 @@ class PostgresNotificationProjector:
                 )
             return tuple(plans)
         if event.name == "work_order.travel_started":
-            return (
+            plans = [
                 RecipientPlan(
                     actor_ids=(assignee,) if assignee else (),
                     text=f"Выезд начат.\n{card}",
@@ -284,7 +326,16 @@ class PostgresNotificationProjector:
                     ),
                     purpose="travel",
                 ),
-            )
+            ]
+            if coordinators:
+                plans.append(
+                    RecipientPlan(
+                        actor_ids=coordinators,
+                        text=f"Мастер выехал на заявку.\n{card}",
+                        purpose="coordinator_travel",
+                    )
+                )
+            return tuple(plans)
         if event.name == "work_order.started":
             return (
                 RecipientPlan(
@@ -333,6 +384,33 @@ class PostgresNotificationProjector:
                 ),
             )
         return ()
+
+    async def _active_pack(
+        self, organization_id: str
+    ) -> PackDefinition | None:
+        if self._packs is None:
+            return None
+        return await self._packs.active(organization_id)
+
+    def _card(
+        self,
+        order: asyncpg.Record | None,
+        pack: PackDefinition | None,
+    ) -> str:
+        if order is None:
+            return ""
+        details = _json_value(order["details"])
+        if pack is not None:
+            return CardRenderer(pack).order_card(
+                work_type=order["work_type"], details=details
+            )
+        address = details.get("address") or details.get("destination") or ""
+        label = (
+            details.get("summary") or details.get("fault") or order["work_type"]
+        )
+        return f"Заявка: {label}" + (
+            f"\nАдрес: {address}" if address else ""
+        )
 
 
 class OutboxProjectorWorker:

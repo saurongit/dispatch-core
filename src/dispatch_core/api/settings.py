@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     database_url: SecretStr
     organization_id: str = "default"
     organization_name: str = "Dispatch Core"
+    default_pack: str = "field_service"
     admin_api_key: SecretStr
     auto_migrate: bool = True
     migrations_directory: Path | None = None
@@ -33,6 +34,7 @@ class Settings(BaseSettings):
     max_bot_token_file: Path | None = None
     max_receive_mode: Literal["disabled", "polling", "webhook"] = "disabled"
     max_proxy: SecretStr | None = None
+    callback_signing_secret: SecretStr | None = None
     worker_idle_seconds: float = Field(default=0.25, ge=0.05, le=10)
     api_host: str = "0.0.0.0"
     api_port: int = Field(default=8080, ge=1, le=65535)

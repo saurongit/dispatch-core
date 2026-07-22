@@ -26,6 +26,7 @@ from dispatch_core.infrastructure.messaging import (
     PostgresOutboundStore,
     PostgresOutboxStore,
 )
+from dispatch_core.infrastructure.pack_store import PostgresPackStore
 from dispatch_core.infrastructure.postgres import (
     PostgresDatabase,
     PostgresUnitOfWorkFactory,
@@ -34,11 +35,14 @@ from dispatch_core.infrastructure.read_models import PostgresOrderReader
 from dispatch_core.infrastructure.workflow_store import (
     PostgresExecutionStore,
     PostgresIdentityStore,
+    PostgresIntakeSessionStore,
     PostgresReportDraftStore,
 )
+from dispatch_core.messaging.intake import IntakeCoordinator
 from dispatch_core.messaging.models import OutboundButton, Provider
 from dispatch_core.messaging.processor import InboundProcessor
 from dispatch_core.messaging.projector import PostgresNotificationProjector
+from dispatch_core.packs.catalog import seed_definition
 from dispatch_core.runtime.worker import run_worker
 from dispatch_core.transports.telegram import TelegramTransport
 
@@ -693,10 +697,13 @@ async def test_identity_binding_and_report_draft_round_trip(
     assert report.comment == "done"
 
 
-async def project_all(database: PostgresDatabase) -> int:
+async def project_all(
+    database: PostgresDatabase,
+    packs: PostgresPackStore | None = None,
+) -> int:
     assert database.pool is not None
     outbox = PostgresOutboxStore(database.pool)
-    projector = PostgresNotificationProjector(database.pool)
+    projector = PostgresNotificationProjector(database.pool, packs)
     projected = 0
     while events := await outbox.claim_events(limit=100):
         for event in events:
@@ -935,3 +942,185 @@ async def test_messenger_curated_flow_reaches_evidence_backed_completion(
     assert completed.report is not None
     assert completed.report.photo_refs == ("telegram:photo-large",)
     assert completed.report.comment == "Lift repaired and tested"
+
+
+@pytest.mark.asyncio
+async def test_client_intake_from_first_message_reaches_completion(
+    database: PostgresDatabase,
+    organization: str,
+) -> None:
+    assert database.pool is not None
+    pool = database.pool
+    identities = PostgresIdentityStore(pool)
+    for values in (
+        ("operator-1", "coordinator", "Operator", "1001"),
+        ("executor-1", "executor", "Executor", "2001"),
+    ):
+        await identities.upsert_actor(
+            organization_id=organization,
+            actor_id=values[0],
+            role=values[1],
+            display_name=values[2],
+            provider=Provider.TELEGRAM,
+            external_user_id=values[3],
+        )
+
+    packs = PostgresPackStore(pool)
+    assert await packs.bootstrap_active(
+        organization, seed=seed_definition("field_service")
+    )
+
+    async def telegram_response(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(telegram_response))
+    transport = TelegramTransport("test-token", client=client)
+    inbox = PostgresInboxStore(pool)
+    commands = service(database)
+    intake = IntakeCoordinator(
+        packs=packs,
+        sessions=PostgresIntakeSessionStore(pool),
+        service=commands,
+    )
+    processor = InboundProcessor(
+        inbox=inbox,
+        identities=identities,
+        callbacks=PostgresCallbackStore(pool),
+        executions=PostgresExecutionStore(pool),
+        drafts=PostgresReportDraftStore(pool),
+        outbound=PostgresOutboundStore(pool),
+        service=commands,
+        reader=PostgresOrderReader(pool),
+        transports={Provider.TELEGRAM: transport},
+        packs=packs,
+        intake=intake,
+    )
+
+    next_update = 0
+
+    async def say(chat: int, text: str) -> None:
+        nonlocal next_update
+        next_update += 1
+        await accept_telegram_update(
+            inbox,
+            organization,
+            next_update,
+            {"message": {"from": {"id": chat}, "chat": {"id": chat}, "text": text}},
+        )
+
+    async def click(chat: int, token: str) -> None:
+        nonlocal next_update
+        next_update += 1
+        await accept_telegram_update(
+            inbox,
+            organization,
+            next_update,
+            {
+                "callback_query": {
+                    "id": f"cb-{next_update}",
+                    "from": {"id": chat},
+                    "message": {"chat": {"id": chat}},
+                    "data": f"dc1:{token}",
+                }
+            },
+        )
+
+    # A brand-new client sends their first message: the processor auto-registers
+    # them as a requester and the intake greeting offers pack services.
+    await say(3001, "Здравствуйте")
+    assert await processor.run_once() == 1
+    repair_token = await callback_token(database, organization, "3001", "Ремонт")
+    await click(3001, repair_token)
+    assert await processor.run_once() == 1
+    done_token = await callback_token(database, organization, "3001", "Готово")
+    await click(3001, done_token)
+    assert await processor.run_once() == 1
+
+    # Guided field prompts: required address, skipped optional asset, required fault.
+    await say(3001, "Ленина 1")
+    assert await processor.run_once() == 1
+    await say(3001, "-")
+    assert await processor.run_once() == 1
+    await say(3001, "Течёт кран")
+    assert await processor.run_once() == 1
+    confirm_token = await callback_token(
+        database, organization, "3001", "Подтвердить"
+    )
+    await click(3001, confirm_token)
+    assert await processor.run_once() == 1
+
+    async with pool.acquire() as connection:
+        order_id = await connection.fetchval(
+            """
+            SELECT id FROM work_orders
+            WHERE organization_id = $1 AND requester_id = $2
+            """,
+            organization,
+            "telegram:3001",
+        )
+    assert order_id is not None
+    submitted = await PostgresOrderReader(pool).get(organization, order_id)
+    assert submitted.status is WorkOrderStatus.SUBMITTED
+    assert submitted.work_type == "repair"
+
+    # Operator is notified of the new client order and publishes it to the pool.
+    await project_all(database, packs)
+    pool_token = await callback_token(database, organization, "1001", "В пул")
+    await click(1001, pool_token)
+    assert await processor.run_once() == 1
+
+    # Curated pool: executor expresses interest, operator assigns, executor works.
+    await project_all(database, packs)
+    interest_token = await callback_token(
+        database, organization, "2001", "Готов взять"
+    )
+    await click(2001, interest_token)
+    assert await processor.run_once() == 1
+
+    await project_all(database, packs)
+    assign_token = await callback_token(
+        database, organization, "1001", "Выбрать мастера"
+    )
+    await click(1001, assign_token)
+    assert await processor.run_once() == 1
+
+    await project_all(database, packs)
+    accept_token = await callback_token(database, organization, "2001", "Принять")
+    await click(2001, accept_token)
+    assert await processor.run_once() == 1
+
+    await project_all(database, packs)
+    start_token = await callback_token(
+        database, organization, "2001", "Начать на месте"
+    )
+    await click(2001, start_token)
+    assert await processor.run_once() == 1
+
+    await project_all(database, packs)
+    submit_token = await callback_token(
+        database, organization, "2001", "Завершить"
+    )
+    next_update += 1
+    await accept_telegram_update(
+        inbox,
+        organization,
+        next_update,
+        {
+            "message": {
+                "from": {"id": 2001},
+                "chat": {"id": 2001},
+                "photo": [{"file_id": "photo-small"}, {"file_id": "photo-large"}],
+            }
+        },
+    )
+    await say(2001, "Кран заменён и проверен")
+    assert await processor.run_once() == 2
+    await click(2001, submit_token)
+    assert await processor.run_once() == 1
+    await client.aclose()
+
+    completed = await PostgresOrderReader(pool).get(organization, order_id)
+    assert completed.status is WorkOrderStatus.COMPLETED
+    assert completed.report is not None
+    assert completed.report.photo_refs == ("telegram:photo-large",)
+    assert completed.report.comment == "Кран заменён и проверен"

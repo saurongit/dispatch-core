@@ -1,24 +1,38 @@
 from __future__ import annotations
 
+import logging
+from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
 from dispatch_core.application.async_service import AsyncDispatchService
 from dispatch_core.application.identity import ActorIdentity
 from dispatch_core.domain.errors import DomainError, InvalidTransition
-from dispatch_core.domain.work_order import PoolResponseStatus, WorkOrderStatus
+from dispatch_core.domain.work_order import (
+    PoolMode,
+    PoolResponseStatus,
+    WorkOrderStatus,
+)
 from dispatch_core.infrastructure.messaging import (
     PostgresCallbackStore,
     PostgresInboxStore,
     PostgresOutboundStore,
 )
+from dispatch_core.infrastructure.pack_store import PostgresPackStore
 from dispatch_core.infrastructure.read_models import OrderReader
 from dispatch_core.infrastructure.workflow_store import (
     PostgresExecutionStore,
     PostgresIdentityStore,
     PostgresReportDraftStore,
 )
-from dispatch_core.messaging.models import InboundEnvelope, Provider
+from dispatch_core.messaging.config import CONFIG_ACTIONS, ConfigCoordinator
+from dispatch_core.messaging.intake import INTAKE_ACTIONS, IntakeCoordinator
+from dispatch_core.messaging.models import InboundEnvelope, OutboundButton, Provider
+from dispatch_core.messaging.replies import Reply
 from dispatch_core.transports.contracts import EventKind, InboundEvent, Transport
+from dispatch_core.transports.max import MaxRateLimitError
+from dispatch_core.transports.telegram import TelegramRateLimitError
+
+logger = logging.getLogger(__name__)
 
 
 class InboundProcessor:
@@ -36,6 +50,9 @@ class InboundProcessor:
         service: AsyncDispatchService,
         reader: OrderReader,
         transports: dict[Provider, Transport],
+        packs: PostgresPackStore | None = None,
+        intake: IntakeCoordinator | None = None,
+        config: ConfigCoordinator | None = None,
     ) -> None:
         self._inbox = inbox
         self._identities = identities
@@ -46,6 +63,9 @@ class InboundProcessor:
         self._service = service
         self._reader = reader
         self._transports = transports
+        self._packs = packs
+        self._intake = intake
+        self._config = config
 
     async def run_once(self, *, limit: int = 50) -> int:
         items = await self._inbox.claim(limit=limit)
@@ -54,6 +74,11 @@ class InboundProcessor:
             try:
                 await self._process(item)
             except Exception as exc:
+                logger.exception(
+                    "processing failed for %s:%s",
+                    item.provider.value,
+                    item.external_event_id,
+                )
                 await self._inbox.mark_failed(
                     item,
                     f"{type(exc).__name__}: {exc}",
@@ -75,7 +100,9 @@ class InboundProcessor:
                 external_user_id=event.external_user_id,
             )
             if identity is None:
-                response = (
+                identity = await self._maybe_register_requester(item, event)
+            if identity is None:
+                response: str | Reply = (
                     "Пользователь не зарегистрирован. "
                     "Передайте администратору ваш ID: "
                     f"{event.external_user_id}."
@@ -85,7 +112,11 @@ class InboundProcessor:
                     response = await self._dispatch(identity, event)
                 except DomainError as exc:
                     response = f"Команда не выполнена: {exc}"
-            if response:
+            reply = response if isinstance(response, Reply) else Reply(response)
+            if reply.text or reply.buttons:
+                buttons = await self._mint_buttons(
+                    item.organization_id, reply.buttons
+                )
                 await self._outbound.enqueue(
                     deduplication_key=(
                         f"inbox:{item.provider.value}:{item.external_event_id}:"
@@ -94,20 +125,80 @@ class InboundProcessor:
                     organization_id=item.organization_id,
                     provider=item.provider,
                     recipient_id=event.chat_id,
-                    text=response,
+                    text=reply.text,
+                    buttons=buttons,
                 )
             if event.callback_id:
                 try:
-                    await transport.answer_callback(event.callback_id, response)
-                except Exception:
-                    # A callback spinner is ephemeral; the durable reply remains queued.
-                    pass
+                    await transport.answer_callback(
+                        event.callback_id, reply.text or None
+                    )
+                except (RuntimeError, TelegramRateLimitError, MaxRateLimitError):
+                    logger.debug(
+                        "answer_callback failed for %s — durable reply still queued",
+                        event.callback_id,
+                    )
+
+    async def _maybe_register_requester(
+        self, item: InboundEnvelope, event: InboundEvent
+    ) -> ActorIdentity | None:
+        if self._intake is None:
+            return None
+        if event.kind not in {EventKind.MESSAGE, EventKind.START}:
+            return None
+        actor_id = f"{item.provider.value}:{event.external_user_id}"
+        await self._identities.upsert_actor(
+            organization_id=item.organization_id,
+            actor_id=actor_id,
+            role="requester",
+            display_name=event.external_user_id,
+            provider=item.provider,
+            external_user_id=event.external_user_id,
+        )
+        return ActorIdentity(
+            organization_id=item.organization_id,
+            actor_id=actor_id,
+            role="requester",
+            display_name=event.external_user_id,
+            provider=item.provider,
+            external_user_id=event.external_user_id,
+        )
+
+    async def _mint_buttons(
+        self, organization_id: str, buttons: tuple[Any, ...]
+    ) -> tuple[OutboundButton, ...]:
+        minted: list[OutboundButton] = []
+        for button in buttons:
+            callback = await self._callbacks.create(
+                organization_id=organization_id,
+                action=button.action,
+                payload=dict(button.payload),
+                allowed_role=button.allowed_role,
+            )
+            minted.append(
+                OutboundButton(
+                    text=button.text,
+                    callback_token=callback.token,
+                    row=button.row,
+                )
+            )
+        return tuple(minted)
 
     async def _dispatch(
         self, identity: ActorIdentity, event: InboundEvent
-    ) -> str:
+    ) -> str | Reply:
         if event.kind is EventKind.CALLBACK:
             return await self._callback(identity, event)
+        if identity.role == "admin" and self._config is not None:
+            if event.kind is EventKind.START:
+                return await self._config.start(identity)
+            if event.kind is EventKind.MESSAGE and event.text:
+                return await self._config.handle_text(identity, event.text)
+        if identity.role == "requester" and self._intake is not None:
+            if event.kind is EventKind.START:
+                return await self._intake.start(identity)
+            if event.kind is EventKind.MESSAGE and event.text:
+                return await self._intake.handle_text(identity, event.text)
         execution = await self._executions.active_for_executor(
             identity.organization_id,
             identity.actor_id,
@@ -153,7 +244,7 @@ class InboundProcessor:
 
     async def _callback(
         self, identity: ActorIdentity, event: InboundEvent
-    ) -> str:
+    ) -> str | Reply:
         if event.callback_token is None:
             raise InvalidTransition("callback token is missing")
         callback = await self._callbacks.resolve(
@@ -164,6 +255,23 @@ class InboundProcessor:
         if callback is None:
             raise InvalidTransition("кнопка устарела или недоступна для этой роли")
         payload = dict(callback.payload)
+        logger.info(
+            "callback action=%s role=%s org=%s",
+            callback.action,
+            identity.role,
+            identity.organization_id,
+        )
+        if self._intake is not None and callback.action in INTAKE_ACTIONS:
+            return await self._intake.handle_callback(
+                identity, callback.action, payload
+            )
+        if self._config is not None and callback.action in CONFIG_ACTIONS:
+            self._require_role(identity, "admin")
+            return await self._config.handle_callback(
+                identity, callback.action, payload
+            )
+        if callback.action == "pool_publish":
+            return await self._publish_pool(identity, payload)
         order_id = str(payload.get("order_id") or "")
         if not order_id:
             raise InvalidTransition("callback does not reference a work order")
@@ -224,6 +332,8 @@ class InboundProcessor:
                     WorkOrderStatus.COMPLETED,
                 }:
                     raise
+                if order.status == WorkOrderStatus.COMPLETED:
+                    return "Заявка уже завершена."
             return "Заявка принята."
         if callback.action == "reject":
             self._require_role(identity, "executor")
@@ -273,6 +383,8 @@ class InboundProcessor:
                     WorkOrderStatus.COMPLETED,
                 }:
                     raise
+                if order.status == WorkOrderStatus.COMPLETED:
+                    return "Заявка уже завершена."
             return "Работа начата. Пришлите фото и комментарий отчёта."
         if callback.action == "submit_report":
             self._require_role(identity, "executor")
@@ -299,6 +411,31 @@ class InboundProcessor:
             )
             return "Отчёт принят, заявка завершена."
         raise InvalidTransition(f"unknown callback action {callback.action!r}")
+
+    async def _publish_pool(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> str:
+        self._require_role(identity, "coordinator", "admin")
+        order_id = str(payload.get("order_id") or "")
+        if not order_id:
+            raise InvalidTransition("callback does not reference a work order")
+        mode = PoolMode.CURATED
+        if self._packs is not None:
+            pack = await self._packs.active(identity.organization_id)
+            if pack is not None:
+                mode = pack.default_pool_mode
+        try:
+            await self._service.publish_pool(
+                identity.organization_id,
+                order_id,
+                mode,
+                actor_id=identity.actor_id,
+            )
+        except InvalidTransition:
+            order = await self._reader.get(identity.organization_id, order_id)
+            if order.status is WorkOrderStatus.SUBMITTED:
+                raise
+        return "Заявка опубликована в пул."
 
     @staticmethod
     def _require_role(identity: ActorIdentity, *roles: str) -> None:

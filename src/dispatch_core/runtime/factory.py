@@ -27,6 +27,7 @@ def build_transports(
     if telegram_enabled and telegram_token:
         transports[Provider.TELEGRAM] = TelegramTransport(
             telegram_token,
+            signing_secret=_secret_value(settings.callback_signing_secret) or "",
             proxy=_secret_value(settings.telegram_proxy),
         )
     max_token = _secret(settings.max_bot_token, settings.max_bot_token_file)
@@ -38,6 +39,7 @@ def build_transports(
     if max_enabled and max_token:
         transports[Provider.MAX] = MaxTransport(
             max_token,
+            signing_secret=_secret_value(settings.callback_signing_secret) or "",
             proxy=_secret_value(settings.max_proxy),
         )
     return transports

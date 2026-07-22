@@ -57,6 +57,32 @@ class PostgresIdentityStore:
             external_user_id=external_user_id,
         )
 
+    async def external_ids_for_role(
+        self,
+        *,
+        organization_id: str,
+        provider: Provider,
+        role: str,
+    ) -> list[str]:
+        async with self._pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT identity.external_user_id
+                FROM external_identities AS identity
+                JOIN actors AS actor
+                  ON actor.organization_id = identity.organization_id
+                 AND actor.id = identity.actor_id
+                WHERE identity.organization_id = $1
+                  AND identity.provider = $2
+                  AND actor.role = $3
+                  AND actor.active
+                """,
+                organization_id,
+                provider.value,
+                role,
+            )
+        return [str(row["external_user_id"]) for row in rows]
+
     async def upsert_actor(
         self,
         *,
@@ -248,3 +274,99 @@ class PostgresReportDraftStore:
                 order_id,
                 executor_id,
             )
+
+
+class _PostgresSessionStore:
+    """Per-actor FSM state persisted as jsonb; shared by intake and config."""
+
+    _table = ""
+
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        self._pool = pool
+
+    async def get(
+        self, organization_id: str, actor_id: str
+    ) -> dict[str, Any] | None:
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                f"""
+                SELECT state FROM {self._table}
+                WHERE organization_id = $1 AND actor_id = $2
+                """,
+                organization_id,
+                actor_id,
+            )
+        if row is None:
+            return None
+        state = row["state"]
+        return json.loads(state) if isinstance(state, str) else state
+
+    async def put(
+        self,
+        *,
+        organization_id: str,
+        actor_id: str,
+        provider: Provider,
+        state: dict[str, Any],
+    ) -> None:
+        async with self._pool.acquire() as connection:
+            await connection.execute(
+                f"""
+                INSERT INTO {self._table} (
+                    organization_id, actor_id, provider, state
+                ) VALUES ($1, $2, $3, $4::jsonb)
+                ON CONFLICT (organization_id, actor_id) DO UPDATE SET
+                    provider = EXCLUDED.provider,
+                    state = EXCLUDED.state,
+                    updated_at = now()
+                """,
+                organization_id,
+                actor_id,
+                provider.value,
+                json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+            )
+
+    async def clear(self, organization_id: str, actor_id: str) -> None:
+        async with self._pool.acquire() as connection:
+            await connection.execute(
+                f"""
+                DELETE FROM {self._table}
+                WHERE organization_id = $1 AND actor_id = $2
+                """,
+                organization_id,
+                actor_id,
+            )
+
+    async def cleanup_stale(
+        self, *, max_age_hours: int = 24, organization_id: str | None = None
+    ) -> int:
+        async with self._pool.acquire() as connection:
+            if organization_id:
+                result = await connection.execute(
+                    f"""
+                    DELETE FROM {self._table}
+                    WHERE organization_id = $1
+                      AND updated_at < now() - make_interval(hours => $2)
+                    """,
+                    organization_id,
+                    max_age_hours,
+                )
+            else:
+                result = await connection.execute(
+                    f"""
+                    DELETE FROM {self._table}
+                    WHERE updated_at < now() - make_interval(hours => $1)
+                    """,
+                    max_age_hours,
+                )
+            parts = result.split()
+            return int(parts[-1]) if len(parts) >= 3 else 0
+
+
+class PostgresIntakeSessionStore(_PostgresSessionStore):
+    _table = "intake_sessions"
+
+
+class PostgresConfigSessionStore(_PostgresSessionStore):
+    _table = "config_sessions"
+

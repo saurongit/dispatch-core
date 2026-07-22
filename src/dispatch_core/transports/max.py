@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections import deque
 from typing import Any
@@ -12,6 +13,11 @@ from dispatch_core.messaging.models import OutboundEnvelope, Provider
 from .common import decode_callback, encode_callback, group_buttons, stable_payload_id
 from .contracts import EventKind, InboundEvent, SendResult
 
+logger = logging.getLogger(__name__)
+
+_MAX_ATTACHMENT_READY_RETRIES = 4
+_MAX_ATTACHMENT_READY_DELAYS = (0, 1, 2, 4)
+
 
 class MaxTransport:
     provider = Provider.MAX
@@ -20,6 +26,7 @@ class MaxTransport:
         self,
         token: str,
         *,
+        signing_secret: str = "",
         api_base: str = "https://platform-api2.max.ru",
         client: httpx.AsyncClient | None = None,
         proxy: str | None = None,
@@ -30,6 +37,7 @@ class MaxTransport:
         if not 1 <= requests_per_second <= 30:
             raise ValueError("MAX request rate must be between 1 and 30")
         self._token = token
+        self._signing_secret = signing_secret
         self._api_base = api_base.rstrip("/")
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
@@ -68,7 +76,10 @@ class MaxTransport:
             callback = item.get("callback")
             callback = callback if isinstance(callback, dict) else {}
             user_id = self._user_id(callback) or self._user_id(item)
-            token = decode_callback(callback.get("payload") or callback.get("data"))
+            token = decode_callback(
+                callback.get("payload") or callback.get("data"),
+                signing_secret=self._signing_secret,
+            )
             if not user_id or not token:
                 return ()
             return (
@@ -205,13 +216,28 @@ class MaxTransport:
                     },
                 }
             ]
-        response = await self._request(
-            "POST",
-            "/messages",
-            params={"user_id": message.recipient_id},
-            json=body,
-        )
-        data = response.json()
+        for attempt in range(_MAX_ATTACHMENT_READY_RETRIES):
+            response = await self._request(
+                "POST",
+                "/messages",
+                params={"user_id": message.recipient_id},
+                json=body,
+            )
+            data = response.json()
+            if isinstance(data, dict) and data.get("code") == "attachment.not.ready":
+                if attempt < _MAX_ATTACHMENT_READY_RETRIES - 1:
+                    delay = _MAX_ATTACHMENT_READY_DELAYS[
+                        min(attempt, len(_MAX_ATTACHMENT_READY_DELAYS) - 1)
+                    ]
+                    logger.info(
+                        "MAX attachment not ready, retry %d/%d in %ds",
+                        attempt + 1,
+                        _MAX_ATTACHMENT_READY_RETRIES,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+            break
         if not isinstance(data, dict):
             return SendResult()
         sent = data.get("message")
@@ -257,21 +283,34 @@ class MaxTransport:
             headers={"Authorization": self._token},
             timeout=request_timeout,
         )
-        response.raise_for_status()
+        if response.status_code == 429:
+            retry_after = 30
+            try:
+                data = response.json()
+                if isinstance(data, dict):
+                    retry_after = data.get("retry_after", retry_after)
+            except Exception:
+                pass
+            raise MaxRateLimitError(retry_after=retry_after)
+        if response.status_code >= 500:
+            raise RuntimeError(f"MAX server error HTTP {response.status_code}")
         return response
 
     async def _wait_api_slot(self) -> None:
+        delay = 0.0
         async with self._rate_lock:
-            while True:
-                now = time.monotonic()
-                cutoff = now - 1
-                while self._request_times and self._request_times[0] <= cutoff:
-                    self._request_times.popleft()
-                if len(self._request_times) < self._rate:
-                    self._request_times.append(now)
-                    return
-                delay = 1 - (now - self._request_times[0])
-                await asyncio.sleep(max(0, delay))
+            now = time.monotonic()
+            cutoff = now - 1
+            while self._request_times and self._request_times[0] <= cutoff:
+                self._request_times.popleft()
+            if len(self._request_times) < self._rate:
+                self._request_times.append(now)
+                return
+            delay = max(0, 1 - (now - self._request_times[0]))
+        if delay > 0:
+            await asyncio.sleep(delay)
+        async with self._rate_lock:
+            self._request_times.append(time.monotonic())
 
     @staticmethod
     def _identity_candidates(item: dict[str, Any]) -> tuple[object, ...]:
@@ -326,16 +365,24 @@ class MaxTransport:
             **values,
         )
 
-    @staticmethod
-    def _button(button: Any) -> dict[str, Any]:
+    def _button(self, button: Any) -> dict[str, Any]:
         if button.callback_token is not None:
             return {
                 "type": "callback",
                 "text": button.text,
-                "payload": encode_callback(button.callback_token),
+                "payload": encode_callback(
+                    button.callback_token,
+                    signing_secret=self._signing_secret,
+                ),
             }
         if button.url is not None:
             return {"type": "link", "text": button.text, "url": button.url}
         if button.request_location:
             return {"type": "request_geo_location", "text": button.text}
         raise ValueError("unsupported MAX button")
+
+
+class MaxRateLimitError(Exception):
+    def __init__(self, retry_after: int) -> None:
+        self.retry_after = retry_after
+        super().__init__(f"MAX rate limited: retry after {retry_after}s")

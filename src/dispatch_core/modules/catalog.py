@@ -46,8 +46,8 @@ MODULES: tuple[ModuleDescriptor, ...] = (
         "core.industry_packs",
         ModuleKind.CORE,
         ModuleState.AVAILABLE,
-        ("field_definitions", "work_types", "evidence_defaults"),
-        "Four example packs reuse one domain lifecycle.",
+        ("field_definitions", "work_types", "evidence_defaults", "versioned_db"),
+        "Per-organization packs live in PostgreSQL; code packs seed templates.",
     ),
     ModuleDescriptor(
         "intake.manual",
@@ -55,6 +55,20 @@ MODULES: tuple[ModuleDescriptor, ...] = (
         ModuleState.AVAILABLE,
         ("create_work_order",),
         "Exercised through the application API and demo CLI.",
+    ),
+    ModuleDescriptor(
+        "intake.telegram_guided",
+        ModuleKind.INTAKE,
+        ModuleState.AVAILABLE,
+        ("service_selection", "field_prompts", "confirmation", "order_creation"),
+        "Pack-driven client flow in the messenger; no dispatcher panel needed.",
+    ),
+    ModuleDescriptor(
+        "config.messenger_admin",
+        ModuleKind.USER_INTERFACE,
+        ModuleState.AVAILABLE,
+        ("brand", "services", "fields", "evidence", "preview", "publish"),
+        "Admin assembles the whole service from bot commands; drafts then publish.",
     ),
     ModuleDescriptor(
         "worker.telegram",

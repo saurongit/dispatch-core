@@ -21,6 +21,8 @@ from dispatch_core.transports.contracts import EventKind
 from dispatch_core.transports.max import MaxTransport
 from dispatch_core.transports.telegram import TelegramTransport
 
+_TEST_SECRET = "test-signing-secret-32-chars!!"
+
 
 def outbound(
     provider: Provider,
@@ -41,7 +43,10 @@ def outbound(
 
 @pytest.mark.parametrize("token", ["a", "abc_123", "x" * 48])
 def test_callback_codec_round_trip(token: str) -> None:
-    assert decode_callback(encode_callback(token)) == token
+    encoded = encode_callback(token, signing_secret=_TEST_SECRET)
+    assert decode_callback(encoded, signing_secret=_TEST_SECRET) == token
+    assert encoded.startswith("dc2:")
+    assert len(encoded.split(":")) == 3
 
 
 @pytest.mark.parametrize("value", ["", "plain", "dc1:", "dc1:" + "x" * 49, None, 42])
@@ -49,10 +54,24 @@ def test_callback_decoder_rejects_invalid_or_foreign_values(value: object) -> No
     assert decode_callback(value) is None
 
 
+def test_callback_decoder_accepts_legacy_dc1_without_secret() -> None:
+    assert decode_callback("dc1:legacy-token") == "legacy-token"
+
+
+def test_callback_decoder_rejects_dc2_with_wrong_secret() -> None:
+    encoded = encode_callback("my-token", signing_secret=_TEST_SECRET)
+    assert decode_callback(encoded, signing_secret="wrong-secret") is None
+
+
+def test_callback_decoder_rejects_dc2_without_secret() -> None:
+    encoded = encode_callback("my-token", signing_secret=_TEST_SECRET)
+    assert decode_callback(encoded) is None
+
+
 @pytest.mark.parametrize("token", ["", "x" * 49])
 def test_callback_encoder_rejects_invalid_length(token: str) -> None:
     with pytest.raises(ValueError, match="length"):
-        encode_callback(token)
+        encode_callback(token, signing_secret=_TEST_SECRET)
 
 
 def test_stable_payload_id_ignores_mapping_order() -> None:
@@ -197,7 +216,10 @@ def test_telegram_parse_ignores_unsupported_or_malformed_updates(
 
 
 def test_telegram_parse_dispatch_callback() -> None:
-    transport = TelegramTransport("token", client=httpx.AsyncClient())
+    transport = TelegramTransport(
+        "token", signing_secret=_TEST_SECRET, client=httpx.AsyncClient()
+    )
+    callback_data = encode_callback("opaque-token", signing_secret=_TEST_SECRET)
     event = transport.parse(
         {
             "update_id": 106,
@@ -205,7 +227,7 @@ def test_telegram_parse_dispatch_callback() -> None:
                 "id": "callback-1",
                 "from": {"id": 7},
                 "message": {"chat": {"id": 9}},
-                "data": "dc1:opaque-token",
+                "data": callback_data,
             },
         }
     )[0]
@@ -225,7 +247,9 @@ async def test_telegram_send_serializes_inline_buttons() -> None:
         return httpx.Response(200, json={"ok": True, "result": {"message_id": 88}})
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    transport = TelegramTransport("secret-token", client=client)
+    transport = TelegramTransport(
+        "secret-token", signing_secret=_TEST_SECRET, client=client
+    )
     result = await transport.send(
         outbound(
             Provider.TELEGRAM,
@@ -238,8 +262,9 @@ async def test_telegram_send_serializes_inline_buttons() -> None:
     await client.aclose()
 
     assert captured["path"].endswith("/sendMessage")
+    expected_hmac = encode_callback("take-token", signing_secret=_TEST_SECRET)
     assert captured["json"]["reply_markup"]["inline_keyboard"] == [
-        [{"text": "Готов взять", "callback_data": "dc1:take-token"}],
+        [{"text": "Готов взять", "callback_data": expected_hmac}],
         [{"text": "Инструкция", "url": "https://example.test"}],
     ]
     assert result.external_message_id == "88"
@@ -273,20 +298,23 @@ async def test_telegram_rejects_provider_level_error_even_on_http_200() -> None:
             )
         )
     )
-    transport = TelegramTransport("token", client=client)
+    transport = TelegramTransport("token", signing_secret=_TEST_SECRET, client=client)
     with pytest.raises(RuntimeError, match="bad chat"):
         await transport.send(outbound(Provider.TELEGRAM))
     await client.aclose()
 
 
 def test_max_parse_callback() -> None:
-    transport = MaxTransport("token", client=httpx.AsyncClient())
+    transport = MaxTransport(
+        "token", signing_secret=_TEST_SECRET, client=httpx.AsyncClient()
+    )
+    callback_payload = encode_callback("token-1", signing_secret=_TEST_SECRET)
     event = transport.parse(
         {
             "update_type": "message_callback",
             "callback": {
                 "callback_id": "cb-1",
-                "payload": "dc1:token-1",
+                "payload": callback_payload,
                 "user": {"user_id": 77},
             },
         }
@@ -382,7 +410,9 @@ async def test_max_send_uses_authorization_header_and_native_keyboard() -> None:
         return httpx.Response(200, json={"message": {"body": {"mid": "m-7"}}})
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    transport = MaxTransport("max-secret", client=client)
+    transport = MaxTransport(
+        "max-secret", signing_secret=_TEST_SECRET, client=client
+    )
     result = await transport.send(
         outbound(
             Provider.MAX,
@@ -396,9 +426,10 @@ async def test_max_send_uses_authorization_header_and_native_keyboard() -> None:
 
     assert captured["authorization"] == "max-secret"
     assert captured["user_id"] == "7001"
+    expected_hmac = encode_callback("accept-token", signing_secret=_TEST_SECRET)
     buttons = captured["json"]["attachments"][0]["payload"]["buttons"]
     assert buttons == [
-        [{"type": "callback", "text": "Принять", "payload": "dc1:accept-token"}],
+        [{"type": "callback", "text": "Принять", "payload": expected_hmac}],
         [{"type": "request_geo_location", "text": "Геопозиция"}],
     ]
     assert result.external_message_id == "m-7"
@@ -427,3 +458,91 @@ def test_max_rejects_rate_above_official_boundary(
 ) -> None:
     with pytest.raises(ValueError, match="between 1 and 30"):
         MaxTransport("token", requests_per_second=requests_per_second)
+
+
+@pytest.mark.asyncio
+async def test_max_send_retries_on_attachment_not_ready() -> None:
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return httpx.Response(200, json={"code": "attachment.not.ready"})
+        return httpx.Response(200, json={"message": {"body": {"mid": "m-1"}}})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = MaxTransport("token", client=client)
+    result = await transport.send(outbound(Provider.MAX))
+    await client.aclose()
+    assert call_count == 2
+    assert result.external_message_id == "m-1"
+
+
+@pytest.mark.asyncio
+async def test_telegram_truncates_long_text() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["json"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = TelegramTransport("token", signing_secret=_TEST_SECRET, client=client)
+    long_text = "x" * 5000
+    await transport.send(
+        OutboundEnvelope(
+            message_id=1,
+            deduplication_key="test",
+            organization_id="org",
+            provider=Provider.TELEGRAM,
+            recipient_id="123",
+            text=long_text,
+            buttons=(),
+            attempts=1,
+        )
+    )
+    await client.aclose()
+    assert len(captured["json"]["text"]) == 4096
+
+
+@pytest.mark.asyncio
+async def test_telegram_raises_on_429() -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(
+                429,
+                json={
+                    "ok": False,
+                    "error_code": 429,
+                    "description": "Too Many Requests",
+                    "parameters": {"retry_after": 10},
+                },
+            )
+        )
+    )
+    transport = TelegramTransport("token", signing_secret=_TEST_SECRET, client=client)
+    from dispatch_core.transports.telegram import TelegramRateLimitError
+
+    with pytest.raises(TelegramRateLimitError) as exc_info:
+        await transport.send(outbound(Provider.TELEGRAM))
+    await client.aclose()
+    assert exc_info.value.retry_after == 10
+
+
+@pytest.mark.asyncio
+async def test_max_raises_on_429() -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(
+                429, json={"code": "rate_limit", "retry_after": 15}
+            )
+        )
+    )
+    transport = MaxTransport("token", client=client)
+    from dispatch_core.transports.max import MaxRateLimitError
+
+    with pytest.raises(MaxRateLimitError) as exc_info:
+        await transport.send(outbound(Provider.MAX))
+    await client.aclose()
+    assert exc_info.value.retry_after == 15

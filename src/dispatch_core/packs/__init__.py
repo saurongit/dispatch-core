@@ -1,5 +1,25 @@
 """Declarative industry packs built on the shared domain language."""
 
-from .catalog import INDUSTRY_PACKS, FieldDefinition, FieldType, IndustryPack
+from .catalog import (
+    DEFAULT_ROLE_LABELS,
+    INDUSTRY_PACKS,
+    Branding,
+    FieldDefinition,
+    FieldType,
+    IndustryPack,
+    PackDefinition,
+    ServiceCatalog,
+    ServiceCategory,
+)
 
-__all__ = ("INDUSTRY_PACKS", "FieldDefinition", "FieldType", "IndustryPack")
+__all__ = (
+    "DEFAULT_ROLE_LABELS",
+    "INDUSTRY_PACKS",
+    "Branding",
+    "FieldDefinition",
+    "FieldType",
+    "IndustryPack",
+    "PackDefinition",
+    "ServiceCatalog",
+    "ServiceCategory",
+)

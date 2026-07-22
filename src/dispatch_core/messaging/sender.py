@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
+
 from dispatch_core.infrastructure.messaging import PostgresOutboundStore
 from dispatch_core.messaging.models import Provider
 from dispatch_core.transports.contracts import Transport
+
+logger = logging.getLogger(__name__)
 
 
 class OutboundSender:
@@ -26,6 +30,12 @@ class OutboundSender:
             try:
                 result = await transport.send(message)
             except Exception as exc:
+                logger.exception(
+                    "send failed for %s:%s to %s",
+                    provider.value,
+                    message.deduplication_key,
+                    message.recipient_id,
+                )
                 await self._store.mark_failed(
                     message,
                     f"{type(exc).__name__}: {exc}",

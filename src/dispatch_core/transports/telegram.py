@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
@@ -9,6 +10,10 @@ from dispatch_core.messaging.models import OutboundEnvelope, Provider
 from .common import decode_callback, encode_callback, group_buttons, stable_payload_id
 from .contracts import EventKind, InboundEvent, SendResult
 
+logger = logging.getLogger(__name__)
+
+_TEXT_LENGTH_LIMIT = 4096
+
 
 class TelegramTransport:
     provider = Provider.TELEGRAM
@@ -17,6 +22,7 @@ class TelegramTransport:
         self,
         token: str,
         *,
+        signing_secret: str = "",
         client: httpx.AsyncClient | None = None,
         proxy: str | None = None,
         timeout_seconds: float = 40,
@@ -24,12 +30,17 @@ class TelegramTransport:
         if not token:
             raise ValueError("Telegram bot token is required")
         self._token = token
-        self._base_url = f"https://api.telegram.org/bot{token}"
+        self._signing_secret = signing_secret
+        self._api_base = "https://api.telegram.org"
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
             proxy=proxy,
+            headers={"Authorization": f"Bot {token}"},
             timeout=httpx.Timeout(timeout_seconds),
         )
+
+    def _bot_url(self) -> str:
+        return f"{self._api_base}/bot{self._token}"
 
     async def close(self) -> None:
         if self._owns_client:
@@ -45,7 +56,9 @@ class TelegramTransport:
         external_event_id = self.external_event_id(payload)
         callback = payload.get("callback_query")
         if isinstance(callback, dict):
-            token = decode_callback(callback.get("data"))
+            token = decode_callback(
+                callback.get("data"), signing_secret=self._signing_secret
+            )
             actor = callback.get("from")
             message = callback.get("message")
             actor = actor if isinstance(actor, dict) else {}
@@ -156,11 +169,11 @@ class TelegramTransport:
         if offset is not None:
             parameters["offset"] = offset
         response = await self._client.post(
-            f"{self._base_url}/getUpdates",
+            f"{self._bot_url()}/getUpdates",
             json=parameters,
             timeout=timeout_seconds + 15,
         )
-        data = self._telegram_result(response)
+        data = self._check_response(response)
         if not isinstance(data, list):
             raise RuntimeError("Telegram getUpdates returned a non-list result")
         updates = tuple(item for item in data if isinstance(item, dict))
@@ -173,9 +186,17 @@ class TelegramTransport:
         return updates, next_offset
 
     async def send(self, message: OutboundEnvelope) -> SendResult:
+        text = message.text
+        if len(text) > _TEXT_LENGTH_LIMIT:
+            logger.warning(
+                "truncating Telegram message from %d to %d chars",
+                len(text),
+                _TEXT_LENGTH_LIMIT,
+            )
+            text = text[:_TEXT_LENGTH_LIMIT]
         payload: dict[str, Any] = {
             "chat_id": message.recipient_id,
-            "text": message.text,
+            "text": text,
             "disable_web_page_preview": True,
         }
         if message.buttons:
@@ -186,10 +207,10 @@ class TelegramTransport:
                 ]
             }
         response = await self._client.post(
-            f"{self._base_url}/sendMessage",
+            f"{self._bot_url()}/sendMessage",
             json=payload,
         )
-        result = self._telegram_result(response)
+        result = self._check_response(response)
         external_id = None
         if isinstance(result, dict) and result.get("message_id") is not None:
             external_id = str(result["message_id"])
@@ -202,10 +223,10 @@ class TelegramTransport:
         if text:
             payload["text"] = text
         response = await self._client.post(
-            f"{self._base_url}/answerCallbackQuery",
+            f"{self._bot_url()}/answerCallbackQuery",
             json=payload,
         )
-        self._telegram_result(response)
+        self._check_response(response)
 
     async def set_webhook(
         self,
@@ -221,13 +242,33 @@ class TelegramTransport:
             "drop_pending_updates": drop_pending_updates,
         }
         response = await self._client.post(
-            f"{self._base_url}/setWebhook",
+            f"{self._bot_url()}/setWebhook",
             json=payload,
         )
-        self._telegram_result(response)
+        self._check_response(response)
 
-    @staticmethod
+    async def set_my_commands(
+        self,
+        commands: tuple[tuple[str, str], ...],
+        *,
+        scope: dict[str, Any] | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "commands": [
+                {"command": command, "description": description}
+                for command, description in commands
+            ]
+        }
+        if scope is not None:
+            payload["scope"] = scope
+        response = await self._client.post(
+            f"{self._bot_url()}/setMyCommands",
+            json=payload,
+        )
+        self._check_response(response)
+
     def _event(
+        self,
         external_event_id: str,
         user_id: str,
         chat_id: str,
@@ -245,12 +286,14 @@ class TelegramTransport:
             **values,
         )
 
-    @staticmethod
-    def _button(button: Any) -> dict[str, Any]:
+    def _button(self, button: Any) -> dict[str, Any]:
         if button.callback_token is not None:
             return {
                 "text": button.text,
-                "callback_data": encode_callback(button.callback_token),
+                "callback_data": encode_callback(
+                    button.callback_token,
+                    signing_secret=self._signing_secret,
+                ),
             }
         if button.url is not None:
             return {"text": button.text, "url": button.url}
@@ -259,10 +302,47 @@ class TelegramTransport:
         raise ValueError("unsupported Telegram button")
 
     @staticmethod
-    def _telegram_result(response: httpx.Response) -> Any:
-        response.raise_for_status()
+    def _check_response(response: httpx.Response) -> Any:
+        if response.status_code == 429:
+            retry_after = None
+            try:
+                body = response.json()
+                if isinstance(body, dict):
+                    params = body.get("parameters")
+                    if isinstance(params, dict):
+                        retry_after = params.get("retry_after")
+            except Exception:
+                pass
+            raise TelegramRateLimitError(
+                retry_after=retry_after or 30,
+                description="Too Many Requests",
+            )
+        if response.status_code >= 500:
+            raise RuntimeError(
+                f"Telegram server error HTTP {response.status_code}"
+            )
         data = response.json()
-        if not isinstance(data, dict) or not data.get("ok"):
-            description = data.get("description") if isinstance(data, dict) else data
-            raise RuntimeError(f"Telegram API rejected request: {description}")
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                f"Telegram returned non-object response: {response.status_code}"
+            )
+        if not data.get("ok"):
+            description = data.get("description", "unknown error")
+            error_code = data.get("error_code", response.status_code)
+            retry_params = data.get("parameters")
+            if isinstance(retry_params, dict) and retry_params.get("retry_after"):
+                raise TelegramRateLimitError(
+                    retry_after=retry_params["retry_after"],
+                    description=description,
+                )
+            raise RuntimeError(
+                f"Telegram API error {error_code}: {description}"
+            )
         return data.get("result")
+
+
+class TelegramRateLimitError(Exception):
+    def __init__(self, *, retry_after: int, description: str) -> None:
+        self.retry_after = retry_after
+        self.description = description
+        super().__init__(f"rate limited: retry after {retry_after}s — {description}")
