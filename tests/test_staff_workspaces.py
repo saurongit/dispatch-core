@@ -12,6 +12,7 @@ from dispatch_core.messaging.workspaces import (
     MASTER_MENU,
     MASTER_OPEN_ORDER,
     OPERATOR_ADD_MASTER,
+    OPERATOR_CALL_MASTER,
     OPERATOR_CANCEL,
     OPERATOR_DELETE_MASTER,
     OPERATOR_DELETE_MASTER_CONFIRM,
@@ -145,6 +146,7 @@ class FakeViews:
 def order(status: str = "submitted") -> dict[str, Any]:
     return {
         "id": "order-1",
+        "public_number": "S777",
         "work_type": "lift_repair",
         "source": "phone",
         "details": {"summary": "Лифт остановился", "address": "Дом 7"},
@@ -169,10 +171,14 @@ async def test_operator_creates_master_through_same_flow_for_both_providers(
     operator = identity("operator", provider)
 
     menu = await target.start(operator)
-    assert {button.action for button in menu.buttons} >= {
-        OPERATOR_LIST_ORDERS,
-        OPERATOR_LIST_MASTERS,
-    }
+    if provider is Provider.TELEGRAM:
+        assert menu.buttons == ()
+        assert "слева от поля ввода" in menu.text
+    else:
+        assert {button.action for button in menu.buttons} >= {
+            OPERATOR_LIST_ORDERS,
+            OPERATOR_LIST_MASTERS,
+        }
     prompt = await target.handle_callback(operator, OPERATOR_ADD_MASTER, {})
     assert "имя мастера" in prompt.text.lower()
     phone_prompt = await target.handle_text(operator, "Антон")
@@ -240,7 +246,8 @@ async def test_operator_cannot_revoke_busy_master_but_can_revoke_free_master() -
     info = await target.handle_callback(
         operator, OPERATOR_MASTER_INFO, {"actor_id": "master-1"}
     )
-    assert "+7 (999) 111-22-33" in info.text
+    assert "+79991112233" in info.text
+    assert OPERATOR_CALL_MASTER in {button.action for button in info.buttons}
     confirm = await target.handle_callback(
         operator, OPERATOR_DELETE_MASTER, {"actor_id": "master-1"}
     )
@@ -275,7 +282,7 @@ async def test_operator_and_master_order_menus_expose_only_valid_actions() -> No
     )
     operator = identity("operator")
     listing = await operator_target.handle_callback(operator, OPERATOR_LIST_ORDERS, {})
-    assert "order-1" in listing.text
+    assert any("S777" in button.text for button in listing.buttons)
     opened = await operator_target.handle_callback(
         operator, OPERATOR_OPEN_ORDER, {"order_id": "order-1"}
     )
@@ -288,7 +295,7 @@ async def test_operator_and_master_order_menus_expose_only_valid_actions() -> No
     assert any(button.action == MASTER_LIST_ORDERS for button in master_menu.buttons)
     master_list = await master_target.handle_callback(master, MASTER_LIST_ORDERS, {})
     open_button = next(
-        button for button in master_list.buttons if "order-1" in button.text
+        button for button in master_list.buttons if "S777" in button.text
     )
     master_opened = await master_target.handle_callback(
         master, open_button.action, dict(open_button.payload)
@@ -328,7 +335,7 @@ async def test_operator_commands_callbacks_and_stale_sessions_are_safe() -> None
     )
     operator = identity("operator")
 
-    assert "Диспетчерская" in (await target.handle_text(operator, "/start@staff")).text
+    assert "диспетчерскую" in (await target.handle_text(operator, "/start@staff")).text
     assert "отменено" in (await target.handle_text(operator, "/cancel")).text
     assert "Активных заявок нет" in (await target.handle_text(operator, "/orders")).text
     assert "Статистика" in (await target.handle_text(operator, "/stats")).text

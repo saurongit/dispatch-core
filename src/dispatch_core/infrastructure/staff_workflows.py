@@ -141,13 +141,20 @@ class PostgresStaffViewStore:
         async with self._pool.acquire() as connection:
             rows = await connection.fetch(
                 """
-                SELECT id, work_type, source, details, status, assignee_id,
-                       coordinator_id, created_at, updated_at
-                FROM work_orders
-                WHERE organization_id = $1
-                  AND status = ANY($2::text[])
-                  AND ($3 <> 'master' OR assignee_id = $4)
-                ORDER BY updated_at DESC, id
+                SELECT orders.id, orders.public_number, orders.work_type,
+                       orders.source, orders.details, orders.status,
+                       orders.assignee_id, orders.coordinator_id,
+                       orders.created_at, orders.updated_at,
+                       master.display_name AS master_name,
+                       master.phone AS master_phone
+                FROM work_orders AS orders
+                LEFT JOIN actors AS master
+                  ON master.organization_id = orders.organization_id
+                 AND master.id = orders.assignee_id
+                WHERE orders.organization_id = $1
+                  AND orders.status = ANY($2::text[])
+                  AND ($3 <> 'master' OR orders.assignee_id = $4)
+                ORDER BY orders.updated_at DESC, orders.id
                 LIMIT $5
                 """,
                 organization_id,
@@ -170,12 +177,19 @@ class PostgresStaffViewStore:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
                 """
-                SELECT id, work_type, source, details, status, assignee_id,
-                       coordinator_id, created_at, updated_at
-                FROM work_orders
-                WHERE organization_id = $1 AND id = $2
-                  AND status = ANY($3::text[])
-                  AND ($4 <> 'master' OR assignee_id = $5)
+                SELECT orders.id, orders.public_number, orders.work_type,
+                       orders.source, orders.details, orders.status,
+                       orders.assignee_id, orders.coordinator_id,
+                       orders.created_at, orders.updated_at,
+                       master.display_name AS master_name,
+                       master.phone AS master_phone
+                FROM work_orders AS orders
+                LEFT JOIN actors AS master
+                  ON master.organization_id = orders.organization_id
+                 AND master.id = orders.assignee_id
+                WHERE orders.organization_id = $1 AND orders.id = $2
+                  AND orders.status = ANY($3::text[])
+                  AND ($4 <> 'master' OR orders.assignee_id = $5)
                 """,
                 organization_id,
                 order_id,

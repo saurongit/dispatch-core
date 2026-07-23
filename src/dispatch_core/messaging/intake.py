@@ -478,7 +478,7 @@ class IntakeCoordinator:
             submission_id = str(uuid4())
             state["submission_id"] = submission_id
             await self._save(identity, state)
-        await self._service.create_order_once(
+        order = await self._service.create_order_once(
             order_id=submission_id,
             organization_id=identity.organization_id,
             work_type=",".join(selected),
@@ -489,7 +489,12 @@ class IntakeCoordinator:
         )
         await self._sessions.clear(identity.organization_id, identity.actor_id)
 
-        return Reply("Заявка отправлена. Оператор свяжется с вами в ближайшее время.")
+        public_number = str(getattr(order, "public_number", "") or "")
+        number_text = f" {public_number}" if public_number else ""
+        return Reply(
+            f"✅ Заявка{number_text} отправлена. "
+            "Оператор свяжется с вами в ближайшее время."
+        )
 
     async def _save(self, identity: ActorIdentity, state: dict[str, Any]) -> None:
         await self._sessions.put(

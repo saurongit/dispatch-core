@@ -11,6 +11,7 @@ import asyncpg
 
 from dispatch_core.domain.errors import ConcurrencyConflict, NotFound
 from dispatch_core.domain.events import DomainEvent
+from dispatch_core.domain.order_numbers import format_order_number
 from dispatch_core.domain.tracking import (
     LocationSource,
     TrackingPoint,
@@ -163,6 +164,20 @@ class PostgresOrderRepository:
     def __init__(self, connection: asyncpg.Connection) -> None:
         self._connection = connection
 
+    async def allocate_public_number(self, organization_id: str) -> str:
+        sequence = await self._connection.fetchval(
+            """
+            INSERT INTO organization_order_counters (
+                organization_id, last_value
+            ) VALUES ($1, 1)
+            ON CONFLICT (organization_id) DO UPDATE
+            SET last_value = organization_order_counters.last_value + 1
+            RETURNING last_value
+            """,
+            organization_id,
+        )
+        return format_order_number(int(sequence))
+
     async def get(self, organization_id: str, order_id: str) -> WorkOrder:
         row = await self._connection.fetchrow(
             """
@@ -187,9 +202,7 @@ class PostgresOrderRepository:
         )
         return _order_from_rows(row, responses)
 
-    async def get_for_read(
-        self, organization_id: str, order_id: str
-    ) -> WorkOrder:
+    async def get_for_read(self, organization_id: str, order_id: str) -> WorkOrder:
         row = await self._connection.fetchrow(
             """
             SELECT * FROM work_orders
@@ -212,48 +225,45 @@ class PostgresOrderRepository:
         )
         return _order_from_rows(row, responses)
 
-    async def save(
-        self, order: WorkOrder, *, expected_version: int | None
-    ) -> None:
+    async def save(self, order: WorkOrder, *, expected_version: int | None) -> None:
         try:
             if expected_version is None:
                 result = await self._connection.execute(
                     """
                     INSERT INTO work_orders (
-                        organization_id, id, work_type, source, details,
+                        organization_id, id, public_number, work_type, source, details,
                         requester_id, coordinator_id, evidence_requirements,
                         status, pool_mode, assignee_id, report, version,
                         created_at, updated_at
                     ) VALUES (
-                        $1, $2, $3, $4, $5::jsonb, $6, $7, $8::jsonb,
-                        $9, $10, $11, $12::jsonb, $13, $14, $15
+                        $1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9::jsonb,
+                        $10, $11, $12, $13::jsonb, $14, $15, $16
                     )
                     ON CONFLICT (organization_id, id) DO NOTHING
                     """,
                     *_order_values(order),
                 )
                 if result != "INSERT 0 1":
-                    raise ConcurrencyConflict(
-                        f"work order {order.id!r} already exists"
-                    )
+                    raise ConcurrencyConflict(f"work order {order.id!r} already exists")
             else:
                 result = await self._connection.execute(
                     """
                     UPDATE work_orders SET
-                        work_type = $3,
-                        source = $4,
-                        details = $5::jsonb,
-                        requester_id = $6,
-                        coordinator_id = $7,
-                        evidence_requirements = $8::jsonb,
-                        status = $9,
-                        pool_mode = $10,
-                        assignee_id = $11,
-                        report = $12::jsonb,
-                        version = $13,
-                        created_at = $14,
-                        updated_at = $15
-                    WHERE organization_id = $1 AND id = $2 AND version = $16
+                        public_number = $3,
+                        work_type = $4,
+                        source = $5,
+                        details = $6::jsonb,
+                        requester_id = $7,
+                        coordinator_id = $8,
+                        evidence_requirements = $9::jsonb,
+                        status = $10,
+                        pool_mode = $11,
+                        assignee_id = $12,
+                        report = $13::jsonb,
+                        version = $14,
+                        created_at = $15,
+                        updated_at = $16
+                    WHERE organization_id = $1 AND id = $2 AND version = $17
                     """,
                     *_order_values(order),
                     expected_version,
@@ -302,9 +312,7 @@ class PostgresTrackingRepository:
     def __init__(self, connection: asyncpg.Connection) -> None:
         self._connection = connection
 
-    async def get(
-        self, organization_id: str, session_id: str
-    ) -> TrackingSession:
+    async def get(self, organization_id: str, session_id: str) -> TrackingSession:
         row = await self._connection.fetchrow(
             """
             SELECT * FROM tracking_sessions
@@ -499,6 +507,7 @@ def _order_values(order: WorkOrder) -> tuple[Any, ...]:
     return (
         order.organization_id,
         order.id,
+        order.public_number,
         order.work_type,
         order.source,
         _json_text(dict(order.details)),
@@ -538,6 +547,7 @@ def _order_from_rows(
     }
     return WorkOrder(
         id=row["id"],
+        public_number=row["public_number"],
         organization_id=row["organization_id"],
         work_type=row["work_type"],
         source=row["source"],

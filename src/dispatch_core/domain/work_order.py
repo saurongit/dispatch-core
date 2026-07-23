@@ -70,6 +70,7 @@ class PoolResponse:
 @dataclass(slots=True)
 class WorkOrder:
     id: str
+    public_number: str
     organization_id: str
     work_type: str
     source: str
@@ -90,14 +91,22 @@ class WorkOrder:
     _events: list[DomainEvent] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
-        if not self.id or not self.organization_id or not self.work_type:
-            raise ValueError("id, organization_id and work_type are required")
+        if (
+            not self.id
+            or not self.public_number
+            or not self.organization_id
+            or not self.work_type
+        ):
+            raise ValueError(
+                "id, public_number, organization_id and work_type are required"
+            )
         self.details = MappingProxyType(deepcopy(dict(self.details)))
         self.pool_responses = dict(self.pool_responses)
 
     def __deepcopy__(self, memo: dict[int, Any]) -> WorkOrder:
         copied = WorkOrder(
             id=self.id,
+            public_number=self.public_number,
             organization_id=self.organization_id,
             work_type=self.work_type,
             source=self.source,
@@ -123,6 +132,7 @@ class WorkOrder:
         cls,
         *,
         order_id: str,
+        public_number: str,
         organization_id: str,
         work_type: str,
         source: str,
@@ -134,6 +144,7 @@ class WorkOrder:
         instant = now or datetime.now(UTC)
         order = cls(
             id=order_id,
+            public_number=public_number,
             organization_id=organization_id,
             work_type=work_type,
             source=source,
@@ -145,7 +156,11 @@ class WorkOrder:
         )
         order._record(
             "work_order.submitted",
-            {"source": source, "requester_id": requester_id},
+            {
+                "public_number": public_number,
+                "source": source,
+                "requester_id": requester_id,
+            },
             instant,
         )
         return order
@@ -223,9 +238,7 @@ class WorkOrder:
             instant,
         )
 
-    def claim_first(
-        self, executor_id: str, *, now: datetime | None = None
-    ) -> None:
+    def claim_first(self, executor_id: str, *, now: datetime | None = None) -> None:
         self._require_pool_mode(PoolMode.FIRST_CLAIM)
         self._require_executor_id(executor_id)
         instant = now or datetime.now(UTC)

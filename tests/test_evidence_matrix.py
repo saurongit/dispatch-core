@@ -31,16 +31,12 @@ def _requirements(mask: int) -> EvidenceRequirements:
 
 def _report(mask: int) -> CompletionReport:
     return CompletionReport(
-        photo_refs=("object://photo-1",)
-        if mask & EVIDENCE_BITS["photo"]
-        else (),
+        photo_refs=("object://photo-1",) if mask & EVIDENCE_BITS["photo"] else (),
         comment="work completed" if mask & EVIDENCE_BITS["comment"] else None,
         signature_ref="object://signature-1"
         if mask & EVIDENCE_BITS["signature"]
         else None,
-        customer_code="4381"
-        if mask & EVIDENCE_BITS["customer_code"]
-        else None,
+        customer_code="4381" if mask & EVIDENCE_BITS["customer_code"] else None,
     )
 
 
@@ -70,6 +66,7 @@ def test_completion_evidence_truth_table(
     """Exhaust every required/present evidence combination (16 x 16)."""
     order = WorkOrder.create(
         order_id="order-1",
+        public_number="A000",
         organization_id="org-1",
         work_type="repair",
         source="phone",

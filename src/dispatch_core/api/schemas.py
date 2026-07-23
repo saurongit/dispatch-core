@@ -65,9 +65,7 @@ class ActorCreateInput(BaseModel):
     @model_validator(mode="after")
     def validate_identity_pair(self) -> ActorCreateInput:
         if (self.provider is None) != (self.external_user_id is None):
-            raise ValueError(
-                "provider and external_user_id must be specified together"
-            )
+            raise ValueError("provider and external_user_id must be specified together")
         return self
 
 
@@ -120,9 +118,7 @@ class BrowserLocationInput(BaseModel):
 
     @field_validator("captured_at")
     @classmethod
-    def captured_at_requires_timezone(
-        cls, value: datetime | None
-    ) -> datetime | None:
+    def captured_at_requires_timezone(cls, value: datetime | None) -> datetime | None:
         if value is not None and value.tzinfo is None:
             raise ValueError("captured_at must include a timezone")
         return value
@@ -160,6 +156,7 @@ class CancelInput(BaseModel):
 
 class WorkOrderResponse(BaseModel):
     id: str
+    public_number: str
     organization_id: str
     work_type: str
     source: str
@@ -178,6 +175,7 @@ class WorkOrderResponse(BaseModel):
     def from_domain(cls, order: WorkOrder) -> WorkOrderResponse:
         return cls(
             id=order.id,
+            public_number=order.public_number,
             organization_id=order.organization_id,
             work_type=order.work_type,
             source=order.source,
@@ -230,6 +228,7 @@ class PublicMapPointResponse(BaseModel):
 
 class PublicTrackingResponse(BaseModel):
     brand: str
+    public_number: str
     work_type: str
     address: str | None
     client_point: PublicMapPointResponse | None

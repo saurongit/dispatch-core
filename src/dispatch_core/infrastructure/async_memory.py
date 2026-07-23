@@ -7,6 +7,7 @@ from types import TracebackType
 
 from dispatch_core.domain.errors import ConcurrencyConflict, NotFound
 from dispatch_core.domain.events import DomainEvent
+from dispatch_core.domain.order_numbers import format_order_number
 from dispatch_core.domain.tracking import TrackingSession, TrackingStatus
 from dispatch_core.domain.work_order import WorkOrder
 
@@ -18,6 +19,7 @@ class AsyncMemoryStore:
         default_factory=dict
     )
     outbox_events: list[DomainEvent] = field(default_factory=list)
+    order_number_counters: dict[str, int] = field(default_factory=dict)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -32,9 +34,7 @@ class AsyncMemoryUnitOfWorkFactory:
 class AsyncMemoryUnitOfWork:
     def __init__(self, store: AsyncMemoryStore) -> None:
         self._store = store
-        self._staged_orders: dict[
-            tuple[str, str], tuple[WorkOrder, int | None]
-        ] = {}
+        self._staged_orders: dict[tuple[str, str], tuple[WorkOrder, int | None]] = {}
         self._staged_tracking: dict[
             tuple[str, str], tuple[TrackingSession, int | None]
         ] = {}
@@ -119,15 +119,21 @@ class _AsyncOrderRepository:
     def __init__(self, unit_of_work: AsyncMemoryUnitOfWork) -> None:
         self._uow = unit_of_work
 
+    async def allocate_public_number(self, organization_id: str) -> str:
+        async with self._uow._store.lock:
+            sequence = (
+                self._uow._store.order_number_counters.get(organization_id, 0) + 1
+            )
+            self._uow._store.order_number_counters[organization_id] = sequence
+        return format_order_number(sequence)
+
     async def get(self, organization_id: str, order_id: str) -> WorkOrder:
         order = self._uow._store.orders.get((organization_id, order_id))
         if order is None:
             raise NotFound(f"work order {order_id!r} was not found")
         return deepcopy(order)
 
-    async def save(
-        self, order: WorkOrder, *, expected_version: int | None
-    ) -> None:
+    async def save(self, order: WorkOrder, *, expected_version: int | None) -> None:
         snapshot = deepcopy(order)
         snapshot.pull_events()
         self._uow._staged_orders[(order.organization_id, order.id)] = (
@@ -140,12 +146,8 @@ class _AsyncTrackingRepository:
     def __init__(self, unit_of_work: AsyncMemoryUnitOfWork) -> None:
         self._uow = unit_of_work
 
-    async def get(
-        self, organization_id: str, session_id: str
-    ) -> TrackingSession:
-        session = self._uow._store.tracking_sessions.get(
-            (organization_id, session_id)
-        )
+    async def get(self, organization_id: str, session_id: str) -> TrackingSession:
+        session = self._uow._store.tracking_sessions.get((organization_id, session_id))
         if session is None:
             raise NotFound(f"tracking session {session_id!r} was not found")
         return deepcopy(session)

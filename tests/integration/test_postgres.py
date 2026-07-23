@@ -221,6 +221,43 @@ async def test_create_round_trip_and_outbox_share_commit(
 
 
 @pytest.mark.asyncio
+async def test_concurrent_creates_allocate_unique_public_numbers(
+    database: PostgresDatabase,
+    organization: str,
+) -> None:
+    orders = await asyncio.gather(
+        *(
+            service(database).create_order(
+                organization_id=organization,
+                order_id=f"numbered-{index}",
+                work_type="repair",
+                source="phone",
+                details={"index": index},
+            )
+            for index in range(100)
+        )
+    )
+
+    public_numbers = {order.public_number for order in orders}
+    assert len(public_numbers) == 100
+    assert public_numbers == {
+        f"A{index:03d}"
+        for index in range(100)
+    }
+    assert database.pool is not None
+    async with database.pool.acquire() as connection:
+        total, distinct = await connection.fetchrow(
+            """
+            SELECT count(*), count(DISTINCT public_number)
+            FROM work_orders
+            WHERE organization_id = $1
+            """,
+            organization,
+        )
+    assert total == distinct == 100
+
+
+@pytest.mark.asyncio
 async def test_pack_store_full_draft_publish_lifecycle(
     database: PostgresDatabase,
     organization: str,
@@ -1386,6 +1423,17 @@ async def test_staff_creation_request_is_idempotent(
         )
     assert duplicate == first
     assert count == 1
+    assert await identities.update_actor_phone(
+        organization_id=organization,
+        actor_id=first["actor_id"],
+        phone="+358401234567",
+    )
+    updated = await identities.get_actor(
+        organization_id=organization,
+        actor_id=first["actor_id"],
+    )
+    assert updated is not None
+    assert updated["phone"] == "+358401234567"
 
 
 @pytest.mark.asyncio

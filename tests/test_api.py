@@ -434,6 +434,7 @@ async def test_public_tracking_returns_only_latest_safe_snapshot() -> None:
     assert response.status_code == 200
     assert response.json() == {
         "brand": "Test Organization",
+        "public_number": "A000",
         "work_type": "lift_repair",
         "address": "Demo street",
         "client_point": {"latitude": 53.76, "longitude": 87.12},
@@ -471,9 +472,12 @@ async def test_public_tracking_uses_generic_not_found_for_bad_credentials() -> N
         )
 
     assert {missing.status_code, malformed.status_code, unknown.status_code} == {404}
-    assert missing.json() == malformed.json() == unknown.json() == {
-        "detail": "Tracking link is unavailable"
-    }
+    assert (
+        missing.json()
+        == malformed.json()
+        == unknown.json()
+        == {"detail": "Tracking link is unavailable"}
+    )
 
 
 @pytest.mark.asyncio
@@ -563,9 +567,7 @@ async def test_address_capability_hides_missing_and_unknown_tokens() -> None:
             json={"latitude": 53.75, "longitude": 87.1},
         )
     assert missing.status_code == unknown.status_code == 404
-    assert missing.json() == unknown.json() == {
-        "detail": "Address link is unavailable"
-    }
+    assert missing.json() == unknown.json() == {"detail": "Address link is unavailable"}
 
 
 @pytest.mark.asyncio
@@ -599,8 +601,7 @@ async def test_browser_location_capability_records_point_for_active_master() -> 
 
 
 @pytest.mark.asyncio
-async def test_tracking_capabilities_cannot_be_used_for_opposite_operation(
-) -> None:
+async def test_tracking_capabilities_cannot_be_used_for_opposite_operation() -> None:
     async with api_client() as (client, store):
         _, travel = await start_tracking(client)
         viewer_token = travel.json()["tracking_url"].split("#", maxsplit=1)[1]

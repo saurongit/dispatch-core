@@ -40,16 +40,17 @@ class DispatchService:
         evidence_requirements: EvidenceRequirements | None = None,
         order_id: str | None = None,
     ) -> WorkOrder:
-        order = WorkOrder.create(
-            order_id=order_id or str(uuid4()),
-            organization_id=organization_id,
-            work_type=work_type,
-            source=source,
-            details=details,
-            requester_id=requester_id,
-            evidence_requirements=evidence_requirements,
-        )
         with self._unit_of_work() as uow:
+            order = WorkOrder.create(
+                order_id=order_id or str(uuid4()),
+                public_number=uow.orders.allocate_public_number(organization_id),
+                organization_id=organization_id,
+                work_type=work_type,
+                source=source,
+                details=details,
+                requester_id=requester_id,
+                evidence_requirements=evidence_requirements,
+            )
             uow.orders.save(order, expected_version=None)
             uow.outbox.add(order.pull_events())
             uow.commit()
@@ -150,16 +151,12 @@ class DispatchService:
             expected_order_version = order.version
             order.cancel(reason, actor_id=actor_id)
             uow.orders.save(order, expected_version=expected_order_version)
-            session = uow.tracking.find_active_for_order(
-                organization_id, order_id
-            )
+            session = uow.tracking.find_active_for_order(organization_id, order_id)
             events = list(order.pull_events())
             if session is not None:
                 expected_session_version = session.version
                 session.cancel(reason)
-                uow.tracking.save(
-                    session, expected_version=expected_session_version
-                )
+                uow.tracking.save(session, expected_version=expected_session_version)
                 events.extend(session.pull_events())
             uow.outbox.add(tuple(events))
             uow.commit()
@@ -205,9 +202,7 @@ class DispatchService:
         with self._unit_of_work() as uow:
             session = uow.tracking.get(organization_id, session_id)
             if session.executor_id != executor_id:
-                raise InvalidTransition(
-                    "session does not belong to this executor"
-                )
+                raise InvalidTransition("session does not belong to this executor")
             expected_version = session.version
             now = datetime.now(UTC)
             observed_at = captured_at or now
@@ -251,16 +246,12 @@ class DispatchService:
             expected_order_version = order.version
             order.complete(executor_id, report)
             uow.orders.save(order, expected_version=expected_order_version)
-            session = uow.tracking.find_active_for_order(
-                organization_id, order_id
-            )
+            session = uow.tracking.find_active_for_order(organization_id, order_id)
             events = list(order.pull_events())
             if session is not None:
                 expected_session_version = session.version
                 session.complete()
-                uow.tracking.save(
-                    session, expected_version=expected_session_version
-                )
+                uow.tracking.save(session, expected_version=expected_session_version)
                 events.extend(session.pull_events())
             uow.outbox.add(tuple(events))
             uow.commit()

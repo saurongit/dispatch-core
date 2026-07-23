@@ -17,7 +17,7 @@ from dispatch_core.infrastructure.workflow_store import (
     PostgresConfigSessionStore,
     PostgresIdentityStore,
 )
-from dispatch_core.messaging.cards import CardRenderer
+from dispatch_core.messaging.cards import CardRenderer, normalize_phone, phone_display
 from dispatch_core.messaging.replies import Reply, ReplyButton
 from dispatch_core.packs.catalog import (
     FieldDefinition,
@@ -48,6 +48,9 @@ CONFIG_PUBLISH = "config_publish"
 CONFIG_CANCEL = "config_cancel"
 CONFIG_ADD_OPERATOR = "config_add_operator"
 CONFIG_LIST_OPERATORS = "config_list_operators"
+CONFIG_OPERATOR_INFO = "config_operator_info"
+CONFIG_CALL_OPERATOR = "config_call_operator"
+CONFIG_EDIT_OPERATOR_PHONE = "config_edit_operator_phone"
 CONFIG_DEL_OPERATOR = "config_del_operator"
 CONFIG_DEL_OPERATOR_CONFIRM = "config_del_operator_confirm"
 CONFIG_OWNER_ROLES = "config_owner_roles"
@@ -78,6 +81,9 @@ CONFIG_ACTIONS = frozenset(
         CONFIG_CANCEL,
         CONFIG_ADD_OPERATOR,
         CONFIG_LIST_OPERATORS,
+        CONFIG_OPERATOR_INFO,
+        CONFIG_CALL_OPERATOR,
+        CONFIG_EDIT_OPERATOR_PHONE,
         CONFIG_DEL_OPERATOR,
         CONFIG_DEL_OPERATOR_CONFIRM,
         CONFIG_OWNER_ROLES,
@@ -144,6 +150,9 @@ class ConfigCoordinator:
             CONFIG_PUBLISH: self._on_publish,
             CONFIG_ADD_OPERATOR: self._on_add_operator,
             CONFIG_LIST_OPERATORS: self._on_list_operators,
+            CONFIG_OPERATOR_INFO: self._on_operator_info,
+            CONFIG_CALL_OPERATOR: self._on_call_operator,
+            CONFIG_EDIT_OPERATOR_PHONE: self._on_edit_operator_phone,
             CONFIG_DEL_OPERATOR: self._on_del_operator,
             CONFIG_DEL_OPERATOR_CONFIRM: self._on_del_operator_confirm,
             CONFIG_OWNER_ROLES: self._on_owner_roles,
@@ -288,6 +297,10 @@ class ConfigCoordinator:
             return await self._field_label(identity, session, text)
         if flow == "add_operator" and step == "name":
             return await self._add_operator_save(identity, session, text)
+        if flow == "add_operator" and step == "phone":
+            return await self._add_operator_phone(identity, session, text)
+        if flow == "edit_operator_phone" and step == "phone":
+            return await self._edit_operator_phone_save(identity, session, text)
         return Reply("Выберите вариант кнопкой ниже.", buttons=(_CANCEL_BUTTON,))
 
     # -- brand -----------------------------------------------------------
@@ -647,7 +660,7 @@ class ConfigCoordinator:
         if note:
             lines.append(note)
             lines.append("")
-        lines.append("Конфигуратор сервиса")
+        lines.append("🛡 Панель администратора")
         source = draft or active
         if source is not None:
             name = source.branding.name or "(без названия)"
@@ -669,6 +682,9 @@ class ConfigCoordinator:
             ReplyButton("Операторы", CONFIG_LIST_OPERATORS, {}, "admin", row=3),
             ReplyButton("Мои роли", CONFIG_OWNER_ROLES, {}, "admin", row=3),
         )
+        if identity.provider.value == "telegram":
+            lines.extend(("", "Команды доступны в меню слева от поля ввода 👈"))
+            return Reply("\n".join(lines))
         return Reply("\n".join(lines), buttons=buttons)
 
     async def _ensure_draft(self, identity: ActorIdentity) -> PackDefinition:
@@ -827,6 +843,21 @@ class ConfigCoordinator:
     ) -> Reply:
         return await self._list_operators(identity)
 
+    async def _on_operator_info(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        return await self._operator_info(identity, payload)
+
+    async def _on_call_operator(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        return await self._call_operator(identity, payload)
+
+    async def _on_edit_operator_phone(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        return await self._edit_operator_phone(identity, payload)
+
     async def _on_del_operator(
         self, identity: ActorIdentity, payload: dict[str, Any]
     ) -> Reply:
@@ -864,6 +895,38 @@ class ConfigCoordinator:
                 "Имя не может быть пустым. Введите имя оператора:",
                 buttons=(_CANCEL_BUTTON,),
             )
+        session["step"] = "phone"
+        session["name"] = name
+        await self._set_session(identity, session)
+        return Reply(
+            f"👤 Имя: {name}\n\n"
+            "📞 Введите телефон оператора полностью, например "
+            "89991112233 или +358401234567:",
+            buttons=(_CANCEL_BUTTON,),
+        )
+
+    async def _add_operator_phone(
+        self,
+        identity: ActorIdentity,
+        session: dict[str, Any],
+        text: str,
+    ) -> Reply:
+        if self._identities is None:
+            return Reply("Управление операторами недоступно.")
+        phone = normalize_phone(text)
+        if phone is None:
+            return Reply(
+                "Введите номер полностью: от 10 до 15 цифр, например "
+                "89991112233 или +358401234567.",
+                buttons=(_CANCEL_BUTTON,),
+            )
+        name = str(session.get("name") or "").strip()
+        if not name:
+            await self._sessions.clear(identity.organization_id, identity.actor_id)
+            return await self._menu(
+                identity,
+                note="Имя оператора потеряно, начните добавление заново.",
+            )
         request_key = str(session.get("request_key") or "")
         if not request_key:
             request_key = f"{identity.actor_id}:add-operator:{uuid4()}"
@@ -873,15 +936,25 @@ class ConfigCoordinator:
             organization_id=identity.organization_id,
             role="operator",
             name=name,
+            phone=phone,
             request_key=request_key,
         )
         await self._sessions.clear(identity.organization_id, identity.actor_id)
         return Reply(
-            f"Оператор создан!\n\n"
-            f"Имя: {result['name']}\n"
-            f"Код привязки: {result['bind_code']}\n\n"
+            f"✅ Оператор создан!\n\n"
+            f"👤 Имя: {result['name']}\n"
+            f"📞 Телефон: {result['phone']}\n"
+            f"🔑 Код привязки: {result['bind_code']}\n\n"
             f"Передайте код оператору. Он должен открыть бота, "
-            f"нажать /start и ввести код."
+            f"нажать /start и ввести код.",
+            buttons=(
+                ReplyButton(
+                    "👥 К операторам",
+                    CONFIG_LIST_OPERATORS,
+                    {},
+                    "admin",
+                ),
+            ),
         )
 
     async def _list_operators(self, identity: ActorIdentity) -> Reply:
@@ -916,8 +989,8 @@ class ConfigCoordinator:
             )
             buttons.append(
                 ReplyButton(
-                    f"Убрать роль: {actor['display_name']}",
-                    CONFIG_DEL_OPERATOR,
+                    f"ℹ️ {actor['display_name']}",
+                    CONFIG_OPERATOR_INFO,
                     {"actor_id": actor["id"]},
                     "admin",
                     row=index,
@@ -936,6 +1009,142 @@ class ConfigCoordinator:
             ReplyButton("В меню", CONFIG_MENU, {}, "admin", row=len(buttons) + 2)
         )
         return Reply("\n".join(lines), buttons=tuple(buttons))
+
+    async def _operator_info(
+        self,
+        identity: ActorIdentity,
+        payload: dict[str, Any],
+    ) -> Reply:
+        if self._identities is None:
+            return Reply("Управление операторами недоступно.")
+        actor_id = str(payload.get("actor_id") or "")
+        actor = await self._identities.get_actor(
+            organization_id=identity.organization_id,
+            actor_id=actor_id,
+        )
+        if actor is None or "operator" not in set(actor.get("roles") or ()):
+            return await self._list_operators(identity)
+        return Reply(
+            "\n".join(
+                (
+                    "🧭 Карточка оператора",
+                    "",
+                    f"👤 Имя: {actor['display_name']}",
+                    "📞 Телефон:",
+                    phone_display(actor.get("phone")),
+                    f"🆔 ID: {actor['id']}",
+                )
+            ),
+            buttons=(
+                ReplyButton(
+                    "📞 Позвонить оператору",
+                    CONFIG_CALL_OPERATOR,
+                    {"actor_id": actor_id},
+                    "admin",
+                ),
+                ReplyButton(
+                    "✏️ Изменить телефон",
+                    CONFIG_EDIT_OPERATOR_PHONE,
+                    {"actor_id": actor_id},
+                    "admin",
+                    row=1,
+                ),
+                ReplyButton(
+                    "🗑 Убрать роль оператора",
+                    CONFIG_DEL_OPERATOR,
+                    {"actor_id": actor_id},
+                    "admin",
+                    row=2,
+                ),
+                ReplyButton(
+                    "⬅ К операторам",
+                    CONFIG_LIST_OPERATORS,
+                    {},
+                    "admin",
+                    row=3,
+                ),
+            ),
+        )
+
+    async def _call_operator(
+        self,
+        identity: ActorIdentity,
+        payload: dict[str, Any],
+    ) -> Reply:
+        if self._identities is None:
+            return Reply("Управление операторами недоступно.")
+        actor_id = str(payload.get("actor_id") or "")
+        actor = await self._identities.get_actor(
+            organization_id=identity.organization_id,
+            actor_id=actor_id,
+        )
+        if actor is None or "operator" not in set(actor.get("roles") or ()):
+            return await self._list_operators(identity)
+        return Reply(
+            f"📞 Оператор {actor['display_name']}\n\n"
+            f"{phone_display(actor.get('phone'))}",
+            buttons=(
+                ReplyButton(
+                    "⬅ К оператору",
+                    CONFIG_OPERATOR_INFO,
+                    {"actor_id": actor_id},
+                    "admin",
+                ),
+            ),
+        )
+
+    async def _edit_operator_phone(
+        self,
+        identity: ActorIdentity,
+        payload: dict[str, Any],
+    ) -> Reply:
+        if self._identities is None:
+            return Reply("Управление операторами недоступно.")
+        actor_id = str(payload.get("actor_id") or "")
+        actor = await self._identities.get_actor(
+            organization_id=identity.organization_id,
+            actor_id=actor_id,
+        )
+        if actor is None or "operator" not in set(actor.get("roles") or ()):
+            return await self._list_operators(identity)
+        await self._set_session(
+            identity,
+            {
+                "flow": "edit_operator_phone",
+                "step": "phone",
+                "actor_id": actor_id,
+            },
+        )
+        return Reply(
+            f"✏️ Новый телефон оператора {actor['display_name']}\n\n"
+            "Введите номер полностью:",
+            buttons=(_CANCEL_BUTTON,),
+        )
+
+    async def _edit_operator_phone_save(
+        self,
+        identity: ActorIdentity,
+        session: dict[str, Any],
+        text: str,
+    ) -> Reply:
+        if self._identities is None:
+            return Reply("Управление операторами недоступно.")
+        phone = normalize_phone(text)
+        if phone is None:
+            return Reply(
+                "Введите номер полностью: от 10 до 15 цифр.",
+                buttons=(_CANCEL_BUTTON,),
+            )
+        actor_id = str(session.get("actor_id") or "")
+        updated = await self._identities.update_actor_phone(
+            organization_id=identity.organization_id,
+            actor_id=actor_id,
+            phone=phone,
+        )
+        await self._sessions.clear(identity.organization_id, identity.actor_id)
+        if not updated:
+            return await self._list_operators(identity)
+        return await self._operator_info(identity, {"actor_id": actor_id})
 
     async def _list_operators_cmd(self, identity: ActorIdentity) -> Reply:
         return await self._list_operators(identity)

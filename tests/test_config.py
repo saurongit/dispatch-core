@@ -14,6 +14,7 @@ from dispatch_core.messaging.config import (
     CONFIG_CANCEL,
     CONFIG_DEL_OPERATOR,
     CONFIG_DEL_OPERATOR_CONFIRM,
+    CONFIG_EDIT_OPERATOR_PHONE,
     CONFIG_EVIDENCE,
     CONFIG_EVIDENCE_CODE,
     CONFIG_EVIDENCE_COMMENT,
@@ -27,6 +28,7 @@ from dispatch_core.messaging.config import (
     CONFIG_FIELDS,
     CONFIG_LIST_OPERATORS,
     CONFIG_MENU,
+    CONFIG_OPERATOR_INFO,
     CONFIG_OWNER_NANO,
     CONFIG_OWNER_ROLES,
     CONFIG_PUBLISH,
@@ -47,13 +49,13 @@ from dispatch_core.packs.catalog import (
 )
 
 
-def admin() -> ActorIdentity:
+def admin(provider: Provider = Provider.TELEGRAM) -> ActorIdentity:
     return ActorIdentity(
         organization_id="org-1",
         actor_id="admin:100",
         role="admin",
         display_name="Admin",
-        provider=Provider.TELEGRAM,
+        provider=provider,
         external_user_id="100",
     )
 
@@ -217,6 +219,15 @@ class FakeIdentityStore:
         actor = self.actors.get(actor_id)
         return {**actor, "id": actor_id} if actor is not None else None
 
+    async def update_actor_phone(
+        self, *, organization_id: str, actor_id: str, phone: str
+    ) -> bool:
+        actor = self.actors.get(actor_id)
+        if actor is None:
+            return False
+        actor["phone"] = phone
+        return True
+
     async def delete_actor(self, *, organization_id: str, actor_id: str) -> bool:
         return self.actors.pop(actor_id, None) is not None
 
@@ -268,8 +279,10 @@ def coordinator(
 async def test_start_shows_menu_with_no_pack() -> None:
     target, _, _ = coordinator()
     reply = await target.start(admin())
-    assert "конфигуратор" in reply.text.lower()
+    assert "панель администратора" in reply.text.lower()
     assert "не создан" in reply.text.lower()
+    assert reply.buttons == ()
+    reply = await target.start(admin(Provider.MAX))
     actions = {b.action for b in reply.buttons}
     assert CONFIG_BRAND in actions
     assert CONFIG_SERVICES in actions
@@ -289,10 +302,28 @@ async def test_admin_creates_lists_and_deletes_operator() -> None:
     assert "имя оператора" in reply.text.lower()
 
     reply = await target.handle_text(who, "Анна")
+    assert "телефон оператора" in reply.text.lower()
+    reply = await target.handle_text(who, "123")
+    assert "полностью" in reply.text.lower()
+    reply = await target.handle_text(who, "8 (999) 111-22-33")
     assert "код привязки: 1234" in reply.text.lower()
+    assert "+7 (999) 111-22-33" in reply.text
 
     reply = await target.handle_callback(who, CONFIG_LIST_OPERATORS, {})
     assert "Анна" in reply.text
+    info = next(
+        button for button in reply.buttons if button.action == CONFIG_OPERATOR_INFO
+    )
+    reply = await target.handle_callback(who, info.action, info.payload)
+    edit_phone = next(
+        button
+        for button in reply.buttons
+        if button.action == CONFIG_EDIT_OPERATOR_PHONE
+    )
+    reply = await target.handle_callback(who, edit_phone.action, edit_phone.payload)
+    assert "новый телефон" in reply.text.lower()
+    reply = await target.handle_text(who, "+358 40 123 4567")
+    assert "+358401234567" in reply.text
     delete = next(
         button for button in reply.buttons if button.action == CONFIG_DEL_OPERATOR
     )
@@ -316,14 +347,15 @@ async def test_operator_creation_retry_does_not_duplicate_actor() -> None:
     who = admin()
     await target.handle_callback(who, CONFIG_ADD_OPERATOR, {})
     request_key = sessions.store["org-1:admin:100"]["request_key"]
+    await target.handle_text(who, "Анна")
     sessions.clear_failures = 1
 
     with pytest.raises(RuntimeError, match="session storage"):
-        await target.handle_text(who, "Анна")
+        await target.handle_text(who, "89991112233")
 
     assert len(identities.actors) == 1
     assert sessions.store["org-1:admin:100"]["request_key"] == request_key
-    reply = await target.handle_text(who, "Анна")
+    reply = await target.handle_text(who, "89991112233")
     assert "код привязки: 1234" in reply.text.lower()
     assert len(identities.actors) == 1
 
@@ -400,7 +432,7 @@ async def test_command_routes_to_section() -> None:
 async def test_start_command_shows_menu() -> None:
     target, _, _ = coordinator()
     reply = await target.handle_text(admin(), "/start")
-    assert "конфигуратор" in reply.text.lower()
+    assert "панель администратора" in reply.text.lower()
 
 
 @pytest.mark.asyncio
@@ -800,7 +832,7 @@ async def test_cancel_unknown_action_shows_menu() -> None:
 async def test_menu_callback_returns_menu() -> None:
     target, _, _ = coordinator(draft=_complete_pack())
     reply = await target.handle_callback(admin(), CONFIG_MENU, {})
-    assert "конфигуратор" in reply.text.lower()
+    assert "панель администратора" in reply.text.lower()
     assert "TestCo" in reply.text
 
 

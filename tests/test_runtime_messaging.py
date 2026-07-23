@@ -20,9 +20,15 @@ from dispatch_core.messaging.models import (
 from dispatch_core.messaging.projector import OutboxProjectorWorker
 from dispatch_core.messaging.replies import ReplyButton
 from dispatch_core.messaging.sender import OutboundSender
+from dispatch_core.messaging.workspaces import OPERATOR_MENU_COMMANDS
 from dispatch_core.runtime import api as runtime_api
 from dispatch_core.runtime.factory import build_transports
-from dispatch_core.runtime.worker import _cleanup_sessions, _repeat, _wait_or_stop
+from dispatch_core.runtime.worker import (
+    _cleanup_sessions,
+    _register_frontend_commands,
+    _repeat,
+    _wait_or_stop,
+)
 from dispatch_core.transports.contracts import SendResult
 from dispatch_core.transports.polling import DurablePollingReceiver
 
@@ -128,6 +134,33 @@ def test_transport_factory_skips_mode_not_used_by_process() -> None:
         allowed_modes={"webhook"},
     )
     assert result == {}
+
+
+@dataclass
+class FakeTelegramCommands:
+    calls: list[tuple[tuple[tuple[str, str], ...], dict[str, Any] | None]] = field(
+        default_factory=list
+    )
+
+    async def set_my_commands(
+        self,
+        commands: tuple[tuple[str, str], ...],
+        *,
+        scope: dict[str, Any] | None = None,
+    ) -> None:
+        self.calls.append((commands, scope))
+
+
+@pytest.mark.asyncio
+async def test_telegram_role_commands_are_registered_for_future_bindings() -> None:
+    telegram = FakeTelegramCommands()
+
+    await _register_frontend_commands(  # type: ignore[arg-type]
+        telegram,
+        "operator",
+    )
+
+    assert telegram.calls == [(OPERATOR_MENU_COMMANDS, None)]
 
 
 @pytest.mark.parametrize(

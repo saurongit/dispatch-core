@@ -190,7 +190,7 @@ def render_tracking_page(nonce: str) -> str:
       }}
       const data = await response.json();
       loadedOnce = true;
-      title.textContent = labels[data.order_status] || 'Статус заявки';
+      title.textContent = 'Заявка ' + data.public_number + ' — ' + (labels[data.order_status] || 'статус');
       const parts = [data.brand, data.work_type, data.master_name];
       address.textContent = data.address || '';
       showProgress(data.order_status);

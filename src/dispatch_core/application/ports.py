@@ -9,15 +9,15 @@ from dispatch_core.domain.work_order import WorkOrder
 
 
 class WorkOrderRepository(Protocol):
+    def allocate_public_number(self, organization_id: str) -> str: ...
+
     def get(self, organization_id: str, order_id: str) -> WorkOrder: ...
 
     def save(self, order: WorkOrder, *, expected_version: int | None) -> None: ...
 
 
 class TrackingRepository(Protocol):
-    def get(
-        self, organization_id: str, session_id: str
-    ) -> TrackingSession: ...
+    def get(self, organization_id: str, session_id: str) -> TrackingSession: ...
 
     def find_active_for_order(
         self, organization_id: str, order_id: str

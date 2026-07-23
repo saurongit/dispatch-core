@@ -9,11 +9,11 @@ from dispatch_core.domain.work_order import WorkOrder
 
 
 class AsyncWorkOrderRepository(Protocol):
+    async def allocate_public_number(self, organization_id: str) -> str: ...
+
     async def get(self, organization_id: str, order_id: str) -> WorkOrder: ...
 
-    async def save(
-        self, order: WorkOrder, *, expected_version: int | None
-    ) -> None: ...
+    async def save(self, order: WorkOrder, *, expected_version: int | None) -> None: ...
 
 
 class AsyncTrackingRepository(Protocol):

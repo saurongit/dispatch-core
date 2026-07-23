@@ -19,7 +19,7 @@ from dispatch_core.infrastructure.messaging import (
     PostgresOutboxStore,
 )
 from dispatch_core.infrastructure.pack_store import PostgresPackStore
-from dispatch_core.messaging.cards import CardRenderer
+from dispatch_core.messaging.cards import operator_order_card
 from dispatch_core.packs.catalog import PackDefinition
 
 logger = logging.getLogger(__name__)
@@ -114,9 +114,7 @@ class PostgresNotificationProjector:
                         plan.delivery_role,
                     )
                     for recipient in recipients:
-                        consumer_key = _role_to_consumer_key(
-                            str(recipient["role"])
-                        )
+                        consumer_key = _role_to_consumer_key(str(recipient["role"]))
                         result = await connection.execute(
                             """
                             INSERT INTO outbound_messages (
@@ -537,26 +535,32 @@ class PostgresNotificationProjector:
         if event.name == "work_order.completed":
             plans: list[RecipientPlan] = []
             if coordinator:
-                plans.append(RecipientPlan(
-                    actor_ids=(coordinator,),
-                    text=f"Заявка завершена.\n{card}",
-                    purpose="completed:operator",
-                    delivery_role="operator",
-                ))
+                plans.append(
+                    RecipientPlan(
+                        actor_ids=(coordinator,),
+                        text=f"Заявка завершена.\n{card}",
+                        purpose="completed:operator",
+                        delivery_role="operator",
+                    )
+                )
             if requester:
-                plans.append(RecipientPlan(
-                    actor_ids=(requester,),
-                    text=f"Заявка завершена.\n{card}",
-                    purpose="completed:client",
-                    delivery_role="client",
-                ))
+                plans.append(
+                    RecipientPlan(
+                        actor_ids=(requester,),
+                        text=f"Заявка завершена.\n{card}",
+                        purpose="completed:client",
+                        delivery_role="client",
+                    )
+                )
             if not plans:
-                plans.append(RecipientPlan(
-                    roles=("operator",),
-                    text=f"Заявка завершена.\n{card}",
-                    purpose="completed:operator",
-                    delivery_role="operator",
-                ))
+                plans.append(
+                    RecipientPlan(
+                        roles=("operator",),
+                        text=f"Заявка завершена.\n{card}",
+                        purpose="completed:operator",
+                        delivery_role="operator",
+                    )
+                )
             return tuple(plans)
         if event.name == "work_order.assignment_rejected":
             return (
@@ -571,25 +575,27 @@ class PostgresNotificationProjector:
         if event.name == "work_order.cancelled":
             plans = []
             if assignee:
-                plans.append(RecipientPlan(
-                    actor_ids=(assignee,),
-                    text=f"Заявка отменена.\n{card}",
-                    purpose="cancelled:master",
-                    delivery_role="master",
-                ))
+                plans.append(
+                    RecipientPlan(
+                        actor_ids=(assignee,),
+                        text=f"Заявка отменена.\n{card}",
+                        purpose="cancelled:master",
+                        delivery_role="master",
+                    )
+                )
             if requester:
-                plans.append(RecipientPlan(
-                    actor_ids=(requester,),
-                    text=f"Заявка отменена.\n{card}",
-                    purpose="cancelled:client",
-                    delivery_role="client",
-                ))
+                plans.append(
+                    RecipientPlan(
+                        actor_ids=(requester,),
+                        text=f"Заявка отменена.\n{card}",
+                        purpose="cancelled:client",
+                        delivery_role="client",
+                    )
+                )
             return tuple(plans)
         return ()
 
-    async def _active_pack(
-        self, organization_id: str
-    ) -> PackDefinition | None:
+    async def _active_pack(self, organization_id: str) -> PackDefinition | None:
         if self._packs is None:
             return None
         return await self._packs.active(organization_id)
@@ -602,17 +608,9 @@ class PostgresNotificationProjector:
         if order is None:
             return ""
         details = _json_value(order["details"])
-        if pack is not None:
-            return CardRenderer(pack).order_card(
-                work_type=order["work_type"], details=details
-            )
-        address = details.get("address") or details.get("destination") or ""
-        label = (
-            details.get("summary") or details.get("fault") or order["work_type"]
-        )
-        return f"Заявка: {label}" + (
-            f"\nАдрес: {address}" if address else ""
-        )
+        values = dict(order)
+        values["details"] = details
+        return operator_order_card(values, pack=pack)
 
 
 class OutboxProjectorWorker:
@@ -631,9 +629,7 @@ class OutboxProjectorWorker:
             try:
                 await self._projector.project(event)
             except Exception as exc:
-                logger.exception(
-                    "projection failed for %s", event.event_id
-                )
+                logger.exception("projection failed for %s", event.event_id)
                 await self._store.mark_failed(
                     event,
                     f"{type(exc).__name__}: {exc}",

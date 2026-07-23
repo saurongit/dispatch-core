@@ -49,7 +49,7 @@ class AsyncDispatchService:
         evidence_requirements: EvidenceRequirements | None = None,
         order_id: str | None = None,
     ) -> WorkOrder:
-        order = WorkOrder.create(
+        return await self._create_new_order(
             order_id=order_id or str(uuid4()),
             organization_id=organization_id,
             work_type=work_type,
@@ -58,7 +58,6 @@ class AsyncDispatchService:
             requester_id=requester_id,
             evidence_requirements=evidence_requirements,
         )
-        return await self._persist_new_order(order)
 
     async def create_order_once(
         self,
@@ -72,20 +71,29 @@ class AsyncDispatchService:
         evidence_requirements: EvidenceRequirements | None = None,
     ) -> WorkOrder:
         """Create one logical submission, safely retrying an ambiguous result."""
-        candidate = WorkOrder.create(
-            order_id=order_id,
-            organization_id=organization_id,
-            work_type=work_type,
-            source=source,
-            details=details,
-            requester_id=requester_id,
-            evidence_requirements=evidence_requirements,
-        )
         try:
-            return await self._persist_new_order(candidate)
+            return await self._create_new_order(
+                order_id=order_id,
+                organization_id=organization_id,
+                work_type=work_type,
+                source=source,
+                details=details,
+                requester_id=requester_id,
+                evidence_requirements=evidence_requirements,
+            )
         except ConcurrencyConflict as conflict:
             async with self._unit_of_work() as uow:
                 existing = await uow.orders.get(organization_id, order_id)
+                candidate = WorkOrder.create(
+                    order_id=order_id,
+                    public_number=existing.public_number,
+                    organization_id=organization_id,
+                    work_type=work_type,
+                    source=source,
+                    details=details,
+                    requester_id=requester_id,
+                    evidence_requirements=evidence_requirements,
+                )
                 if not _same_submission(existing, candidate):
                     raise ConcurrencyConflict(
                         f"work order {order_id!r} belongs to a different submission"
@@ -93,8 +101,29 @@ class AsyncDispatchService:
                 await uow.commit()
             return existing
 
-    async def _persist_new_order(self, order: WorkOrder) -> WorkOrder:
+    async def _create_new_order(
+        self,
+        *,
+        order_id: str,
+        organization_id: str,
+        work_type: str,
+        source: str,
+        details: Mapping[str, Any],
+        requester_id: str | None,
+        evidence_requirements: EvidenceRequirements | None,
+    ) -> WorkOrder:
         async with self._unit_of_work() as uow:
+            public_number = await uow.orders.allocate_public_number(organization_id)
+            order = WorkOrder.create(
+                order_id=order_id,
+                public_number=public_number,
+                organization_id=organization_id,
+                work_type=work_type,
+                source=source,
+                details=details,
+                requester_id=requester_id,
+                evidence_requirements=evidence_requirements,
+            )
             await uow.orders.save(order, expected_version=None)
             await uow.outbox.add(order.pull_events())
             await uow.commit()

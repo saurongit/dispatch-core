@@ -7,6 +7,7 @@ from types import TracebackType
 
 from dispatch_core.domain.errors import ConcurrencyConflict, NotFound
 from dispatch_core.domain.events import DomainEvent
+from dispatch_core.domain.order_numbers import format_order_number
 from dispatch_core.domain.tracking import TrackingSession, TrackingStatus
 from dispatch_core.domain.work_order import WorkOrder
 
@@ -18,12 +19,21 @@ class MemoryStore:
         default_factory=dict
     )
     outbox_events: list[DomainEvent] = field(default_factory=list)
+    order_number_counters: dict[str, int] = field(default_factory=dict)
     lock: RLock = field(default_factory=RLock)
 
 
 class _OrderRepository:
     def __init__(self, unit_of_work: InMemoryUnitOfWork) -> None:
         self._uow = unit_of_work
+
+    def allocate_public_number(self, organization_id: str) -> str:
+        with self._uow._store.lock:
+            sequence = (
+                self._uow._store.order_number_counters.get(organization_id, 0) + 1
+            )
+            self._uow._store.order_number_counters[organization_id] = sequence
+        return format_order_number(sequence)
 
     def get(self, organization_id: str, order_id: str) -> WorkOrder:
         stored = self._uow._store.orders.get(order_id)
@@ -43,12 +53,8 @@ class _TrackingRepository:
     def __init__(self, unit_of_work: InMemoryUnitOfWork) -> None:
         self._uow = unit_of_work
 
-    def get(
-        self, organization_id: str, session_id: str
-    ) -> TrackingSession:
-        stored = self._uow._store.tracking_sessions.get(
-            (organization_id, session_id)
-        )
+    def get(self, organization_id: str, session_id: str) -> TrackingSession:
+        stored = self._uow._store.tracking_sessions.get((organization_id, session_id))
         if stored is None:
             raise NotFound(f"tracking session {session_id!r} was not found")
         return deepcopy(stored)
@@ -58,9 +64,7 @@ class _TrackingRepository:
     ) -> TrackingSession | None:
         matches = [
             item
-            for (stored_org, _), item in (
-                self._uow._store.tracking_sessions.items()
-            )
+            for (stored_org, _), item in (self._uow._store.tracking_sessions.items())
             if stored_org == organization_id
             and item.work_order_id == order_id
             and item.status is TrackingStatus.ACTIVE
@@ -69,9 +73,7 @@ class _TrackingRepository:
             raise RuntimeError("more than one active tracking session for work order")
         return deepcopy(matches[0]) if matches else None
 
-    def save(
-        self, session: TrackingSession, *, expected_version: int | None
-    ) -> None:
+    def save(self, session: TrackingSession, *, expected_version: int | None) -> None:
         snapshot = deepcopy(session)
         snapshot.pull_events()
         self._uow._staged_tracking[(session.organization_id, session.id)] = (
@@ -132,9 +134,7 @@ class InMemoryUnitOfWork:
     def _check_executor_capacity(self) -> None:
         active_statuses = {"assigned", "accepted", "en_route", "in_progress"}
         merged = dict(self._store.orders)
-        merged.update(
-            {order.id: order for order, _ in self._staged_orders.values()}
-        )
+        merged.update({order.id: order for order, _ in self._staged_orders.values()})
         occupied: set[str] = set()
         for order in merged.values():
             if order.assignee_id is None or order.status.value not in active_statuses:

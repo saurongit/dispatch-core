@@ -384,9 +384,7 @@ def create_app(
         body: IntakeAddressLocationInput,
         request: Request,
         response: Response,
-        intake_token: Annotated[
-            str | None, Header(alias="X-Intake-Token")
-        ] = None,
+        intake_token: Annotated[str | None, Header(alias="X-Intake-Token")] = None,
     ) -> IntakeAddressLocationResponse:
         client_ip = request.client.host if request.client else "unknown"
         now = time.monotonic()
@@ -458,9 +456,7 @@ def create_app(
     async def public_tracking(
         request: Request,
         response: Response,
-        tracking_token: Annotated[
-            str | None, Header(alias="X-Tracking-Token")
-        ] = None,
+        tracking_token: Annotated[str | None, Header(alias="X-Tracking-Token")] = None,
     ) -> PublicTrackingResponse:
         client_ip = request.client.host if request.client else "unknown"
         now = time.monotonic()
@@ -477,15 +473,11 @@ def create_app(
             raise HTTPException(status_code=429, detail="Too many attempts")
         if tracking_token is None or len(tracking_token) < 43:
             _TRACKING_ATTEMPTS[client_ip].append(now)
-            raise HTTPException(
-                status_code=404, detail="Tracking link is unavailable"
-            )
+            raise HTTPException(status_code=404, detail="Tracking link is unavailable")
         view = await get_tracking_reader(request).resolve(tracking_token)
         if view is None:
             _TRACKING_ATTEMPTS[client_ip].append(now)
-            raise HTTPException(
-                status_code=404, detail="Tracking link is unavailable"
-            )
+            raise HTTPException(status_code=404, detail="Tracking link is unavailable")
         _TRACKING_ATTEMPTS.pop(client_ip, None)
         response.headers["Cache-Control"] = "no-store, private"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
@@ -495,6 +487,7 @@ def create_app(
         point = view.latest_point
         return PublicTrackingResponse(
             brand=resolved_settings.organization_name,
+            public_number=view.public_number,
             work_type=view.work_type,
             address=view.address,
             client_point=(
@@ -531,9 +524,7 @@ def create_app(
         body: BrowserLocationInput,
         request: Request,
         response: Response,
-        location_token: Annotated[
-            str | None, Header(alias="X-Location-Token")
-        ] = None,
+        location_token: Annotated[str | None, Header(alias="X-Location-Token")] = None,
     ) -> LocationRecordedResponse:
         client_ip = request.client.host if request.client else "unknown"
         now = time.monotonic()
@@ -550,17 +541,13 @@ def create_app(
             raise HTTPException(status_code=429, detail="Too many attempts")
         if location_token is None or len(location_token) < 43:
             _TRACKING_ATTEMPTS[client_ip].append(now)
-            raise HTTPException(
-                status_code=404, detail="Location link is unavailable"
-            )
+            raise HTTPException(status_code=404, detail="Location link is unavailable")
         target = await get_tracking_reader(request).resolve_location_sender(
             location_token
         )
         if target is None:
             _TRACKING_ATTEMPTS[client_ip].append(now)
-            raise HTTPException(
-                status_code=404, detail="Location link is unavailable"
-            )
+            raise HTTPException(status_code=404, detail="Location link is unavailable")
         try:
             tracking = await get_service(request).record_location(
                 organization_id=target.organization_id,

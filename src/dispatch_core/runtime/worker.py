@@ -156,8 +156,6 @@ async def run_worker(
     if isinstance(telegram, TelegramTransport):
         await _register_frontend_commands(
             telegram,
-            identities,
-            settings.organization_id,
             settings.consumer_key,
         )
     stop = stop_event or asyncio.Event()
@@ -232,8 +230,6 @@ async def run_worker(
 
 async def _register_frontend_commands(
     telegram: TelegramTransport,
-    identities: PostgresIdentityStore,
-    organization_id: str,
     consumer_key: str,
 ) -> None:
     role_commands = {
@@ -245,16 +241,7 @@ async def _register_frontend_commands(
     if commands is None:
         return
     try:
-        external_ids = await identities.external_ids_for_role(
-            organization_id=organization_id,
-            provider=Provider.TELEGRAM,
-            role=consumer_key,
-        )
-        for external_id in external_ids:
-            await telegram.set_my_commands(
-                commands,
-                scope={"type": "chat", "chat_id": int(external_id)},
-            )
+        await telegram.set_my_commands(commands)
     except Exception:
         logger.warning(
             "failed to register %s bot commands",

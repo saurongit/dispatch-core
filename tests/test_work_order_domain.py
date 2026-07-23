@@ -18,6 +18,7 @@ from dispatch_core.domain.work_order import (
 def make_order(**overrides: object) -> WorkOrder:
     values: dict[str, object] = {
         "order_id": "order-1",
+        "public_number": "A000",
         "organization_id": "org-1",
         "work_type": "repair",
         "source": "phone",
@@ -32,6 +33,7 @@ def make_order(**overrides: object) -> WorkOrder:
     ("field", "value"),
     [
         ("order_id", ""),
+        ("public_number", ""),
         ("organization_id", ""),
         ("work_type", ""),
     ],
@@ -69,6 +71,7 @@ def test_submitted_event_contains_source_and_requester() -> None:
     assert event.name == "work_order.submitted"
     assert event.aggregate_version == 1
     assert event.payload == {
+        "public_number": "A000",
         "source": "phone",
         "requester_id": "resident-7",
     }

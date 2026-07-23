@@ -286,6 +286,7 @@ class FakeTransport:
 def order() -> WorkOrder:
     return WorkOrder.create(
         order_id="order-1",
+        public_number="A000",
         organization_id="org-1",
         work_type="repair",
         source="phone",

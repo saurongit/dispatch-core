@@ -25,6 +25,7 @@ class OrderReader(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class PublicTrackingView:
+    public_number: str
     work_type: str
     address: str | None
     client_location: PublicMapPoint | None
@@ -86,6 +87,7 @@ class AsyncMemoryTrackingViewReader:
             if order is None:
                 return None
             return PublicTrackingView(
+                public_number=order.public_number,
                 work_type=order.work_type,
                 address=_public_address(order.details),
                 client_location=_public_service_location(order.details),
@@ -136,6 +138,7 @@ class PostgresTrackingViewReader:
                 """
                 SELECT tracking.status AS tracking_status,
                        tracking.updated_at,
+                       orders.public_number,
                        orders.work_type,
                        orders.status AS order_status,
                        orders.details,
@@ -193,6 +196,7 @@ class PostgresTrackingViewReader:
             )
         details = row["details"]
         return PublicTrackingView(
+            public_number=row["public_number"],
             work_type=row["work_type"],
             address=_public_address(details),
             client_location=_public_service_location(details),

@@ -426,6 +426,27 @@ class PostgresIdentityStore:
             )
         return dict(row) if row is not None else None
 
+    async def update_actor_phone(
+        self,
+        *,
+        organization_id: str,
+        actor_id: str,
+        phone: str,
+    ) -> bool:
+        result: str
+        async with self._pool.acquire() as connection:
+            result = await connection.execute(
+                """
+                UPDATE actors
+                SET phone = $3
+                WHERE organization_id = $1 AND id = $2 AND active
+                """,
+                organization_id,
+                actor_id,
+                phone,
+            )
+        return result.endswith("1")
+
     async def delete_actor(
         self,
         *,

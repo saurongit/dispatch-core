@@ -10,7 +10,14 @@ from dispatch_core.infrastructure.staff_workflows import (
     PostgresStaffWorkflowSessionStore,
 )
 from dispatch_core.infrastructure.workflow_store import PostgresIdentityStore
-from dispatch_core.messaging.cards import CardRenderer
+from dispatch_core.messaging.cards import (
+    master_order_card,
+    normalize_phone,
+    operator_order_card,
+    order_number,
+    phone_display,
+    status_emoji,
+)
 from dispatch_core.messaging.replies import Reply, ReplyButton
 
 OPERATOR_MENU = "operator_menu"
@@ -19,6 +26,8 @@ OPERATOR_OPEN_ORDER = "operator_open_order"
 OPERATOR_LIST_MASTERS = "operator_list_masters"
 OPERATOR_ADD_MASTER = "operator_add_master"
 OPERATOR_MASTER_INFO = "operator_master_info"
+OPERATOR_CALL_MASTER = "operator_call_master"
+OPERATOR_CALL_CLIENT = "operator_call_client"
 OPERATOR_DELETE_MASTER = "operator_delete_master"
 OPERATOR_DELETE_MASTER_CONFIRM = "operator_delete_master_confirm"
 OPERATOR_STATS = "operator_stats"
@@ -36,6 +45,8 @@ OPERATOR_ACTIONS = frozenset(
         OPERATOR_LIST_MASTERS,
         OPERATOR_ADD_MASTER,
         OPERATOR_MASTER_INFO,
+        OPERATOR_CALL_MASTER,
+        OPERATOR_CALL_CLIENT,
         OPERATOR_DELETE_MASTER,
         OPERATOR_DELETE_MASTER_CONFIRM,
         OPERATOR_STATS,
@@ -87,10 +98,19 @@ class OperatorCoordinator:
             lines.extend((note, ""))
         lines.extend(
             (
-                "Диспетчерская",
-                f"Вы вошли как {identity.display_name} (оператор).",
+                "👋 Добро пожаловать в диспетчерскую!",
+                "",
+                "Ты зарегистрирован как оператор.",
+                "",
+                (
+                    "Команды доступны в меню слева от поля ввода 👈"
+                    if identity.provider.value == "telegram"
+                    else "Команды доступны по кнопкам ниже 👇"
+                ),
             )
         )
+        if identity.provider.value == "telegram":
+            return Reply("\n".join(lines))
         return Reply(
             "\n".join(lines),
             buttons=(
@@ -171,6 +191,17 @@ class OperatorCoordinator:
             return await self.add_master(identity)
         if action == OPERATOR_MASTER_INFO:
             return await self.master_info(identity, str(payload.get("actor_id") or ""))
+        if action == OPERATOR_CALL_MASTER:
+            return await self.call_master(
+                identity,
+                str(payload.get("actor_id") or ""),
+                str(payload.get("order_id") or ""),
+            )
+        if action == OPERATOR_CALL_CLIENT:
+            return await self.call_client(
+                identity,
+                str(payload.get("order_id") or ""),
+            )
         if action == OPERATOR_DELETE_MASTER:
             return await self.delete_master(
                 identity, str(payload.get("actor_id") or "")
@@ -270,22 +301,88 @@ class OperatorCoordinator:
                     "🧑‍🔧 Карточка мастера",
                     "",
                     f"Имя: {actor['display_name']}",
-                    f"Телефон: {actor.get('phone') or '—'}",
+                    "📞 Телефон:",
+                    phone_display(actor.get("phone")),
                     f"ID: {actor['id']}",
                 )
             ),
             buttons=(
                 ReplyButton(
+                    "📞 Позвонить мастеру",
+                    OPERATOR_CALL_MASTER,
+                    {"actor_id": actor_id},
+                    "operator",
+                ),
+                ReplyButton(
                     "🗑 Убрать роль мастера",
                     OPERATOR_DELETE_MASTER,
                     {"actor_id": actor_id},
                     "operator",
+                    row=1,
                 ),
                 ReplyButton(
                     "⬅ К мастерам",
                     OPERATOR_LIST_MASTERS,
                     allowed_role="operator",
-                    row=1,
+                    row=2,
+                ),
+            ),
+        )
+
+    async def call_master(
+        self,
+        identity: ActorIdentity,
+        actor_id: str,
+        order_id: str = "",
+    ) -> Reply:
+        actor = await self._identities.get_actor(
+            organization_id=identity.organization_id,
+            actor_id=actor_id,
+        )
+        if actor is None or "master" not in set(actor.get("roles") or ()):
+            return await self.list_masters(identity, note="Мастер не найден.")
+        heading = (
+            f"📞 Мастер по заявке {order_id}"
+            if order_id
+            else f"📞 Мастер {actor['display_name']}"
+        )
+        return Reply(
+            f"{heading}\n\n{phone_display(actor.get('phone'))}",
+            buttons=(
+                ReplyButton(
+                    "⬅ К мастеру",
+                    OPERATOR_MASTER_INFO,
+                    {"actor_id": actor_id},
+                    "operator",
+                ),
+            ),
+        )
+
+    async def call_client(
+        self,
+        identity: ActorIdentity,
+        order_id: str,
+    ) -> Reply:
+        order = await self._views.get_active_order(
+            organization_id=identity.organization_id,
+            role="operator",
+            actor_id=identity.actor_id,
+            order_id=order_id,
+        )
+        if order is None:
+            return self.menu(identity, note="Заявка не найдена или уже закрыта.")
+        details = dict(order.get("details") or {})
+        return Reply(
+            (
+                f"📞 Клиент по заявке {order_number(order)}\n\n"
+                f"{phone_display(details.get('phone') or details.get('client_phone'))}"
+            ),
+            buttons=(
+                ReplyButton(
+                    "⬅ К заявке",
+                    OPERATOR_OPEN_ORDER,
+                    {"order_id": order_id},
+                    "operator",
                 ),
             ),
         )
@@ -362,6 +459,29 @@ class OperatorCoordinator:
         if order is None:
             return self.menu(identity, note="Заявка не найдена или уже закрыта.")
         buttons: list[ReplyButton] = []
+        details = dict(order.get("details") or {})
+        if details.get("phone") or details.get("client_phone"):
+            buttons.append(
+                ReplyButton(
+                    "📞 Позвонить клиенту",
+                    OPERATOR_CALL_CLIENT,
+                    {"order_id": order_id},
+                    "operator",
+                )
+            )
+        if order.get("assignee_id"):
+            buttons.append(
+                ReplyButton(
+                    "📞 Позвонить мастеру",
+                    OPERATOR_CALL_MASTER,
+                    {
+                        "actor_id": str(order["assignee_id"]),
+                        "order_id": order_number(order),
+                    },
+                    "operator",
+                    row=len(buttons),
+                )
+            )
         if order["status"] == "submitted":
             buttons.append(
                 ReplyButton(
@@ -369,6 +489,7 @@ class OperatorCoordinator:
                     "pool_publish",
                     {"order_id": order_id},
                     "operator",
+                    row=len(buttons),
                 )
             )
         buttons.append(
@@ -439,7 +560,7 @@ class OperatorCoordinator:
         session: dict[str, Any],
         value: str,
     ) -> Reply:
-        phone = _normalize_phone(value)
+        phone = normalize_phone(value)
         if phone is None:
             return Reply(
                 "Введите номер полностью: от 10 до 15 цифр, например "
@@ -486,15 +607,10 @@ class OperatorCoordinator:
         )
 
     async def _order_card(self, identity: ActorIdentity, order: dict[str, Any]) -> str:
+        pack = None
         if self._packs is not None:
             pack = await self._packs.active(identity.organization_id)
-            if pack is not None:
-                body = CardRenderer(pack).order_card(
-                    work_type=str(order["work_type"]),
-                    details=dict(order.get("details") or {}),
-                )
-                return _order_header(order) + "\n" + body
-        return _fallback_order_card(order)
+        return operator_order_card(order, pack=pack)
 
     async def _session(self, identity: ActorIdentity) -> dict[str, Any] | None:
         return await self._sessions.get(
@@ -661,15 +777,10 @@ class MasterCoordinator:
         return Reply(await self._order_card(identity, order), buttons=tuple(buttons))
 
     async def _order_card(self, identity: ActorIdentity, order: dict[str, Any]) -> str:
+        pack = None
         if self._packs is not None:
             pack = await self._packs.active(identity.organization_id)
-            if pack is not None:
-                body = CardRenderer(pack).order_card(
-                    work_type=str(order["work_type"]),
-                    details=dict(order.get("details") or {}),
-                )
-                return _order_header(order) + "\n" + body
-        return _fallback_order_card(order)
+        return master_order_card(order, pack=pack)
 
 
 def _orders_reply(
@@ -687,12 +798,10 @@ def _orders_reply(
         lines.append(empty_text)
     for index, order in enumerate(orders):
         order_id = str(order["id"])
-        status = _ACTIVE_LABELS.get(str(order["status"]), str(order["status"]))
-        label = _order_label(order)
-        lines.append(f"• {order_id} — {status} — {label}")
+        number = order_number(order)
         buttons.append(
             ReplyButton(
-                f"{status.split()[0]} {order_id}",
+                f"{status_emoji(order['status'])} {number}",
                 open_action,
                 {"order_id": order_id},
                 allowed_role,
@@ -708,49 +817,3 @@ def _orders_reply(
         )
     )
     return Reply("\n".join(lines), buttons=tuple(buttons))
-
-
-def _order_header(order: dict[str, Any]) -> str:
-    status = _ACTIVE_LABELS.get(str(order["status"]), str(order["status"]))
-    return f"Заявка {order['id']}\nСтатус: {status}"
-
-
-def _fallback_order_card(order: dict[str, Any]) -> str:
-    details = dict(order.get("details") or {})
-    lines = [_order_header(order), f"Тип: {order['work_type']}"]
-    address = details.get("address") or details.get("destination")
-    summary = details.get("summary") or details.get("fault") or details.get("problem")
-    if address:
-        lines.append(f"Адрес: {address}")
-    if summary:
-        lines.append(f"Описание: {summary}")
-    return "\n".join(lines)
-
-
-def _order_label(order: dict[str, Any]) -> str:
-    details = dict(order.get("details") or {})
-    return str(
-        details.get("summary")
-        or details.get("fault")
-        or details.get("problem")
-        or order["work_type"]
-    )
-
-
-def _normalize_phone(value: str) -> str | None:
-    stripped = value.strip()
-    international = stripped.startswith("+")
-    digits = "".join(character for character in stripped if character.isdigit())
-    if international:
-        if not 10 <= len(digits) <= 15:
-            return None
-        return f"+{digits}"
-    if len(digits) == 10:
-        digits = "7" + digits
-    elif len(digits) == 11 and digits.startswith("8"):
-        digits = "7" + digits[1:]
-    if not 11 <= len(digits) <= 15:
-        return None
-    if len(digits) == 11 and digits.startswith("7"):
-        return f"+7 ({digits[1:4]}) {digits[4:7]}-{digits[7:9]}-{digits[9:11]}"
-    return f"+{digits}"
