@@ -20,7 +20,7 @@
   order navigation and paired Telegram/MAX PostgreSQL E2E;
 - FastAPI command/configuration surface and health endpoints;
 - Docker Compose packaging and file-based provider secrets;
-- 670 tests, including 44 live PostgreSQL race/E2E tests, and a 90% branch
+- 682 tests, including 45 live PostgreSQL race/E2E tests, and a 90% branch
   coverage gate.
 
 This milestone is usable as an integration backend and a technical portfolio.

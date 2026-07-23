@@ -1,24 +1,18 @@
 from __future__ import annotations
 
-import logging
 from math import isfinite
 from secrets import token_urlsafe
 from typing import Any, TypedDict
+from uuid import uuid4
 
 from dispatch_core.application.async_service import AsyncDispatchService
 from dispatch_core.application.identity import ActorIdentity
 from dispatch_core.application.tracking_links import intake_address_url
-from dispatch_core.infrastructure.messaging import PostgresOutboundStore
 from dispatch_core.infrastructure.pack_store import PostgresPackStore
-from dispatch_core.infrastructure.workflow_store import (
-    PostgresIdentityStore,
-    PostgresIntakeSessionStore,
-)
+from dispatch_core.infrastructure.workflow_store import PostgresIntakeSessionStore
 from dispatch_core.messaging.cards import CardRenderer
 from dispatch_core.messaging.replies import Reply, ReplyButton
 from dispatch_core.packs.catalog import PackDefinition
-
-logger = logging.getLogger(__name__)
 
 INTAKE_PICK_SERVICE = "intake_pick_service"
 INTAKE_SERVICES_DONE = "intake_services_done"
@@ -87,29 +81,27 @@ class IntakeCoordinator:
         packs: PostgresPackStore,
         sessions: PostgresIntakeSessionStore,
         service: AsyncDispatchService,
-        outbound: PostgresOutboundStore | None = None,
-        identities: PostgresIdentityStore | None = None,
         public_base_url: str | None = None,
     ) -> None:
         self._packs = packs
         self._sessions = sessions
         self._service = service
-        self._outbound = outbound
-        self._identities = identities
         self._public_base_url = public_base_url
 
     async def start(self, identity: ActorIdentity) -> Reply:
         pack = await self._packs.active(identity.organization_id)
         if pack is None:
             return Reply(_NOT_CONFIGURED)
-        state: dict[str, Any] = {"step": "phone", "field_values": {}}
+        state: dict[str, Any] = {
+            "step": "phone",
+            "field_values": {},
+            "submission_id": str(uuid4()),
+        }
         await self._save(identity, state)
         return Reply("Введите ваш телефон:", buttons=(_CANCEL_BUTTON,))
 
     async def handle_text(self, identity: ActorIdentity, text: str) -> Reply:
-        state = await self._sessions.get(
-            identity.organization_id, identity.actor_id
-        )
+        state = await self._sessions.get(identity.organization_id, identity.actor_id)
         if state is None:
             return await self.start(identity)
         pack = await self._packs.active(identity.organization_id)
@@ -139,16 +131,12 @@ class IntakeCoordinator:
         payload: dict[str, Any],
     ) -> Reply:
         if action == INTAKE_CANCEL:
-            await self._sessions.clear(
-                identity.organization_id, identity.actor_id
-            )
+            await self._sessions.clear(identity.organization_id, identity.actor_id)
             return Reply("Заявка отменена.")
         pack = await self._packs.active(identity.organization_id)
         if pack is None:
             return Reply(_NOT_CONFIGURED)
-        state = await self._sessions.get(
-            identity.organization_id, identity.actor_id
-        )
+        state = await self._sessions.get(identity.organization_id, identity.actor_id)
         if state is None:
             return await self.start(identity)
         step = state.get("step")
@@ -269,9 +257,7 @@ class IntakeCoordinator:
             or not -180 <= longitude <= 180
         ):
             return Reply("Не удалось распознать геопозицию. Выберите адрес заново.")
-        state = await self._sessions.get(
-            identity.organization_id, identity.actor_id
-        )
+        state = await self._sessions.get(identity.organization_id, identity.actor_id)
         if state is None:
             return await self.start(identity)
         pack = await self._packs.active(identity.organization_id)
@@ -305,9 +291,7 @@ class IntakeCoordinator:
             buttons=self._address_buttons(state),
         )
 
-    def _address_buttons(
-        self, state: dict[str, Any]
-    ) -> tuple[ReplyButton, ...]:
+    def _address_buttons(self, state: dict[str, Any]) -> tuple[ReplyButton, ...]:
         buttons = [
             ReplyButton(
                 "📍 Отправить геопозицию",
@@ -344,9 +328,7 @@ class IntakeCoordinator:
                 row=3,
             )
         )
-        buttons.append(
-            ReplyButton("Отмена", INTAKE_CANCEL, {}, "client", row=4)
-        )
+        buttons.append(ReplyButton("Отмена", INTAKE_CANCEL, {}, "client", row=4))
         return tuple(buttons)
 
     # -- services / fields / confirm --------------------------------------
@@ -455,8 +437,7 @@ class IntakeCoordinator:
         self, pack: PackDefinition, state: dict[str, Any]
     ) -> Reply:
         labels = [
-            pack.service_catalog.label_for(key)
-            for key in state.get("selected", [])
+            pack.service_catalog.label_for(key) for key in state.get("selected", [])
         ]
         fv = state.get("field_values", {})
         lines = ["Заявка:", ""]
@@ -492,76 +473,25 @@ class IntakeCoordinator:
         service_location = state.get("service_location")
         if isinstance(service_location, dict):
             details["service_location"] = dict(service_location)
-        order = None
-        try:
-            order = await self._service.create_order(
-                organization_id=identity.organization_id,
-                work_type=",".join(selected),
-                source=f"{identity.provider.value}:{identity.external_user_id}",
-                details=details,
-                requester_id=identity.actor_id,
-                evidence_requirements=pack.evidence,
-            )
-        finally:
-            await self._sessions.clear(identity.organization_id, identity.actor_id)
-
-        if order is not None and self._outbound is not None:
-            await self._notify_operators(identity, order, field_values, labels)
-
-        return Reply(
-            "Заявка отправлена. Оператор свяжется с вами в ближайшее время."
+        submission_id = state.get("submission_id")
+        if not isinstance(submission_id, str) or not submission_id:
+            submission_id = str(uuid4())
+            state["submission_id"] = submission_id
+            await self._save(identity, state)
+        await self._service.create_order_once(
+            order_id=submission_id,
+            organization_id=identity.organization_id,
+            work_type=",".join(selected),
+            source=f"{identity.provider.value}:{identity.external_user_id}",
+            details=details,
+            requester_id=identity.actor_id,
+            evidence_requirements=pack.evidence,
         )
+        await self._sessions.clear(identity.organization_id, identity.actor_id)
 
-    async def _notify_operators(
-        self,
-        identity: ActorIdentity,
-        order: Any,
-        field_values: dict[str, str],
-        service_labels: list[str],
-    ) -> None:
-        phone = field_values.get("phone", "не указан")
-        address = field_values.get("address", "не указан")
-        lines = [
-            f"Новая заявка #{order.id[:8]}",
-            "",
-            f"Клиент: {identity.display_name}",
-            f"Телефон: {phone}",
-            f"Адрес: {address}",
-            f"Услуги: {', '.join(service_labels)}",
-            "",
-            "Статус: Новая",
-        ]
-        extra = [
-            f"{k}: {v}"
-            for k, v in field_values.items()
-            if k not in ("phone", "address")
-        ]
-        if extra:
-            lines.extend(extra)
-        text = "\n".join(lines)
+        return Reply("Заявка отправлена. Оператор свяжется с вами в ближайшее время.")
 
-        if self._identities is not None and self._outbound is not None:
-            external_ids = await self._identities.external_ids_for_role(
-                organization_id=identity.organization_id,
-                provider=identity.provider,
-                role="operator",
-                consumer_key="operator",
-            )
-            for external_id in external_ids:
-                if not external_id:
-                    continue
-                await self._outbound.enqueue(
-                    deduplication_key=f"order:{order.id}:op:{external_id}",
-                    organization_id=identity.organization_id,
-                    provider=identity.provider,
-                    recipient_id=external_id,
-                    text=text,
-                    consumer_key="operator",
-                )
-
-    async def _save(
-        self, identity: ActorIdentity, state: dict[str, Any]
-    ) -> None:
+    async def _save(self, identity: ActorIdentity, state: dict[str, Any]) -> None:
         await self._sessions.put(
             organization_id=identity.organization_id,
             actor_id=identity.actor_id,
@@ -586,9 +516,7 @@ def _ask_field(definition: Any) -> Reply:
     return Reply(f"{definition.ask()}{hint}", buttons=(_CANCEL_BUTTON,))
 
 
-def _service_buttons(
-    pack: PackDefinition, selected: object
-) -> tuple[ReplyButton, ...]:
+def _service_buttons(pack: PackDefinition, selected: object) -> tuple[ReplyButton, ...]:
     chosen = set(selected or ())
     buttons: list[ReplyButton] = []
     for row, category in enumerate(pack.service_catalog.categories):

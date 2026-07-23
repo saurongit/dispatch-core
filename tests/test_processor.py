@@ -12,6 +12,7 @@ from dispatch_core.domain.errors import InvalidTransition
 from dispatch_core.domain.tracking import LocationSource
 from dispatch_core.domain.work_order import CompletionReport, PoolMode, WorkOrder
 from dispatch_core.infrastructure.workflow_store import ActiveExecution
+from dispatch_core.messaging.intake import INTAKE_CANCEL
 from dispatch_core.messaging.models import (
     CallbackAction,
     InboundEnvelope,
@@ -134,12 +135,29 @@ class FakeRoleCoordinator:
 
 
 @dataclass
+class FakeIntake:
+    callbacks: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+
+    async def handle_callback(
+        self,
+        actor: ActorIdentity,
+        action: str,
+        payload: dict[str, Any],
+    ) -> Reply:
+        self.callbacks.append((action, payload))
+        return Reply("client callback")
+
+
+@dataclass
 class FakeCallbacks:
     action: str = "accept"
     payload: dict[str, Any] = field(default_factory=lambda: {"order_id": "order-1"})
     value: CallbackAction | None = None
+    resolve_calls: list[dict[str, Any]] = field(default_factory=list)
+    complete_calls: list[dict[str, Any]] = field(default_factory=list)
 
     async def resolve(self, **values: Any) -> CallbackAction | None:
+        self.resolve_calls.append(values)
         if self.value is not None:
             return self.value
         return CallbackAction(
@@ -150,6 +168,10 @@ class FakeCallbacks:
             allowed_role=None,
             expires_at=datetime.now(UTC) + timedelta(hours=1),
         )
+
+    async def complete(self, **values: Any) -> bool:
+        self.complete_calls.append(values)
+        return True
 
 
 @dataclass
@@ -198,9 +220,12 @@ class FakeService:
         default_factory=list
     )
     fail_methods: set[str] = field(default_factory=set)
+    unexpected_fail_methods: set[str] = field(default_factory=set)
 
     async def _call(self, name: str, *args: Any, **kwargs: Any) -> None:
         self.calls.append((name, args, kwargs))
+        if name in self.unexpected_fail_methods:
+            raise RuntimeError(f"transient {name} failure")
         if name in self.fail_methods:
             raise InvalidTransition(f"forced {name} failure")
 
@@ -282,6 +307,7 @@ def processor(
     binding_sessions: FakeBindingSessions | None = None,
     operator: FakeRoleCoordinator | None = None,
     master: FakeRoleCoordinator | None = None,
+    intake: FakeIntake | None = None,
     consumer_key: str = "",
     include_transport: bool = True,
 ) -> tuple[InboundProcessor, dict[str, Any]]:
@@ -302,6 +328,7 @@ def processor(
         "binding_sessions": binding_sessions,
         "operator": operator,
         "master": master,
+        "intake": intake,
         "consumer_key": consumer_key,
     }
     return InboundProcessor(**values), values  # type: ignore[arg-type]
@@ -396,6 +423,31 @@ async def test_dispatch_saves_location_to_active_tracking_session() -> None:
 
 
 @pytest.mark.asyncio
+async def test_non_master_frontend_cannot_submit_master_evidence_or_location() -> None:
+    execution = ActiveExecution("order-1", "in_progress", "track-1")
+    drafts = FakeDrafts()
+    service = FakeService()
+    target, _ = processor(
+        executions=FakeExecutions(execution),
+        drafts=drafts,
+        service=service,
+    )
+    operator = identity("operator")
+
+    await target._dispatch(
+        operator,
+        event(EventKind.PHOTO, media_id="wrong-role-photo"),
+    )
+    await target._dispatch(
+        operator,
+        event(EventKind.LOCATION, latitude=53.75, longitude=87.1),
+    )
+
+    assert drafts.photos == []
+    assert service.calls == []
+
+
+@pytest.mark.asyncio
 async def test_dispatch_accepts_contact_as_neutral_event() -> None:
     target, _ = processor()
     assert (
@@ -448,6 +500,55 @@ async def test_callback_routes_every_supported_action(
 
 
 @pytest.mark.asyncio
+async def test_callback_claim_is_stable_for_inbox_retry() -> None:
+    callbacks = FakeCallbacks()
+    target, _ = processor(callbacks=callbacks)
+    callback_event = event(
+        EventKind.CALLBACK,
+        external_event_id="telegram:retryable-update",
+        callback_token="token-1",
+    )
+
+    await target._callback(identity(), callback_event)
+
+    assert [call["claim_key"] for call in callbacks.resolve_calls] == [
+        "telegram:telegram:retryable-update",
+    ]
+    assert callbacks.complete_calls == [
+        {
+            "token": "token-1",
+            "organization_id": "org-1",
+            "claim_key": "telegram:telegram:retryable-update",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unexpected_callback_failure_leaves_claim_resumable() -> None:
+    callbacks = FakeCallbacks()
+    service = FakeService(unexpected_fail_methods={"accept_order"})
+    target, _ = processor(callbacks=callbacks, service=service)
+    callback_event = event(
+        EventKind.CALLBACK,
+        external_event_id="telegram:retryable-update",
+        callback_token="token-1",
+    )
+
+    with pytest.raises(RuntimeError, match="transient accept_order"):
+        await target._callback(identity(), callback_event)
+
+    assert callbacks.complete_calls == []
+    service.unexpected_fail_methods.clear()
+    await target._callback(identity(), callback_event)
+    assert len(callbacks.resolve_calls) == 2
+    assert (
+        callbacks.resolve_calls[0]["claim_key"]
+        == (callbacks.resolve_calls[1]["claim_key"])
+    )
+    assert len(callbacks.complete_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_callback_rejects_unknown_expired_and_wrong_role_actions() -> None:
     expired, _ = processor(callbacks=FakeCallbacks(value=None))
     expired._callbacks = FakeCallbacks(value=None)  # type: ignore[assignment]
@@ -462,6 +563,23 @@ async def test_callback_rejects_unknown_expired_and_wrong_role_actions() -> None
             identity(),
             event(EventKind.CALLBACK, callback_token="token"),
         )
+
+
+@pytest.mark.asyncio
+async def test_admin_role_cannot_execute_forwarded_client_intake_button() -> None:
+    intake = FakeIntake()
+    target, _ = processor(
+        callbacks=FakeCallbacks(action=INTAKE_CANCEL, payload={}),
+        intake=intake,
+    )
+
+    with pytest.raises(InvalidTransition, match="роли"):
+        await target._callback(
+            identity("admin"),
+            event(EventKind.CALLBACK, callback_token="forwarded-client-token"),
+        )
+
+    assert intake.callbacks == []
 
 
 @pytest.mark.asyncio

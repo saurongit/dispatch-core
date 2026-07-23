@@ -292,6 +292,57 @@ async def test_duplicate_order_creation_is_atomic_conflict(
 
 
 @pytest.mark.asyncio
+async def test_idempotent_submission_race_creates_one_order_and_event(
+    database: PostgresDatabase,
+    organization: str,
+) -> None:
+    commands = service(database)
+    submission = {
+        "order_id": "stable-intake-submission",
+        "organization_id": organization,
+        "work_type": "repair",
+        "source": "telegram:7001",
+        "details": {
+            "phone": "+7 999 000-00-01",
+            "address": "Ленина 1",
+            "service_keys": ["repair"],
+        },
+        "requester_id": "telegram:7001",
+    }
+
+    first, second = await asyncio.gather(
+        commands.create_order_once(**submission),
+        commands.create_order_once(**submission),
+    )
+
+    assert first.id == second.id == submission["order_id"]
+    assert database.pool is not None
+    async with database.pool.acquire() as connection:
+        order_count = await connection.fetchval(
+            """
+            SELECT count(*) FROM work_orders
+            WHERE organization_id = $1 AND id = $2
+            """,
+            organization,
+            submission["order_id"],
+        )
+        event_count = await connection.fetchval(
+            """
+            SELECT count(*) FROM outbox_events
+            WHERE organization_id = $1 AND aggregate_id = $2
+            """,
+            organization,
+            submission["order_id"],
+        )
+    assert order_count == 1
+    assert event_count == 1
+
+    changed = {**submission, "details": {**submission["details"], "address": "Иная"}}
+    with pytest.raises(ConcurrencyConflict, match="different submission"):
+        await commands.create_order_once(**changed)
+
+
+@pytest.mark.asyncio
 async def test_first_claim_race_has_one_database_winner(
     database: PostgresDatabase,
     organization: str,
@@ -976,12 +1027,15 @@ async def test_staff_stores_cover_empty_clear_validation_and_cleanup(
         display_name="Staff Store Actor",
     )
     sessions = PostgresStaffWorkflowSessionStore(pool)
-    assert await sessions.get(
-        organization_id=organization,
-        actor_id="staff-store-actor",
-        role="master",
-        provider=Provider.MAX,
-    ) is None
+    assert (
+        await sessions.get(
+            organization_id=organization,
+            actor_id="staff-store-actor",
+            role="master",
+            provider=Provider.MAX,
+        )
+        is None
+    )
     with pytest.raises(ValueError, match="workflow role"):
         await sessions.get(
             organization_id=organization,
@@ -1002,12 +1056,15 @@ async def test_staff_stores_cover_empty_clear_validation_and_cleanup(
         role="master",
         provider=Provider.MAX,
     )
-    assert await sessions.get(
-        organization_id=organization,
-        actor_id="staff-store-actor",
-        role="master",
-        provider=Provider.MAX,
-    ) is None
+    assert (
+        await sessions.get(
+            organization_id=organization,
+            actor_id="staff-store-actor",
+            role="master",
+            provider=Provider.MAX,
+        )
+        is None
+    )
     await sessions.put(
         organization_id=organization,
         actor_id="staff-store-actor",
@@ -1031,12 +1088,15 @@ async def test_staff_stores_cover_empty_clear_validation_and_cleanup(
             actor_id="staff-store-actor",
             limit=0,
         )
-    assert await views.get_active_order(
-        organization_id=organization,
-        role="master",
-        actor_id="staff-store-actor",
-        order_id="missing",
-    ) is None
+    assert (
+        await views.get_active_order(
+            organization_id=organization,
+            role="master",
+            actor_id="staff-store-actor",
+            order_id="missing",
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -1138,10 +1198,13 @@ async def test_generic_workflow_sessions_and_empty_report_cleanup(
         provider=Provider.MAX,
         state={"flow": "brand"},
     )
-    assert await config.cleanup_stale(
-        max_age_hours=-1,
-        organization_id=organization,
-    ) == 1
+    assert (
+        await config.cleanup_stale(
+            max_age_hours=-1,
+            organization_id=organization,
+        )
+        == 1
+    )
     await config.put(
         organization_id=organization,
         actor_id="admin-2",
@@ -1168,15 +1231,62 @@ async def test_callback_token_is_opaque_role_scoped_and_expiring(
         token=created.token,
         organization_id=organization,
         actor_role="master",
+        claim_key="telegram:update-1",
+    )
+    retried = await callbacks.resolve(
+        token=created.token,
+        organization_id=organization,
+        actor_role="master",
+        claim_key="telegram:update-1",
+    )
+    assert (
+        await callbacks.peek_action(
+            token=created.token,
+            organization_id=organization,
+            claim_key="telegram:update-1",
+        )
+        == "pool_interest"
+    )
+    competing = await callbacks.resolve(
+        token=created.token,
+        organization_id=organization,
+        actor_role="master",
+        claim_key="telegram:update-2",
+    )
+    assert (
+        await callbacks.peek_action(
+            token=created.token,
+            organization_id=organization,
+            claim_key="telegram:update-2",
+        )
+        is None
     )
     denied = await callbacks.resolve(
         token=created.token,
         organization_id=organization,
         actor_role="operator",
+        claim_key="telegram:update-3",
     )
     assert resolved is not None
     assert dict(resolved.payload) == {"order_id": "order-1"}
+    assert retried is not None
+    assert dict(retried.payload) == {"order_id": "order-1"}
+    assert competing is None
     assert denied is None
+    assert await callbacks.complete(
+        token=created.token,
+        organization_id=organization,
+        claim_key="telegram:update-1",
+    )
+    assert (
+        await callbacks.resolve(
+            token=created.token,
+            organization_id=organization,
+            actor_role="master",
+            claim_key="telegram:update-1",
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -2293,22 +2403,17 @@ async def test_travel_projects_location_request_and_client_tracking_link(
         if button["url"] is not None
     ]
     assert len(tracking_buttons) == 1
-    assert tracking_buttons[0]["url"].startswith(
-        "https://dispatch.example/track#"
-    )
+    assert tracking_buttons[0]["url"].startswith("https://dispatch.example/track#")
     assert "?" not in tracking_buttons[0]["url"]
     sender_buttons = [
         button
         for message in messages
         if message["recipient_id"] == "master-chat"
         for button in message["buttons"]
-        if button["url"] is not None
-        and "/track/share#" in button["url"]
+        if button["url"] is not None and "/track/share#" in button["url"]
     ]
     assert len(sender_buttons) == 1
-    assert sender_buttons[0]["url"].startswith(
-        "https://dispatch.example/track/share#"
-    )
+    assert sender_buttons[0]["url"].startswith("https://dispatch.example/track/share#")
 
 
 @pytest.mark.asyncio
@@ -2714,6 +2819,17 @@ async def test_client_intake_from_first_message_reaches_completion(
 
     # Operator is notified of the new client order and publishes it to the pool.
     await project_all(database, packs)
+    async with pool.acquire() as connection:
+        new_order_notifications = await connection.fetchval(
+            """
+            SELECT count(*) FROM outbound_messages
+            WHERE organization_id = $1
+              AND recipient_id = '1001'
+              AND text_body LIKE 'Новая заявка%'
+            """,
+            organization,
+        )
+    assert new_order_notifications == 1
     pool_token = await callback_token(database, organization, "1001", "В пул")
     await click(1001, pool_token)
     assert await processor.run_once() == 1

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -43,10 +42,9 @@ class FakePacks:
 @dataclass
 class FakeSessions:
     store: dict[str, dict[str, Any]] = field(default_factory=dict)
+    clear_failures: int = 0
 
-    async def get(
-        self, organization_id: str, actor_id: str
-    ) -> dict[str, Any] | None:
+    async def get(self, organization_id: str, actor_id: str) -> dict[str, Any] | None:
         value = self.store.get(f"{organization_id}:{actor_id}")
         return dict(value) if value is not None else None
 
@@ -61,6 +59,9 @@ class FakeSessions:
         self.store[f"{organization_id}:{actor_id}"] = dict(state)
 
     async def clear(self, organization_id: str, actor_id: str) -> None:
+        if self.clear_failures:
+            self.clear_failures -= 1
+            raise RuntimeError("session storage unavailable")
         self.store.pop(f"{organization_id}:{actor_id}", None)
 
 
@@ -68,27 +69,14 @@ class FakeSessions:
 class FakeService:
     orders: list[dict[str, Any]] = field(default_factory=list)
     result: object | None = None
+    failures: int = 0
 
-    async def create_order(self, **values: Any) -> object | None:
+    async def create_order_once(self, **values: Any) -> object | None:
         self.orders.append(values)
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("order storage unavailable")
         return self.result
-
-
-@dataclass
-class FakeOutbound:
-    messages: list[dict[str, Any]] = field(default_factory=list)
-
-    async def enqueue(self, **values: Any) -> bool:
-        self.messages.append(values)
-        return True
-
-
-@dataclass
-class FakeIdentities:
-    external_ids: list[str]
-
-    async def external_ids_for_role(self, **values: Any) -> list[str]:
-        return self.external_ids
 
 
 def coordinator(
@@ -123,6 +111,7 @@ async def test_start_asks_for_phone() -> None:
     assert INTAKE_CANCEL in actions
     state = sessions.store["org-1:telegram:7001"]
     assert state["step"] == "phone"
+    assert len(state["submission_id"]) == 36
 
 
 @pytest.mark.asyncio
@@ -152,9 +141,7 @@ async def test_phone_to_address_to_services() -> None:
 
 @pytest.mark.asyncio
 async def test_address_card_warns_about_vpn_and_offers_all_methods() -> None:
-    target, sessions, _ = coordinator(
-        public_base_url="https://dispatch.example"
-    )
+    target, sessions, _ = coordinator(public_base_url="https://dispatch.example")
     who = identity()
     await target.start(who)
 
@@ -174,9 +161,7 @@ async def test_address_card_warns_about_vpn_and_offers_all_methods() -> None:
 
 @pytest.mark.asyncio
 async def test_native_location_advances_to_services_and_is_saved() -> None:
-    target, sessions, _ = coordinator(
-        public_base_url="https://dispatch.example"
-    )
+    target, sessions, _ = coordinator(public_base_url="https://dispatch.example")
     who = identity()
     await target.start(who)
     await target.handle_text(who, "+7 999 123 4567")
@@ -205,9 +190,7 @@ async def test_native_location_advances_to_services_and_is_saved() -> None:
 
 @pytest.mark.asyncio
 async def test_address_callbacks_reject_wrong_step_and_continue_after_map() -> None:
-    target, sessions, _ = coordinator(
-        public_base_url="https://dispatch.example"
-    )
+    target, sessions, _ = coordinator(public_base_url="https://dispatch.example")
     who = identity()
     wrong = await target.handle_callback(who, INTAKE_REQUEST_LOCATION, {})
     assert "телефон" in wrong.text.lower()
@@ -341,6 +324,71 @@ async def test_confirm_clears_session_on_success() -> None:
     assert "отправлена" in done.text.lower()
     assert "org-1:telegram:7001" not in sessions.store
     assert len(service.orders) == 1
+
+
+@pytest.mark.asyncio
+async def test_confirm_failure_preserves_session_and_stable_submission_id() -> None:
+    target, sessions, service = coordinator()
+    who = identity()
+    key = "org-1:telegram:7001"
+    await target.start(who)
+    submission_id = sessions.store[key]["submission_id"]
+    sessions.store[key].update(
+        {
+            "step": "confirm",
+            "selected": ["repair"],
+            "field_values": {
+                "phone": "79990000000",
+                "address": "Ленина 1",
+                "fault": "Течь",
+            },
+        }
+    )
+    service.failures = 1
+
+    with pytest.raises(RuntimeError, match="order storage"):
+        await target.handle_callback(who, INTAKE_CONFIRM, {})
+
+    assert sessions.store[key]["step"] == "confirm"
+    assert sessions.store[key]["submission_id"] == submission_id
+    await target.handle_callback(who, INTAKE_CONFIRM, {})
+    assert [item["order_id"] for item in service.orders] == [
+        submission_id,
+        submission_id,
+    ]
+    assert key not in sessions.store
+
+
+@pytest.mark.asyncio
+async def test_confirm_retry_after_clear_failure_reuses_submission_id() -> None:
+    target, sessions, service = coordinator()
+    who = identity()
+    key = "org-1:telegram:7001"
+    await target.start(who)
+    submission_id = sessions.store[key]["submission_id"]
+    sessions.store[key].update(
+        {
+            "step": "confirm",
+            "selected": ["repair"],
+            "field_values": {
+                "phone": "79990000000",
+                "address": "Ленина 1",
+                "fault": "Течь",
+            },
+        }
+    )
+    sessions.clear_failures = 1
+
+    with pytest.raises(RuntimeError, match="session storage"):
+        await target.handle_callback(who, INTAKE_CONFIRM, {})
+
+    assert sessions.store[key]["submission_id"] == submission_id
+    await target.handle_callback(who, INTAKE_CONFIRM, {})
+    assert [item["order_id"] for item in service.orders] == [
+        submission_id,
+        submission_id,
+    ]
+    assert key not in sessions.store
 
 
 @pytest.mark.asyncio
@@ -522,36 +570,3 @@ async def test_confirm_without_service_restarts_intake() -> None:
     }
     reply = await target.handle_callback(who, INTAKE_CONFIRM, {})
     assert "телефон" in reply.text.lower()
-
-
-@pytest.mark.asyncio
-async def test_success_notifies_nonblank_operator_ids_with_extra_fields() -> None:
-    service = FakeService(result=SimpleNamespace(id="order-123456789"))
-    sessions = FakeSessions(
-        store={
-            "org-1:telegram:7001": {
-                "step": "confirm",
-                "selected": ["repair"],
-                "field_values": {
-                    "phone": "79990000000",
-                    "address": "Ленина 1",
-                    "fault": "Течь",
-                },
-            }
-        }
-    )
-    outbound = FakeOutbound()
-    target = IntakeCoordinator(
-        packs=FakePacks(seed_definition("field_service")),
-        sessions=sessions,
-        service=service,
-        outbound=outbound,
-        identities=FakeIdentities(["operator-chat", ""]),
-    )
-
-    reply = await target.handle_callback(identity(), INTAKE_CONFIRM, {})
-
-    assert "отправлена" in reply.text.lower()
-    assert len(outbound.messages) == 1
-    assert outbound.messages[0]["recipient_id"] == "operator-chat"
-    assert "fault: Течь" in outbound.messages[0]["text"]

@@ -104,6 +104,7 @@ class FakePackStore:
     _active: PackDefinition | None = None
     _published_version: int | None = None
     _publish_error: Exception | None = None
+    update_failures: int = 0
 
     async def active(self, organization_id: str) -> PackDefinition | None:
         return self._active
@@ -121,6 +122,9 @@ class FakePackStore:
     async def update_draft(
         self, organization_id: str, definition: PackDefinition
     ) -> None:
+        if self.update_failures:
+            self.update_failures -= 1
+            raise RuntimeError("pack storage unavailable")
         self._draft = definition
 
     async def publish_draft(self, organization_id: str) -> int:
@@ -137,10 +141,9 @@ class FakePackStore:
 @dataclass
 class FakeSessionStore:
     store: dict[str, dict[str, Any]] = field(default_factory=dict)
+    clear_failures: int = 0
 
-    async def get(
-        self, organization_id: str, actor_id: str
-    ) -> dict[str, Any] | None:
+    async def get(self, organization_id: str, actor_id: str) -> dict[str, Any] | None:
         value = self.store.get(f"{organization_id}:{actor_id}")
         return dict(value) if value is not None else None
 
@@ -155,6 +158,9 @@ class FakeSessionStore:
         self.store[f"{organization_id}:{actor_id}"] = dict(state)
 
     async def clear(self, organization_id: str, actor_id: str) -> None:
+        if self.clear_failures:
+            self.clear_failures -= 1
+            raise RuntimeError("session storage unavailable")
         self.store.pop(f"{organization_id}:{actor_id}", None)
 
 
@@ -162,6 +168,7 @@ class FakeSessionStore:
 class FakeIdentityStore:
     actors: dict[str, dict[str, Any]] = field(default_factory=dict)
     next_id: int = 1
+    creation_requests: dict[str, str] = field(default_factory=dict)
 
     async def create_staff_actor(
         self,
@@ -172,7 +179,10 @@ class FakeIdentityStore:
         phone: str | None = None,
         provider: Provider | None = None,
         external_user_id: str | None = None,
+        request_key: str | None = None,
     ) -> dict[str, Any]:
+        if request_key and request_key in self.creation_requests:
+            return self.actors[self.creation_requests[request_key]]
         actor_id = f"operator:{self.next_id}"
         self.next_id += 1
         actor = {
@@ -188,6 +198,8 @@ class FakeIdentityStore:
             "roles": [role],
         }
         self.actors[actor_id] = actor
+        if request_key:
+            self.creation_requests[request_key] = actor_id
         return actor
 
     async def list_actors(
@@ -205,9 +217,7 @@ class FakeIdentityStore:
         actor = self.actors.get(actor_id)
         return {**actor, "id": actor_id} if actor is not None else None
 
-    async def delete_actor(
-        self, *, organization_id: str, actor_id: str
-    ) -> bool:
+    async def delete_actor(self, *, organization_id: str, actor_id: str) -> bool:
         return self.actors.pop(actor_id, None) is not None
 
     async def revoke_role(
@@ -284,19 +294,38 @@ async def test_admin_creates_lists_and_deletes_operator() -> None:
     reply = await target.handle_callback(who, CONFIG_LIST_OPERATORS, {})
     assert "Анна" in reply.text
     delete = next(
-        button for button in reply.buttons
-        if button.action == CONFIG_DEL_OPERATOR
+        button for button in reply.buttons if button.action == CONFIG_DEL_OPERATOR
     )
 
     reply = await target.handle_callback(who, delete.action, delete.payload)
     confirm = next(
-        button for button in reply.buttons
+        button
+        for button in reply.buttons
         if button.action == CONFIG_DEL_OPERATOR_CONFIRM
     )
     reply = await target.handle_callback(who, confirm.action, confirm.payload)
 
     assert "операторов пока нет" in reply.text.lower()
     assert identities.actors == {}
+
+
+@pytest.mark.asyncio
+async def test_operator_creation_retry_does_not_duplicate_actor() -> None:
+    identities = FakeIdentityStore()
+    target, _, sessions = coordinator(identities=identities)
+    who = admin()
+    await target.handle_callback(who, CONFIG_ADD_OPERATOR, {})
+    request_key = sessions.store["org-1:admin:100"]["request_key"]
+    sessions.clear_failures = 1
+
+    with pytest.raises(RuntimeError, match="session storage"):
+        await target.handle_text(who, "Анна")
+
+    assert len(identities.actors) == 1
+    assert sessions.store["org-1:admin:100"]["request_key"] == request_key
+    reply = await target.handle_text(who, "Анна")
+    assert "код привязки: 1234" in reply.text.lower()
+    assert len(identities.actors) == 1
 
 
 @pytest.mark.asyncio
@@ -468,9 +497,7 @@ async def test_services_add_and_delete() -> None:
     assert len(packs._draft.service_catalog.categories) == 1
     key = packs._draft.service_catalog.categories[0].key
 
-    reply = await target.handle_callback(
-        admin(), CONFIG_SERVICE_DELETE, {"key": key}
-    )
+    reply = await target.handle_callback(admin(), CONFIG_SERVICE_DELETE, {"key": key})
     assert len(packs._draft.service_catalog.categories) == 0
 
 
@@ -482,6 +509,40 @@ async def test_services_empty_label_rejected() -> None:
     reply = await target.handle_text(admin(), "")
     assert "пустым" in reply.text.lower()
     assert sessions.store["org-1:admin:100"]["step"] == "label"
+
+
+@pytest.mark.asyncio
+async def test_service_save_failure_preserves_flow_for_inbox_retry() -> None:
+    target, packs, sessions = coordinator(draft=blank_definition())
+    await target.handle_callback(admin(), CONFIG_SERVICE_ADD, {})
+    packs.update_failures = 1
+
+    with pytest.raises(RuntimeError, match="pack storage"):
+        await target.handle_text(admin(), "Ремонт")
+
+    assert sessions.store["org-1:admin:100"]["flow"] == "service_add"
+    await target.handle_text(admin(), "Ремонт")
+    assert packs._draft is not None
+    assert [item.label for item in packs._draft.service_catalog.categories] == [
+        "Ремонт"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_service_clear_failure_retry_does_not_duplicate_item() -> None:
+    target, packs, sessions = coordinator(draft=blank_definition())
+    await target.handle_callback(admin(), CONFIG_SERVICE_ADD, {})
+    sessions.clear_failures = 1
+
+    with pytest.raises(RuntimeError, match="session storage"):
+        await target.handle_text(admin(), "Ремонт")
+
+    assert sessions.store["org-1:admin:100"]["flow"] == "service_add"
+    await target.handle_text(admin(), "Ремонт")
+    assert packs._draft is not None
+    assert [item.label for item in packs._draft.service_catalog.categories] == [
+        "Ремонт"
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -506,9 +567,7 @@ async def test_fields_add_full_flow() -> None:
     assert "тип поля" in reply.text.lower()
     assert sessions.store["org-1:admin:100"]["scratch"]["label"] == "Телефон"
 
-    reply = await target.handle_callback(
-        admin(), CONFIG_FIELD_TYPE, {"type": "text"}
-    )
+    reply = await target.handle_callback(admin(), CONFIG_FIELD_TYPE, {"type": "text"})
     assert "обязательн" in reply.text.lower()
 
     reply = await target.handle_callback(
@@ -526,17 +585,13 @@ async def test_fields_add_full_flow() -> None:
 async def test_fields_delete() -> None:
     pack = PackDefinition(
         branding=Branding(name="X"),
-        service_catalog=ServiceCatalog(
-            categories=(ServiceCategory("a", "A"),)
-        ),
+        service_catalog=ServiceCatalog(categories=(ServiceCategory("a", "A"),)),
         fields=(FieldDefinition("phone", "Телефон", FieldType.TEXT),),
         evidence=EvidenceRequirements(),
     )
     target, packs, _ = coordinator(draft=pack)
     await target.handle_text(admin(), "/fields")
-    reply = await target.handle_callback(
-        admin(), CONFIG_FIELD_DELETE, {"key": "phone"}
-    )
+    reply = await target.handle_callback(admin(), CONFIG_FIELD_DELETE, {"key": "phone"})
     assert "пока пусто" in reply.text.lower()
     assert len(packs._draft.fields) == 0
 
@@ -544,9 +599,7 @@ async def test_fields_delete() -> None:
 @pytest.mark.asyncio
 async def test_field_type_with_no_session_returns_fields() -> None:
     target, _, _ = coordinator(draft=blank_definition())
-    reply = await target.handle_callback(
-        admin(), CONFIG_FIELD_TYPE, {"type": "text"}
-    )
+    reply = await target.handle_callback(admin(), CONFIG_FIELD_TYPE, {"type": "text"})
     assert "пол" in reply.text.lower()
 
 
@@ -557,6 +610,22 @@ async def test_field_required_with_no_session_returns_fields() -> None:
         admin(), CONFIG_FIELD_REQUIRED, {"required": True}
     )
     assert "пол" in reply.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_field_clear_failure_retry_does_not_duplicate_item() -> None:
+    target, packs, sessions = coordinator(draft=blank_definition())
+    await target.handle_callback(admin(), CONFIG_FIELD_ADD, {})
+    await target.handle_text(admin(), "Телефон")
+    await target.handle_callback(admin(), CONFIG_FIELD_TYPE, {"type": "text"})
+    sessions.clear_failures = 1
+
+    with pytest.raises(RuntimeError, match="session storage"):
+        await target.handle_callback(admin(), CONFIG_FIELD_REQUIRED, {"required": True})
+
+    await target.handle_callback(admin(), CONFIG_FIELD_REQUIRED, {"required": True})
+    assert packs._draft is not None
+    assert [item.label for item in packs._draft.fields] == ["Телефон"]
 
 
 # ---------------------------------------------------------------------------

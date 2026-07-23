@@ -108,8 +108,6 @@ async def run_worker(
         packs=packs,
         sessions=intake_sessions,
         service=service,
-        outbound=outbound,
-        identities=identities,
         public_base_url=settings.public_base_url,
     )
     config = ConfigCoordinator(

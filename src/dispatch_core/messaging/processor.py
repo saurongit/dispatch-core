@@ -27,7 +27,12 @@ from dispatch_core.infrastructure.workflow_store import (
 )
 from dispatch_core.messaging.config import CONFIG_ACTIONS, ConfigCoordinator
 from dispatch_core.messaging.intake import INTAKE_ACTIONS, IntakeCoordinator
-from dispatch_core.messaging.models import InboundEnvelope, OutboundButton, Provider
+from dispatch_core.messaging.models import (
+    CallbackAction,
+    InboundEnvelope,
+    OutboundButton,
+    Provider,
+)
 from dispatch_core.messaging.replies import Reply
 from dispatch_core.messaging.staff import (
     STAFF_SELECT_ROLE,
@@ -208,37 +213,53 @@ class InboundProcessor:
             action = await self._callbacks.peek_action(
                 token=event.callback_token,
                 organization_id=item.organization_id,
+                claim_key=_callback_claim_key(event),
             )
             if action == STAFF_SELECT_ROLE:
                 callback = await self._callbacks.resolve(
                     token=event.callback_token,
                     organization_id=item.organization_id,
                     actor_role=base.role,
+                    claim_key=_callback_claim_key(event),
                 )
                 if callback is None:
                     return base, coordinator.menu(
                         base,
                         note="Кнопка выбора роли устарела.",
                     )
-                role, reply = await coordinator.select(base, dict(callback.payload))
-                if role is None:
-                    return base, reply
-                selected = await self._identities.resolve(
-                    organization_id=item.organization_id,
-                    provider=item.provider,
-                    external_user_id=event.external_user_id,
-                    consumer_key=role,
-                )
-                if selected is None:
-                    await coordinator.clear(base)
-                    return base, coordinator.menu(
-                        base,
-                        note="Выбранная роль больше недоступна.",
-                    )
-                return selected, await self._role_landing(
-                    selected,
-                    note=reply.text,
-                )
+                try:
+                    role, reply = await coordinator.select(base, dict(callback.payload))
+                    if role is None:
+                        result = (base, reply)
+                    else:
+                        selected = await self._identities.resolve(
+                            organization_id=item.organization_id,
+                            provider=item.provider,
+                            external_user_id=event.external_user_id,
+                            consumer_key=role,
+                        )
+                        if selected is None:
+                            await coordinator.clear(base)
+                            result = (
+                                base,
+                                coordinator.menu(
+                                    base,
+                                    note="Выбранная роль больше недоступна.",
+                                ),
+                            )
+                        else:
+                            result = (
+                                selected,
+                                await self._role_landing(
+                                    selected,
+                                    note=reply.text,
+                                ),
+                            )
+                except DomainError:
+                    await self._complete_callback_claim(callback, event)
+                    raise
+                await self._complete_callback_claim(callback, event)
+                return result
         role = await coordinator.selected(base)
         if role is not None:
             selected = await self._identities.resolve(
@@ -445,10 +466,12 @@ class InboundProcessor:
                 and event.text.lstrip().startswith("/")
             ):
                 return await self._master.handle_text(identity, event.text)
-        execution = await self._executions.active_for_executor(
-            identity.organization_id,
-            identity.actor_id,
-        )
+        execution = None
+        if identity.role == "master":
+            execution = await self._executions.active_for_executor(
+                identity.organization_id,
+                identity.actor_id,
+            )
         if event.kind is EventKind.LOCATION:
             if execution is None or execution.tracking_session_id is None:
                 return Reply("Нет активного маршрута для этой геопозиции.")
@@ -497,9 +520,23 @@ class InboundProcessor:
             token=event.callback_token,
             organization_id=identity.organization_id,
             actor_role=identity.role,
+            claim_key=_callback_claim_key(event),
         )
         if callback is None:
             raise InvalidTransition("кнопка устарела или недоступна для этой роли")
+        try:
+            reply = await self._execute_callback(identity, callback)
+        except DomainError:
+            await self._complete_callback_claim(callback, event)
+            raise
+        await self._complete_callback_claim(callback, event)
+        return reply
+
+    async def _execute_callback(
+        self,
+        identity: ActorIdentity,
+        callback: CallbackAction,
+    ) -> Reply:
         payload = dict(callback.payload)
         logger.info(
             "callback action=%s role=%s org=%s",
@@ -508,6 +545,7 @@ class InboundProcessor:
             identity.organization_id,
         )
         if self._intake is not None and callback.action in INTAKE_ACTIONS:
+            self._require_role(identity, "client")
             return await self._intake.handle_callback(
                 identity, callback.action, payload
             )
@@ -668,6 +706,19 @@ class InboundProcessor:
             return Reply("Отчёт принят, заявка завершена.")
         raise InvalidTransition(f"unknown callback action {callback.action!r}")
 
+    async def _complete_callback_claim(
+        self,
+        callback: CallbackAction,
+        event: InboundEvent,
+    ) -> None:
+        completed = await self._callbacks.complete(
+            token=callback.token,
+            organization_id=callback.organization_id,
+            claim_key=_callback_claim_key(event),
+        )
+        if not completed:
+            raise RuntimeError("callback claim ownership was lost")
+
     async def _role_landing(
         self,
         identity: ActorIdentity,
@@ -716,6 +767,10 @@ class InboundProcessor:
     def _require_role(identity: ActorIdentity, *roles: str) -> None:
         if identity.role not in roles:
             raise InvalidTransition("действие недоступно для вашей роли")
+
+
+def _callback_claim_key(event: InboundEvent) -> str:
+    return f"{event.provider.value}:{event.external_event_id}"
 
 
 def _location_source(provider: Provider):

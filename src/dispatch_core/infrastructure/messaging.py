@@ -518,15 +518,22 @@ class PostgresCallbackStore:
         token: str,
         organization_id: str,
         actor_role: str,
+        claim_key: str | None = None,
     ) -> CallbackAction | None:
+        stable_claim_key = claim_key or token_urlsafe(18)
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
                 """
-                UPDATE callback_actions SET revoked_at = now()
+                UPDATE callback_actions SET
+                    revoked_at = COALESCE(revoked_at, now()),
+                    claim_key = COALESCE(claim_key, $4)
                 WHERE token = $1
                   AND organization_id = $2
-                  AND revoked_at IS NULL
                   AND expires_at > now()
+                  AND (
+                      revoked_at IS NULL
+                      OR (claim_key = $4 AND completed_at IS NULL)
+                  )
                   AND (
                       allowed_role IS NULL
                       OR allowed_role = $3
@@ -537,6 +544,7 @@ class PostgresCallbackStore:
                 token,
                 organization_id,
                 actor_role,
+                stable_claim_key,
             )
         if row is None:
             return None
@@ -549,11 +557,32 @@ class PostgresCallbackStore:
             expires_at=row["expires_at"],
         )
 
+    async def complete(
+        self,
+        *,
+        token: str,
+        organization_id: str,
+        claim_key: str,
+    ) -> bool:
+        async with self._pool.acquire() as connection:
+            result = await connection.execute(
+                """
+                UPDATE callback_actions SET completed_at = now()
+                WHERE token = $1 AND organization_id = $2
+                  AND claim_key = $3 AND completed_at IS NULL
+                """,
+                token,
+                organization_id,
+                claim_key,
+            )
+        return result == "UPDATE 1"
+
     async def peek_action(
         self,
         *,
         token: str,
         organization_id: str,
+        claim_key: str | None = None,
     ) -> str | None:
         """Identify a callback route without authorizing or consuming it."""
         async with self._pool.acquire() as connection:
@@ -561,10 +590,15 @@ class PostgresCallbackStore:
                 """
                 SELECT action FROM callback_actions
                 WHERE token = $1 AND organization_id = $2
-                  AND revoked_at IS NULL AND expires_at > now()
+                  AND (
+                      revoked_at IS NULL
+                      OR (claim_key = $3 AND completed_at IS NULL)
+                  )
+                  AND expires_at > now()
                 """,
                 token,
                 organization_id,
+                claim_key,
             )
         return str(action) if action is not None else None
 

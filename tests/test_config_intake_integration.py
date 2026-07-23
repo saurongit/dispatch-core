@@ -67,9 +67,7 @@ class FakePackStore:
 class FakeSessionStore:
     store: dict[str, dict[str, Any]] = field(default_factory=dict)
 
-    async def get(
-        self, organization_id: str, actor_id: str
-    ) -> dict[str, Any] | None:
+    async def get(self, organization_id: str, actor_id: str) -> dict[str, Any] | None:
         value = self.store.get(f"{organization_id}:{actor_id}")
         return dict(value) if value is not None else None
 
@@ -91,7 +89,7 @@ class FakeSessionStore:
 class FakeService:
     orders: list[dict[str, Any]] = field(default_factory=list)
 
-    async def create_order(self, **values: Any) -> None:
+    async def create_order_once(self, **values: Any) -> None:
         self.orders.append(values)
 
 

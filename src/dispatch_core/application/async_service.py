@@ -5,11 +5,8 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from dispatch_core.domain.tracking import (
-    LocationSource,
-    TrackingPoint,
-    TrackingSession,
-)
+from dispatch_core.domain.errors import ConcurrencyConflict
+from dispatch_core.domain.tracking import LocationSource, TrackingPoint, TrackingSession
 from dispatch_core.domain.work_order import (
     CompletionReport,
     EvidenceRequirements,
@@ -20,6 +17,19 @@ from dispatch_core.domain.work_order import (
 from .async_ports import AsyncUnitOfWorkFactory
 
 OrderChange = Callable[[WorkOrder], None]
+
+
+def _same_submission(existing: WorkOrder, candidate: WorkOrder) -> bool:
+    """Match immutable creation intent, allowing the existing order to advance."""
+    return (
+        existing.id == candidate.id
+        and existing.organization_id == candidate.organization_id
+        and existing.work_type == candidate.work_type
+        and existing.source == candidate.source
+        and existing.requester_id == candidate.requester_id
+        and existing.details == candidate.details
+        and existing.evidence_requirements == candidate.evidence_requirements
+    )
 
 
 class AsyncDispatchService:
@@ -48,6 +58,42 @@ class AsyncDispatchService:
             requester_id=requester_id,
             evidence_requirements=evidence_requirements,
         )
+        return await self._persist_new_order(order)
+
+    async def create_order_once(
+        self,
+        *,
+        order_id: str,
+        organization_id: str,
+        work_type: str,
+        source: str,
+        details: Mapping[str, Any],
+        requester_id: str | None = None,
+        evidence_requirements: EvidenceRequirements | None = None,
+    ) -> WorkOrder:
+        """Create one logical submission, safely retrying an ambiguous result."""
+        candidate = WorkOrder.create(
+            order_id=order_id,
+            organization_id=organization_id,
+            work_type=work_type,
+            source=source,
+            details=details,
+            requester_id=requester_id,
+            evidence_requirements=evidence_requirements,
+        )
+        try:
+            return await self._persist_new_order(candidate)
+        except ConcurrencyConflict as conflict:
+            async with self._unit_of_work() as uow:
+                existing = await uow.orders.get(organization_id, order_id)
+                if not _same_submission(existing, candidate):
+                    raise ConcurrencyConflict(
+                        f"work order {order_id!r} belongs to a different submission"
+                    ) from conflict
+                await uow.commit()
+            return existing
+
+    async def _persist_new_order(self, order: WorkOrder) -> WorkOrder:
         async with self._unit_of_work() as uow:
             await uow.orders.save(order, expected_version=None)
             await uow.outbox.add(order.pull_events())
@@ -178,9 +224,7 @@ class AsyncDispatchService:
             if session.executor_id != executor_id:
                 from dispatch_core.domain.errors import InvalidTransition
 
-                raise InvalidTransition(
-                    "session does not belong to this executor"
-                )
+                raise InvalidTransition("session does not belong to this executor")
             expected_version = session.version
             now = datetime.now(UTC)
             observed_at = captured_at or now
