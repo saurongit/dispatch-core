@@ -55,6 +55,20 @@ OpenStreetMap attribution is visible on the map. The public OSM raster service
 has no SLA and can withdraw commercial access; use a suitable provider or
 self-hosted tiles before material paid traffic.
 
+## Configure the service in the admin bot
+
+Each organisation has one designated administrator-owner. In Telegram the
+sections are available through `/brand`, `/services`, `/fields`, `/evidence`,
+`/allocation`, `/role_labels`, `/versions`, `/operators`, `/preview` and
+`/publish`. In MAX the same actions are buttons in the shared staff bot after
+selecting the administrator role.
+
+The configurator maintains one draft and does not change the active client flow
+until `/publish`. `/versions` can discard unpublished changes or copy an active
+or archived revision into the draft. A restored revision always requires
+preview and explicit publish. Client requests already in progress remain on
+the form revision with which they started.
+
 ## Register actors
 
 The normal messenger flow does not require copying an external ID. The

@@ -155,10 +155,12 @@ def operator_order_card(
 ) -> str:
     details = _details(order)
     status = str(order.get("status") or "")
+    client_label = _role_label(pack, "client", "Клиент")
+    master_label = _role_label(pack, "master", "Мастер")
     lines = [
         f"{status_emoji(status)} Заявка {order_number(order)}",
         "",
-        f"👤 Клиент: {_first(details, 'client_name', 'name') or 'не указан'}",
+        f"👤 {client_label}: {_first(details, 'client_name', 'name') or 'не указан'}",
         "📞 Телефон:",
         phone_display(_first(details, "phone", "client_phone")),
         "⬇️ Нажмите на номер выше ⬇️",
@@ -186,7 +188,7 @@ def operator_order_card(
         )
     )
     if order.get("master_name"):
-        lines.append(f"👨‍🔧 Мастер: {order['master_name']}")
+        lines.append(f"👨‍🔧 {master_label}: {order['master_name']}")
     lines.extend(_extra_fields(details, pack))
     return "\n".join(lines)
 
@@ -198,10 +200,12 @@ def master_order_card(
 ) -> str:
     details = _details(order)
     status = str(order.get("status") or "")
+    client_label = _role_label(pack, "client", "Клиент")
+    master_label = _role_label(pack, "master", "Мастер")
     lines = [
         f"{_MASTER_STATUS_EMOJI.get(status, '📄')} Заявка {order_number(order)}",
         "",
-        f"👤 Клиент: {_first(details, 'client_name', 'name') or '—'}",
+        f"👤 {client_label}: {_first(details, 'client_name', 'name') or '—'}",
         "📞 Телефон:",
         phone_display(_first(details, "phone", "client_phone")),
         f"📍 Адрес объекта: {_first(details, 'address', 'destination') or '—'}",
@@ -225,7 +229,7 @@ def master_order_card(
         lines.append(f"🗓 Когда нужен мастер: {_datetime_text(schedule)}")
     lines.append(f"📊 Статус: {status_label(status)}")
     if order.get("master_name"):
-        lines.append(f"👨‍🔧 Мастер: {order['master_name']}")
+        lines.append(f"👨‍🔧 {master_label}: {order['master_name']}")
     lines.extend(_extra_fields(details, pack))
     return "\n".join(lines)
 
@@ -268,6 +272,16 @@ def _extra_fields(
         if value not in (None, ""):
             lines.append(f"🔹 {definition.label}: {value}")
     return lines
+
+
+def _role_label(
+    pack: PackDefinition | None,
+    role: str,
+    fallback: str,
+) -> str:
+    if pack is None:
+        return fallback
+    return str(pack.role_labels.get(role) or fallback)
 
 
 def _datetime_text(value: Any) -> str:

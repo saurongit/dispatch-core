@@ -7,13 +7,17 @@ import pytest
 
 from dispatch_core.application.identity import ActorIdentity
 from dispatch_core.domain.errors import NotFound
-from dispatch_core.domain.work_order import EvidenceRequirements
+from dispatch_core.domain.work_order import EvidenceRequirements, PoolMode
+from dispatch_core.infrastructure.pack_store import PackRevision
 from dispatch_core.messaging.config import (
     CONFIG_ADD_OPERATOR,
+    CONFIG_ALLOCATION,
     CONFIG_BRAND,
     CONFIG_CANCEL,
     CONFIG_DEL_OPERATOR,
     CONFIG_DEL_OPERATOR_CONFIRM,
+    CONFIG_DISCARD_DRAFT,
+    CONFIG_DISCARD_DRAFT_CONFIRM,
     CONFIG_EDIT_OPERATOR_PHONE,
     CONFIG_EVIDENCE,
     CONFIG_EVIDENCE_CODE,
@@ -23,6 +27,8 @@ from dispatch_core.messaging.config import (
     CONFIG_EVIDENCE_SIGNATURE,
     CONFIG_FIELD_ADD,
     CONFIG_FIELD_DELETE,
+    CONFIG_FIELD_MOVE,
+    CONFIG_FIELD_PROMPT,
     CONFIG_FIELD_REQUIRED,
     CONFIG_FIELD_TYPE,
     CONFIG_FIELDS,
@@ -31,10 +37,18 @@ from dispatch_core.messaging.config import (
     CONFIG_OPERATOR_INFO,
     CONFIG_OWNER_NANO,
     CONFIG_OWNER_ROLES,
+    CONFIG_POOL_MODE,
     CONFIG_PUBLISH,
+    CONFIG_RESTORE_VERSION,
+    CONFIG_RESTORE_VERSION_CONFIRM,
+    CONFIG_ROLE_LABEL_EDIT,
+    CONFIG_ROLE_LABELS,
     CONFIG_SERVICE_ADD,
     CONFIG_SERVICE_DELETE,
+    CONFIG_SERVICE_MOVE,
+    CONFIG_SERVICE_MULTI_SELECT,
     CONFIG_SERVICES,
+    CONFIG_VERSIONS,
     ConfigCoordinator,
 )
 from dispatch_core.messaging.models import Provider
@@ -58,6 +72,9 @@ def admin(provider: Provider = Provider.TELEGRAM) -> ActorIdentity:
         provider=provider,
         external_user_id="100",
     )
+
+
+SESSION_KEY = "org-1:admin:100:telegram"
 
 
 def _complete_pack() -> PackDefinition:
@@ -107,12 +124,48 @@ class FakePackStore:
     _published_version: int | None = None
     _publish_error: Exception | None = None
     update_failures: int = 0
+    _history: dict[int, PackDefinition] = field(default_factory=dict)
 
     async def active(self, organization_id: str) -> PackDefinition | None:
         return self._active
 
     async def draft(self, organization_id: str) -> PackDefinition | None:
         return self._draft
+
+    async def revision(self, organization_id: str, version: int) -> PackRevision | None:
+        definition = self._history.get(version)
+        if definition is None and self._active is not None:
+            active_version = self._published_version or 1
+            if version == active_version:
+                definition = self._active
+        if definition is None:
+            return None
+        state = "active" if version == (self._published_version or 1) else "archived"
+        return PackRevision(version, state, definition)
+
+    async def revisions(self, organization_id: str) -> tuple[PackRevision, ...]:
+        rows: list[PackRevision] = []
+        active_version = self._published_version or 1
+        if self._draft is not None:
+            rows.append(PackRevision(active_version + 1, "draft", self._draft))
+        if self._active is not None:
+            rows.append(PackRevision(active_version, "active", self._active))
+        for version, definition in sorted(self._history.items(), reverse=True):
+            if version != active_version:
+                rows.append(PackRevision(version, "archived", definition))
+        return tuple(rows)
+
+    async def discard_draft(self, organization_id: str) -> bool:
+        existed = self._draft is not None
+        self._draft = None
+        return existed
+
+    async def restore_as_draft(self, organization_id: str, version: int) -> int:
+        revision = await self.revision(organization_id, version)
+        if revision is None:
+            raise NotFound("no version")
+        self._draft = revision.definition
+        return (self._published_version or 1) + 1
 
     async def ensure_draft(
         self, organization_id: str, *, seed: PackDefinition
@@ -134,9 +187,12 @@ class FakePackStore:
             raise self._publish_error
         if self._draft is None:
             raise NotFound("no draft")
+        if self._active is not None:
+            self._history[self._published_version or 1] = self._active
         self._active = self._draft
         self._draft = None
         self._published_version = (self._published_version or 0) + 1
+        self._history[self._published_version] = self._active
         return self._published_version
 
 
@@ -145,8 +201,14 @@ class FakeSessionStore:
     store: dict[str, dict[str, Any]] = field(default_factory=dict)
     clear_failures: int = 0
 
-    async def get(self, organization_id: str, actor_id: str) -> dict[str, Any] | None:
-        value = self.store.get(f"{organization_id}:{actor_id}")
+    @staticmethod
+    def key(organization_id: str, actor_id: str, provider: Provider) -> str:
+        return f"{organization_id}:{actor_id}:{provider.value}"
+
+    async def get(
+        self, organization_id: str, actor_id: str, provider: Provider
+    ) -> dict[str, Any] | None:
+        value = self.store.get(self.key(organization_id, actor_id, provider))
         return dict(value) if value is not None else None
 
     async def put(
@@ -157,13 +219,15 @@ class FakeSessionStore:
         provider: Provider,
         state: dict[str, Any],
     ) -> None:
-        self.store[f"{organization_id}:{actor_id}"] = dict(state)
+        self.store[self.key(organization_id, actor_id, provider)] = dict(state)
 
-    async def clear(self, organization_id: str, actor_id: str) -> None:
+    async def clear(
+        self, organization_id: str, actor_id: str, provider: Provider
+    ) -> None:
         if self.clear_failures:
             self.clear_failures -= 1
             raise RuntimeError("session storage unavailable")
-        self.store.pop(f"{organization_id}:{actor_id}", None)
+        self.store.pop(self.key(organization_id, actor_id, provider), None)
 
 
 @dataclass
@@ -346,7 +410,7 @@ async def test_operator_creation_retry_does_not_duplicate_actor() -> None:
     target, _, sessions = coordinator(identities=identities)
     who = admin()
     await target.handle_callback(who, CONFIG_ADD_OPERATOR, {})
-    request_key = sessions.store["org-1:admin:100"]["request_key"]
+    request_key = sessions.store[SESSION_KEY]["request_key"]
     await target.handle_text(who, "Анна")
     sessions.clear_failures = 1
 
@@ -354,7 +418,7 @@ async def test_operator_creation_retry_does_not_duplicate_actor() -> None:
         await target.handle_text(who, "89991112233")
 
     assert len(identities.actors) == 1
-    assert sessions.store["org-1:admin:100"]["request_key"] == request_key
+    assert sessions.store[SESSION_KEY]["request_key"] == request_key
     reply = await target.handle_text(who, "89991112233")
     assert "код привязки: 1234" in reply.text.lower()
     assert len(identities.actors) == 1
@@ -446,7 +510,7 @@ async def test_unknown_command_shows_menu() -> None:
 async def test_text_during_active_flow_is_consumed() -> None:
     target, _, sessions = coordinator(draft=_complete_pack())
     await target.handle_text(admin(), "/brand")
-    assert sessions.store["org-1:admin:100"]["flow"] == "brand"
+    assert sessions.store[SESSION_KEY]["flow"] == "brand"
     reply = await target.handle_text(admin(), "MyBrand")
     assert "приветствие" in reply.text.lower()
 
@@ -455,9 +519,9 @@ async def test_text_during_active_flow_is_consumed() -> None:
 async def test_command_during_flow_clears_session() -> None:
     target, _, sessions = coordinator(draft=_complete_pack())
     await target.handle_text(admin(), "/brand")
-    assert "org-1:admin:100" in sessions.store
+    assert SESSION_KEY in sessions.store
     reply = await target.handle_text(admin(), "/services")
-    assert "org-1:admin:100" not in sessions.store
+    assert SESSION_KEY not in sessions.store
     assert "услуги" in reply.text.lower()
 
 
@@ -482,7 +546,7 @@ async def test_brand_full_flow() -> None:
     reply = await target.handle_text(admin(), "8-800")
     assert "обновлён" in reply.text.lower()
     assert packs._draft.branding.support == "8-800"
-    assert "org-1:admin:100" not in sessions.store
+    assert SESSION_KEY not in sessions.store
 
 
 @pytest.mark.asyncio
@@ -493,7 +557,7 @@ async def test_brand_skip_support_with_dash() -> None:
     await target.handle_text(admin(), "Hello")
     await target.handle_text(admin(), "-")
     assert packs._draft.branding.support == ""
-    assert "org-1:admin:100" not in sessions.store
+    assert SESSION_KEY not in sessions.store
 
 
 @pytest.mark.asyncio
@@ -502,7 +566,7 @@ async def test_brand_empty_name_rejected() -> None:
     await target.handle_text(admin(), "/brand")
     reply = await target.handle_text(admin(), "")
     assert "пустым" in reply.text.lower()
-    assert sessions.store["org-1:admin:100"]["step"] == "name"
+    assert sessions.store[SESSION_KEY]["step"] == "name"
 
 
 # ---------------------------------------------------------------------------
@@ -540,7 +604,7 @@ async def test_services_empty_label_rejected() -> None:
     await target.handle_callback(admin(), CONFIG_SERVICE_ADD, {})
     reply = await target.handle_text(admin(), "")
     assert "пустым" in reply.text.lower()
-    assert sessions.store["org-1:admin:100"]["step"] == "label"
+    assert sessions.store[SESSION_KEY]["step"] == "label"
 
 
 @pytest.mark.asyncio
@@ -552,7 +616,7 @@ async def test_service_save_failure_preserves_flow_for_inbox_retry() -> None:
     with pytest.raises(RuntimeError, match="pack storage"):
         await target.handle_text(admin(), "Ремонт")
 
-    assert sessions.store["org-1:admin:100"]["flow"] == "service_add"
+    assert sessions.store[SESSION_KEY]["flow"] == "service_add"
     await target.handle_text(admin(), "Ремонт")
     assert packs._draft is not None
     assert [item.label for item in packs._draft.service_catalog.categories] == [
@@ -569,7 +633,7 @@ async def test_service_clear_failure_retry_does_not_duplicate_item() -> None:
     with pytest.raises(RuntimeError, match="session storage"):
         await target.handle_text(admin(), "Ремонт")
 
-    assert sessions.store["org-1:admin:100"]["flow"] == "service_add"
+    assert sessions.store[SESSION_KEY]["flow"] == "service_add"
     await target.handle_text(admin(), "Ремонт")
     assert packs._draft is not None
     assert [item.label for item in packs._draft.service_catalog.categories] == [
@@ -597,7 +661,7 @@ async def test_fields_add_full_flow() -> None:
     await target.handle_callback(admin(), CONFIG_FIELD_ADD, {})
     reply = await target.handle_text(admin(), "Телефон")
     assert "тип поля" in reply.text.lower()
-    assert sessions.store["org-1:admin:100"]["scratch"]["label"] == "Телефон"
+    assert sessions.store[SESSION_KEY]["scratch"]["label"] == "Телефон"
 
     reply = await target.handle_callback(admin(), CONFIG_FIELD_TYPE, {"type": "text"})
     assert "обязательн" in reply.text.lower()
@@ -610,7 +674,7 @@ async def test_fields_add_full_flow() -> None:
     assert len(packs._draft.fields) == 1
     assert packs._draft.fields[0].key == "field"
     assert packs._draft.fields[0].required is True
-    assert "org-1:admin:100" not in sessions.store
+    assert SESSION_KEY not in sessions.store
 
 
 @pytest.mark.asyncio
@@ -810,10 +874,10 @@ async def test_publish_validation_error() -> None:
 async def test_cancel_clears_session() -> None:
     target, _, sessions = coordinator(draft=_complete_pack())
     await target.handle_text(admin(), "/brand")
-    assert "org-1:admin:100" in sessions.store
+    assert SESSION_KEY in sessions.store
     reply = await target.handle_callback(admin(), CONFIG_CANCEL, {})
     assert "отменено" in reply.text.lower()
-    assert "org-1:admin:100" not in sessions.store
+    assert SESSION_KEY not in sessions.store
 
 
 @pytest.mark.asyncio
@@ -834,6 +898,135 @@ async def test_menu_callback_returns_menu() -> None:
     reply = await target.handle_callback(admin(), CONFIG_MENU, {})
     assert "панель администратора" in reply.text.lower()
     assert "TestCo" in reply.text
+
+
+# ---------------------------------------------------------------------------
+# Complete pack controls
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_admin_sessions_are_isolated_by_provider() -> None:
+    target, _, sessions = coordinator(draft=_complete_pack())
+    telegram = admin(Provider.TELEGRAM)
+    maximum = admin(Provider.MAX)
+
+    await target.handle_text(telegram, "/brand")
+    await target.handle_callback(maximum, CONFIG_SERVICE_ADD, {})
+
+    assert sessions.store["org-1:admin:100:telegram"]["flow"] == "brand"
+    assert sessions.store["org-1:admin:100:max"]["flow"] == "service_add"
+
+
+@pytest.mark.asyncio
+async def test_service_selection_mode_and_order_are_configurable() -> None:
+    target, packs, _ = coordinator(draft=_complete_pack())
+
+    await target.handle_callback(admin(), CONFIG_SERVICE_MULTI_SELECT, {})
+    assert packs._draft is not None
+    assert packs._draft.service_catalog.multi_select is False
+
+    await target.handle_callback(
+        admin(),
+        CONFIG_SERVICE_MOVE,
+        {"key": "install", "direction": "up"},
+    )
+    assert [item.key for item in packs._draft.service_catalog.categories] == [
+        "install",
+        "repair",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_enum_field_choices_prompt_and_order_are_configurable() -> None:
+    target, packs, _ = coordinator(draft=_complete_pack())
+    who = admin()
+
+    await target.handle_callback(who, CONFIG_FIELD_ADD, {})
+    await target.handle_text(who, "Срочность")
+    reply = await target.handle_callback(
+        who,
+        CONFIG_FIELD_TYPE,
+        {"type": FieldType.ENUM.value},
+    )
+    assert "варианты" in reply.text.lower()
+    reply = await target.handle_text(who, "Обычная")
+    assert "минимум два" in reply.text.lower()
+    await target.handle_text(who, "Обычная, Срочная")
+    await target.handle_callback(who, CONFIG_FIELD_REQUIRED, {"required": True})
+
+    assert packs._draft is not None
+    enum_field = next(item for item in packs._draft.fields if item.label == "Срочность")
+    assert enum_field.choices == ("Обычная", "Срочная")
+
+    await target.handle_callback(
+        who,
+        CONFIG_FIELD_PROMPT,
+        {"key": enum_field.key},
+    )
+    await target.handle_text(who, "Насколько срочно выполнить работу?")
+    enum_field = next(item for item in packs._draft.fields if item.label == "Срочность")
+    assert enum_field.prompt == "Насколько срочно выполнить работу?"
+
+    await target.handle_callback(
+        who,
+        CONFIG_FIELD_MOVE,
+        {"key": enum_field.key, "direction": "up"},
+    )
+    assert packs._draft.ordered_fields()[-2].key == enum_field.key
+
+
+@pytest.mark.asyncio
+async def test_allocation_and_role_labels_are_configurable() -> None:
+    target, packs, _ = coordinator(draft=_complete_pack())
+    who = admin()
+
+    reply = await target.handle_callback(who, CONFIG_ALLOCATION, {})
+    assert "оператор выбирает" in reply.text.lower()
+    await target.handle_callback(
+        who,
+        CONFIG_POOL_MODE,
+        {"mode": PoolMode.FIRST_CLAIM.value},
+    )
+    assert packs._draft is not None
+    assert packs._draft.default_pool_mode is PoolMode.FIRST_CLAIM
+
+    await target.handle_callback(who, CONFIG_ROLE_LABELS, {})
+    await target.handle_callback(
+        who,
+        CONFIG_ROLE_LABEL_EDIT,
+        {"role": "master"},
+    )
+    await target.handle_text(who, "Выездной специалист")
+    assert packs._draft.role_labels["master"] == "Выездной специалист"
+
+
+@pytest.mark.asyncio
+async def test_draft_can_be_discarded_and_active_version_restored() -> None:
+    target, packs, _ = coordinator(
+        draft=blank_definition(),
+        active=_complete_pack(),
+    )
+    who = admin()
+
+    reply = await target.handle_callback(who, CONFIG_VERSIONS, {})
+    assert CONFIG_DISCARD_DRAFT in {button.action for button in reply.buttons}
+    await target.handle_callback(who, CONFIG_DISCARD_DRAFT, {})
+    await target.handle_callback(who, CONFIG_DISCARD_DRAFT_CONFIRM, {})
+    assert packs._draft is None
+
+    reply = await target.handle_callback(who, CONFIG_VERSIONS, {})
+    restore = next(
+        button for button in reply.buttons if button.action == CONFIG_RESTORE_VERSION
+    )
+    reply = await target.handle_callback(who, restore.action, restore.payload)
+    confirm = next(
+        button
+        for button in reply.buttons
+        if button.action == CONFIG_RESTORE_VERSION_CONFIRM
+    )
+    await target.handle_callback(who, confirm.action, confirm.payload)
+    assert packs._draft == packs._active
 
 
 # ---------------------------------------------------------------------------

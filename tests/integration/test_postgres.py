@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from asyncpg import UniqueViolationError
 
 from dispatch_core.api import create_app
 from dispatch_core.api.settings import Settings
@@ -48,6 +49,7 @@ from dispatch_core.infrastructure.workflow_store import (
     PostgresStaffBindingSessionStore,
     PostgresStaffRoleSelectionStore,
 )
+from dispatch_core.messaging.config import ConfigCoordinator
 from dispatch_core.messaging.intake import IntakeCoordinator
 from dispatch_core.messaging.models import OutboundButton, Provider
 from dispatch_core.messaging.processor import InboundProcessor
@@ -240,10 +242,7 @@ async def test_concurrent_creates_allocate_unique_public_numbers(
 
     public_numbers = {order.public_number for order in orders}
     assert len(public_numbers) == 100
-    assert public_numbers == {
-        f"A{index:03d}"
-        for index in range(100)
-    }
+    assert public_numbers == {f"A{index:03d}" for index in range(100)}
     assert database.pool is not None
     async with database.pool.acquire() as connection:
         total, distinct = await connection.fetchrow(
@@ -284,6 +283,23 @@ async def test_pack_store_full_draft_publish_lifecycle(
     assert await packs.publish_draft(organization) == 2
     assert await packs.draft(organization) is None
     assert (await packs.active(organization)).to_json() == initial.to_json()
+    active = await packs.active_revision(organization)
+    assert active is not None
+    assert active.version == 2
+    archived = await packs.revision(organization, 1)
+    assert archived is not None
+    assert archived.state == "archived"
+    assert [revision.state for revision in await packs.revisions(organization)] == [
+        "active",
+        "archived",
+    ]
+
+    assert await packs.restore_as_draft(organization, 1) == 3
+    assert (await packs.draft(organization)).to_json() == initial.to_json()
+    assert await packs.discard_draft(organization)
+    assert not await packs.discard_draft(organization)
+    with pytest.raises(NotFound, match="pack version"):
+        await packs.restore_as_draft(organization, 404)
 
     with pytest.raises(NotFound, match="no draft"):
         await packs.update_draft(organization, replacement)
@@ -1211,7 +1227,7 @@ async def test_generic_workflow_sessions_and_empty_report_cleanup(
     for actor_id, role in (
         ("client-1", "client"),
         ("admin-1", "admin"),
-        ("admin-2", "admin"),
+        ("session-2", "client"),
     ):
         await identities.upsert_actor(
             organization_id=organization,
@@ -1236,20 +1252,53 @@ async def test_generic_workflow_sessions_and_empty_report_cleanup(
         provider=Provider.MAX,
         state={"flow": "brand"},
     )
+    await config.put(
+        organization_id=organization,
+        actor_id="admin-1",
+        provider=Provider.TELEGRAM,
+        state={"flow": "service_add"},
+    )
+    assert await config.get(organization, "admin-1", Provider.MAX) == {"flow": "brand"}
+    assert await config.get(organization, "admin-1", Provider.TELEGRAM) == {
+        "flow": "service_add"
+    }
     assert (
         await config.cleanup_stale(
             max_age_hours=-1,
             organization_id=organization,
         )
-        == 1
+        == 2
     )
     await config.put(
         organization_id=organization,
-        actor_id="admin-2",
+        actor_id="session-2",
         provider=Provider.MAX,
         state={"flow": "services"},
     )
     assert await config.cleanup_stale(max_age_hours=-1) == 1
+
+
+@pytest.mark.asyncio
+async def test_only_one_active_admin_is_allowed_per_organization(
+    database: PostgresDatabase,
+    organization: str,
+) -> None:
+    assert database.pool is not None
+    identities = PostgresIdentityStore(database.pool)
+    await identities.upsert_actor(
+        organization_id=organization,
+        actor_id="owner-1",
+        role="admin",
+        display_name="Owner One",
+    )
+
+    with pytest.raises(UniqueViolationError):
+        await identities.upsert_actor(
+            organization_id=organization,
+            actor_id="owner-2",
+            role="admin",
+            display_name="Owner Two",
+        )
 
 
 @pytest.mark.asyncio
@@ -2563,6 +2612,196 @@ async def accept_telegram_update(
         payload=update,
         consumer_key=consumer_key,
     )
+
+
+@pytest.mark.asyncio
+async def test_admin_provider_flow_publishes_pack_used_by_client_processor(
+    database: PostgresDatabase,
+    organization: str,
+) -> None:
+    assert database.pool is not None
+    pool = database.pool
+    identities = PostgresIdentityStore(pool)
+    await identities.upsert_actor(
+        organization_id=organization,
+        actor_id="admin-owner",
+        role="admin",
+        display_name="Owner",
+        provider=Provider.TELEGRAM,
+        external_user_id="6101",
+    )
+    packs = PostgresPackStore(pool)
+    inbox = PostgresInboxStore(pool)
+    callbacks = PostgresCallbackStore(pool)
+    outbound = PostgresOutboundStore(pool)
+    commands = service(database)
+    transport_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"ok": True, "result": True})
+        )
+    )
+    transport = TelegramTransport("test-token", client=transport_client)
+    config = ConfigCoordinator(
+        packs=packs,
+        sessions=PostgresConfigSessionStore(pool),
+        identities=identities,
+    )
+    admin_processor = InboundProcessor(
+        inbox=inbox,
+        identities=identities,
+        callbacks=callbacks,
+        executions=PostgresExecutionStore(pool),
+        drafts=PostgresReportDraftStore(pool),
+        outbound=outbound,
+        service=commands,
+        reader=PostgresOrderReader(pool),
+        transports={Provider.TELEGRAM: transport},
+        packs=packs,
+        config=config,
+        organization_id=organization,
+        consumer_key="admin",
+    )
+    update_id = 10_000
+
+    async def admin_says(text: str) -> None:
+        nonlocal update_id
+        update_id += 1
+        await accept_telegram_update(
+            inbox,
+            organization,
+            update_id,
+            {
+                "message": {
+                    "from": {"id": 6101},
+                    "chat": {"id": 6101},
+                    "text": text,
+                }
+            },
+            "admin",
+        )
+        assert await admin_processor.run_once() == 1
+
+    async def admin_click(button_text: str) -> None:
+        nonlocal update_id
+        token = await callback_token(database, organization, "6101", button_text)
+        update_id += 1
+        await accept_telegram_update(
+            inbox,
+            organization,
+            update_id,
+            {
+                "callback_query": {
+                    "id": f"admin-cb-{update_id}",
+                    "from": {"id": 6101},
+                    "message": {"chat": {"id": 6101}},
+                    "data": f"dc1:{token}",
+                }
+            },
+            "admin",
+        )
+        assert await admin_processor.run_once() == 1
+
+    await admin_says("/brand")
+    await admin_says("Выезд Профи")
+    await admin_says("Здравствуйте! Оформим заявку за минуту.")
+    await admin_says("+7 900 000-00-00")
+    await admin_says("/services")
+    await admin_click("Добавить услугу")
+    await admin_says("Ремонт")
+    await admin_says("/fields")
+    await admin_click("Добавить поле")
+    await admin_says("Адрес")
+    await admin_click("Адрес")
+    await admin_click("Да")
+    await admin_says("/publish")
+
+    active = await packs.active_revision(organization)
+    assert active is not None
+    assert active.definition.branding.name == "Выезд Профи"
+    assert active.definition.fields[0].key == "address"
+
+    intake = IntakeCoordinator(
+        packs=packs,
+        sessions=PostgresIntakeSessionStore(pool),
+        service=commands,
+    )
+    client_processor = InboundProcessor(
+        inbox=inbox,
+        identities=identities,
+        callbacks=callbacks,
+        executions=PostgresExecutionStore(pool),
+        drafts=PostgresReportDraftStore(pool),
+        outbound=outbound,
+        service=commands,
+        reader=PostgresOrderReader(pool),
+        transports={Provider.TELEGRAM: transport},
+        packs=packs,
+        intake=intake,
+        organization_id=organization,
+        consumer_key="client",
+    )
+
+    async def client_says(text: str) -> None:
+        nonlocal update_id
+        update_id += 1
+        await accept_telegram_update(
+            inbox,
+            organization,
+            update_id,
+            {
+                "message": {
+                    "from": {"id": 6201},
+                    "chat": {"id": 6201},
+                    "text": text,
+                }
+            },
+            "client",
+        )
+        assert await client_processor.run_once() == 1
+
+    async def client_click(button_text: str) -> None:
+        nonlocal update_id
+        token = await callback_token(database, organization, "6201", button_text)
+        update_id += 1
+        await accept_telegram_update(
+            inbox,
+            organization,
+            update_id,
+            {
+                "callback_query": {
+                    "id": f"client-cb-{update_id}",
+                    "from": {"id": 6201},
+                    "message": {"chat": {"id": 6201}},
+                    "data": f"dc1:{token}",
+                }
+            },
+            "client",
+        )
+        assert await client_processor.run_once() == 1
+
+    await client_says("Здравствуйте")
+    await client_says("+7 999 123-45-67")
+    await client_says("Кирова 10")
+    await client_click("Ремонт")
+    await client_click("Готово")
+    await client_click("Отправить")
+    await transport_client.aclose()
+
+    async with pool.acquire() as connection:
+        row = await connection.fetchrow(
+            """
+            SELECT details FROM work_orders
+            WHERE organization_id = $1 AND requester_id = 'telegram:6201'
+            """,
+            organization,
+        )
+    assert row is not None
+    details = row["details"]
+    if isinstance(details, str):
+        details = json.loads(details)
+    assert details["services"] == ["Ремонт"]
+    assert details["address"] == "Кирова 10"
+    assert details["pack_version"] == active.version
 
 
 @pytest.mark.asyncio

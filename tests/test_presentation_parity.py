@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -14,6 +14,7 @@ from dispatch_core.messaging.workspaces import (
     OPERATOR_LIST_ORDERS,
     OperatorCoordinator,
 )
+from dispatch_core.packs.catalog import seed_definition
 
 
 def _order() -> dict[str, Any]:
@@ -68,6 +69,26 @@ def test_master_card_matches_the_canonical_snapshot() -> None:
         "📊 Статус: 👤 Назначена\n"
         "👨‍🔧 Мастер: Антон"
     )
+
+
+def test_pack_role_labels_are_used_in_order_cards() -> None:
+    base = seed_definition("field_service")
+    pack = replace(
+        base,
+        role_labels={
+            **base.role_labels,
+            "client": "Заказчик",
+            "master": "Специалист",
+        },
+    )
+
+    operator = operator_order_card(_order(), pack=pack)
+    master = master_order_card(_order(), pack=pack)
+
+    assert "👤 Заказчик: Иван" in operator
+    assert "👨‍🔧 Специалист: Антон" in operator
+    assert "👤 Заказчик: Иван" in master
+    assert "👨‍🔧 Специалист: Антон" in master
 
 
 @dataclass

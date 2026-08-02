@@ -6,10 +6,12 @@ from typing import Any
 import pytest
 
 from dispatch_core.application.identity import ActorIdentity
+from dispatch_core.infrastructure.pack_store import PackRevision
 from dispatch_core.messaging.intake import (
     INTAKE_CANCEL,
     INTAKE_CONFIRM,
     INTAKE_CONTINUE_AFTER_MAP,
+    INTAKE_FIELD_CHOICE,
     INTAKE_PICK_SERVICE,
     INTAKE_REQUEST_LOCATION,
     INTAKE_SERVICES_DONE,
@@ -17,7 +19,14 @@ from dispatch_core.messaging.intake import (
     IntakeCoordinator,
 )
 from dispatch_core.messaging.models import Provider
-from dispatch_core.packs.catalog import PackDefinition, ServiceCatalog, seed_definition
+from dispatch_core.packs.catalog import (
+    FieldDefinition,
+    FieldType,
+    PackDefinition,
+    ServiceCatalog,
+    ServiceCategory,
+    seed_definition,
+)
 
 
 def identity() -> ActorIdentity:
@@ -34,9 +43,24 @@ def identity() -> ActorIdentity:
 @dataclass
 class FakePacks:
     pack: PackDefinition | None
+    version: int = 1
+    revisions: dict[int, PackDefinition] = field(default_factory=dict)
 
     async def active(self, organization_id: str) -> PackDefinition | None:
         return self.pack
+
+    async def active_revision(self, organization_id: str) -> PackRevision | None:
+        if self.pack is None:
+            return None
+        self.revisions.setdefault(self.version, self.pack)
+        return PackRevision(self.version, "active", self.pack)
+
+    async def revision(self, organization_id: str, version: int) -> PackRevision | None:
+        definition = self.revisions.get(version)
+        if definition is None:
+            return None
+        state = "active" if version == self.version else "archived"
+        return PackRevision(version, state, definition)
 
 
 @dataclass
@@ -111,6 +135,7 @@ async def test_start_asks_for_phone() -> None:
     assert INTAKE_CANCEL in actions
     state = sessions.store["org-1:telegram:7001"]
     assert state["step"] == "phone"
+    assert state["pack_version"] == 1
     assert len(state["submission_id"]) == 36
 
 
@@ -432,17 +457,28 @@ async def test_text_without_session_restarts_and_confirm_text_shows_buttons() ->
 
 
 @pytest.mark.asyncio
-async def test_text_and_callback_report_pack_removed_mid_flow() -> None:
-    packs = FakePacks(seed_definition("field_service"))
+async def test_active_intake_keeps_pack_revision_after_publish() -> None:
+    original = seed_definition("field_service")
+    packs = FakePacks(original)
     sessions = FakeSessions()
     target = IntakeCoordinator(packs=packs, sessions=sessions, service=FakeService())
     who = identity()
     await target.start(who)
-    packs.pack = None
-    text_reply = await target.handle_text(who, "79990000000")
-    callback_reply = await target.handle_callback(who, INTAKE_CONFIRM, {})
-    assert "не настроен" in text_reply.text.lower()
-    assert "не настроен" in callback_reply.text.lower()
+    packs.version = 2
+    packs.pack = replace(
+        original,
+        service_catalog=ServiceCatalog(
+            categories=(ServiceCategory("new", "Новая услуга"),),
+        ),
+    )
+
+    await target.handle_text(who, "79990000000")
+    reply = await target.handle_text(who, "Ленина 10")
+
+    labels = {button.text for button in reply.buttons}
+    assert original.service_catalog.categories[0].label in labels
+    assert "Новая услуга" not in labels
+    assert sessions.store["org-1:telegram:7001"]["pack_version"] == 1
 
 
 @pytest.mark.asyncio
@@ -494,6 +530,53 @@ async def test_single_select_service_moves_directly_to_fields() -> None:
     )
     assert reply.text
     assert sessions.store["org-1:telegram:7001"]["step"] == "fields"
+
+
+@pytest.mark.asyncio
+async def test_enum_field_is_rendered_as_buttons_and_validated() -> None:
+    base = seed_definition("field_service")
+    enum_pack = replace(
+        base,
+        fields=(
+            FieldDefinition(
+                "address",
+                "Адрес",
+                FieldType.ADDRESS,
+                required=True,
+                order=1,
+            ),
+            FieldDefinition(
+                "urgency",
+                "Срочность",
+                FieldType.ENUM,
+                required=True,
+                choices=("Обычная", "Срочная"),
+                prompt="Выберите срочность",
+                order=2,
+            ),
+        ),
+    )
+    target, sessions, _ = coordinator(enum_pack)
+    who = identity()
+    await _go_to_services(target, who)
+    await target.handle_callback(who, INTAKE_PICK_SERVICE, {"service": "repair"})
+    reply = await target.handle_callback(who, INTAKE_SERVICES_DONE, {})
+    assert {button.action for button in reply.buttons} == {
+        INTAKE_FIELD_CHOICE,
+        INTAKE_CANCEL,
+    }
+
+    invalid = await target.handle_text(who, "Когда-нибудь")
+    assert "предложенных" in invalid.text.lower()
+    reply = await target.handle_callback(
+        who,
+        INTAKE_FIELD_CHOICE,
+        {"value": "Срочная"},
+    )
+    assert INTAKE_CONFIRM in {button.action for button in reply.buttons}
+    assert sessions.store["org-1:telegram:7001"]["field_values"]["urgency"] == (
+        "Срочная"
+    )
 
 
 @pytest.mark.asyncio

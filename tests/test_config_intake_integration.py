@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from dispatch_core.application.identity import ActorIdentity
+from dispatch_core.infrastructure.pack_store import PackRevision
 from dispatch_core.messaging.config import (
     CONFIG_EVIDENCE_PHOTO_INC,
     CONFIG_FIELD_ADD,
@@ -34,9 +35,23 @@ from dispatch_core.packs.catalog import PackDefinition
 class FakePackStore:
     _draft: PackDefinition | None = None
     _active: PackDefinition | None = None
+    _active_version: int = 0
+    _revisions: dict[int, PackDefinition] = field(default_factory=dict)
 
     async def active(self, organization_id: str) -> PackDefinition | None:
         return self._active
+
+    async def active_revision(self, organization_id: str) -> PackRevision | None:
+        if self._active is None:
+            return None
+        return PackRevision(self._active_version, "active", self._active)
+
+    async def revision(self, organization_id: str, version: int) -> PackRevision | None:
+        definition = self._revisions.get(version)
+        if definition is None:
+            return None
+        state = "active" if version == self._active_version else "archived"
+        return PackRevision(version, state, definition)
 
     async def draft(self, organization_id: str) -> PackDefinition | None:
         return self._draft
@@ -60,15 +75,22 @@ class FakePackStore:
             raise NotFound("no draft")
         self._active = self._draft
         self._draft = None
-        return 1
+        self._active_version += 1
+        self._revisions[self._active_version] = self._active
+        return self._active_version
 
 
 @dataclass
 class FakeSessionStore:
     store: dict[str, dict[str, Any]] = field(default_factory=dict)
 
-    async def get(self, organization_id: str, actor_id: str) -> dict[str, Any] | None:
-        value = self.store.get(f"{organization_id}:{actor_id}")
+    async def get(
+        self,
+        organization_id: str,
+        actor_id: str,
+        provider: Provider = Provider.TELEGRAM,
+    ) -> dict[str, Any] | None:
+        value = self.store.get(f"{organization_id}:{actor_id}:{provider.value}")
         return dict(value) if value is not None else None
 
     async def put(
@@ -79,10 +101,15 @@ class FakeSessionStore:
         provider: Provider,
         state: dict[str, Any],
     ) -> None:
-        self.store[f"{organization_id}:{actor_id}"] = dict(state)
+        self.store[f"{organization_id}:{actor_id}:{provider.value}"] = dict(state)
 
-    async def clear(self, organization_id: str, actor_id: str) -> None:
-        self.store.pop(f"{organization_id}:{actor_id}", None)
+    async def clear(
+        self,
+        organization_id: str,
+        actor_id: str,
+        provider: Provider = Provider.TELEGRAM,
+    ) -> None:
+        self.store.pop(f"{organization_id}:{actor_id}:{provider.value}", None)
 
 
 @dataclass
@@ -193,8 +220,6 @@ async def test_admin_publishes_pack_then_client_creates_order() -> None:
     await intake.handle_callback(guy, INTAKE_PICK_SERVICE, {"service": cat_key})
     reply = await intake.handle_callback(guy, INTAKE_SERVICES_DONE, {})
 
-    reply = await intake.handle_text(guy, "ул. Мира 5")
-    assert reply.buttons  # still asking for next pack field or confirm
     reply = await intake.handle_text(guy, "Течёт кран")
     assert INTAKE_CONFIRM in {b.action for b in reply.buttons}
 

@@ -38,6 +38,11 @@ The project demonstrates a production-oriented FastAPI/PostgreSQL design:
 - Telegram and MAX polling/webhook parsing, buttons, location and photo reports;
 - address intake through native location, a protected map or manual text, with
   an explicit VPN/GPS-spoofing accuracy warning;
+- a complete Telegram/MAX admin configurator for branding, ordered services,
+  single/multiple selection, typed fields and prompts, completion evidence,
+  allocation policy, role labels, preview, publish and version restore;
+- every active client intake is pinned to its IndustryPack revision, so a new
+  publish cannot change a form halfway through completion;
 - a read-only customer map plus continuous browser GPS fallback when native
   messenger location is unavailable;
 - separate 256-bit read/write capabilities kept out of query strings and
@@ -110,7 +115,7 @@ python -m venv .venv
 
 The in-memory demo completes a curated operator/executor flow without external
 services. PostgreSQL integration tests run when `TEST_DATABASE_URL` is set.
-The verified suite currently contains 670 passing tests, including 44 live
+The verified suite currently contains 739 passing tests, including 57 live
 PostgreSQL integration tests. CI enforces 90% branch coverage across Python
 3.12, 3.13 and 3.14.
 

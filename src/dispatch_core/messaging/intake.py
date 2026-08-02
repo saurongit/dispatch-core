@@ -8,7 +8,7 @@ from uuid import uuid4
 from dispatch_core.application.async_service import AsyncDispatchService
 from dispatch_core.application.identity import ActorIdentity
 from dispatch_core.application.tracking_links import intake_address_url
-from dispatch_core.infrastructure.pack_store import PostgresPackStore
+from dispatch_core.infrastructure.pack_store import PackRevision, PostgresPackStore
 from dispatch_core.infrastructure.workflow_store import PostgresIntakeSessionStore
 from dispatch_core.messaging.cards import CardRenderer
 from dispatch_core.messaging.replies import Reply, ReplyButton
@@ -21,6 +21,7 @@ INTAKE_CANCEL = "intake_cancel"
 INTAKE_REQUEST_LOCATION = "intake_request_location"
 INTAKE_TYPE_ADDRESS = "intake_type_address"
 INTAKE_CONTINUE_AFTER_MAP = "intake_continue_after_map"
+INTAKE_FIELD_CHOICE = "intake_field_choice"
 INTAKE_ACTIONS = frozenset(
     {
         INTAKE_PICK_SERVICE,
@@ -30,6 +31,7 @@ INTAKE_ACTIONS = frozenset(
         INTAKE_REQUEST_LOCATION,
         INTAKE_TYPE_ADDRESS,
         INTAKE_CONTINUE_AFTER_MAP,
+        INTAKE_FIELD_CHOICE,
     }
 )
 
@@ -89,13 +91,14 @@ class IntakeCoordinator:
         self._public_base_url = public_base_url
 
     async def start(self, identity: ActorIdentity) -> Reply:
-        pack = await self._packs.active(identity.organization_id)
-        if pack is None:
+        revision = await self._packs.active_revision(identity.organization_id)
+        if revision is None:
             return Reply(_NOT_CONFIGURED)
         state: dict[str, Any] = {
             "step": "phone",
             "field_values": {},
             "submission_id": str(uuid4()),
+            "pack_version": revision.version,
         }
         await self._save(identity, state)
         return Reply("Введите ваш телефон:", buttons=(_CANCEL_BUTTON,))
@@ -111,9 +114,10 @@ class IntakeCoordinator:
         state = await self._sessions.get(identity.organization_id, identity.actor_id)
         if state is None:
             return await self.start(identity)
-        pack = await self._packs.active(identity.organization_id)
-        if pack is None:
+        revision = await self._pack_for_state(identity, state)
+        if revision is None:
             return Reply(_NOT_CONFIGURED)
+        pack = revision.definition
         step = state.get("step")
         if step == "phone":
             return await self._fill_phone(identity, pack, state, text)
@@ -140,12 +144,13 @@ class IntakeCoordinator:
         if action == INTAKE_CANCEL:
             await self._sessions.clear(identity.organization_id, identity.actor_id)
             return Reply("Заявка отменена.")
-        pack = await self._packs.active(identity.organization_id)
-        if pack is None:
-            return Reply(_NOT_CONFIGURED)
         state = await self._sessions.get(identity.organization_id, identity.actor_id)
         if state is None:
             return await self.start(identity)
+        revision = await self._pack_for_state(identity, state)
+        if revision is None:
+            return Reply(_NOT_CONFIGURED)
+        pack = revision.definition
         step = state.get("step")
         if action == INTAKE_REQUEST_LOCATION:
             if step != "address":
@@ -190,6 +195,15 @@ class IntakeCoordinator:
                     buttons=_service_buttons(pack, state.get("selected", ())),
                 )
             return await self._pick_service(identity, pack, state, payload)
+        if action == INTAKE_FIELD_CHOICE:
+            if step != "fields":
+                return Reply("Сначала заполните предыдущие шаги.")
+            return await self._fill_field(
+                identity,
+                pack,
+                state,
+                str(payload.get("value") or ""),
+            )
         if action == INTAKE_SERVICES_DONE:
             if step != "services":
                 return Reply(
@@ -267,9 +281,10 @@ class IntakeCoordinator:
         state = await self._sessions.get(identity.organization_id, identity.actor_id)
         if state is None:
             return await self.start(identity)
-        pack = await self._packs.active(identity.organization_id)
-        if pack is None:
+        revision = await self._pack_for_state(identity, state)
+        if revision is None:
             return Reply(_NOT_CONFIGURED)
+        pack = revision.definition
         if state.get("step") != "address":
             return Reply("Геопозиция сейчас не запрашивается.")
         label = (address or "").strip()[:500]
@@ -417,7 +432,18 @@ class IntakeCoordinator:
                     buttons=(_CANCEL_BUTTON,),
                 )
         else:
-            state.setdefault("field_values", {})[definition.key] = value
+            normalized = _normalize_field_value(definition, value)
+            if normalized is None:
+                if definition.field_type.value == "integer":
+                    return Reply(
+                        "Введите целое число:",
+                        buttons=(_CANCEL_BUTTON,),
+                    )
+                return Reply(
+                    "Выберите один из предложенных вариантов:",
+                    buttons=_ask_field(definition).buttons,
+                )
+            state.setdefault("field_values", {})[definition.key] = normalized
         index += 1
         state["field_index"] = index
         fields = pack.ordered_fields()
@@ -475,6 +501,7 @@ class IntakeCoordinator:
         details: dict[str, Any] = {
             "services": labels,
             "service_keys": selected,
+            "pack_version": state.get("pack_version"),
             **field_values,
         }
         service_location = state.get("service_location")
@@ -498,9 +525,10 @@ class IntakeCoordinator:
 
         public_number = str(getattr(order, "public_number", "") or "")
         number_text = f" {public_number}" if public_number else ""
+        operator_label = str(pack.role_labels.get("operator") or "Оператор")
         return Reply(
             f"✅ Заявка{number_text} отправлена. "
-            "Оператор свяжется с вами в ближайшее время."
+            f"{operator_label} свяжется с вами в ближайшее время."
         )
 
     async def _save(self, identity: ActorIdentity, state: dict[str, Any]) -> None:
@@ -510,6 +538,23 @@ class IntakeCoordinator:
             provider=identity.provider,
             state=state,
         )
+
+    async def _pack_for_state(
+        self,
+        identity: ActorIdentity,
+        state: dict[str, Any],
+    ) -> PackRevision | None:
+        try:
+            version = int(state.get("pack_version", 0))
+        except (TypeError, ValueError):
+            version = 0
+        if version > 0:
+            return await self._packs.revision(identity.organization_id, version)
+        revision = await self._packs.active_revision(identity.organization_id)
+        if revision is not None:
+            state["pack_version"] = revision.version
+            await self._save(identity, state)
+        return revision
 
 
 _NOT_CONFIGURED = "Приём заявок ещё не настроен. Обратитесь к администратору."
@@ -525,7 +570,43 @@ def _services_reply(pack: PackDefinition) -> Reply:
 
 def _ask_field(definition: Any) -> Reply:
     hint = "" if definition.required else " (или «-», чтобы пропустить)"
+    if definition.field_type.value == "enum":
+        buttons = (
+            *(
+                ReplyButton(
+                    choice,
+                    INTAKE_FIELD_CHOICE,
+                    {"value": choice},
+                    "client",
+                    row=index,
+                )
+                for index, choice in enumerate(definition.choices)
+            ),
+            ReplyButton(
+                "Отмена",
+                INTAKE_CANCEL,
+                {},
+                "client",
+                row=len(definition.choices),
+            ),
+        )
+        return Reply(f"{definition.ask()}{hint}", buttons=buttons)
     return Reply(f"{definition.ask()}{hint}", buttons=(_CANCEL_BUTTON,))
+
+
+def _normalize_field_value(definition: Any, value: str) -> str | None:
+    if definition.field_type.value == "integer":
+        try:
+            return str(int(value))
+        except ValueError:
+            return None
+    if definition.field_type.value == "enum":
+        folded = value.casefold()
+        return next(
+            (choice for choice in definition.choices if choice.casefold() == folded),
+            None,
+        )
+    return value
 
 
 def _service_buttons(pack: PackDefinition, selected: object) -> tuple[ReplyButton, ...]:

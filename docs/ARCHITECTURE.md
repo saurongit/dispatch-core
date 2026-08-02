@@ -38,6 +38,27 @@ The behavioural baseline is `dez_core_dr`. Industry packs generalise its
 terminology, fields and evidence requirements, but do not replace its proven
 client/operator/master/admin workflows.
 
+## IndustryPack configuration and revisions
+
+Each organisation has one designated administrator-owner. This is a product
+invariant, so the configurator has no collaborative editing, multi-admin
+approval or conflict-resolution model. The owner may also hold operator and
+master roles; configuration sessions remain isolated by Telegram/MAX and do
+not overwrite one another.
+
+Without changing code, the administrator configures branding, ordered
+services, single/multiple selection, typed fields including enumerations,
+prompts, completion evidence, pool policy and role labels used in order cards.
+Changes first live in the organisation's single draft. Publishing archives the
+previous active revision and atomically activates the draft. An active or
+archived revision can be copied into a new draft for review and explicit
+publishing; there is no unchecked direct active-state rollback.
+
+When client intake starts, its durable session records the active revision
+number. Every later step reads that same active/archived revision, so an admin
+publish cannot change services, fields or evidence halfway through an open
+request. The revision number is also stored in the created order details.
+
 ## Work allocation policies
 
 `curated` preserves the human dispatch pattern:

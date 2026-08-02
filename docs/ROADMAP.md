@@ -18,13 +18,18 @@
   attempt limit;
 - frontend-isolated inbox/cursors and the two-bot MAX topology with a durable
   admin/operator/master selector in the shared staff bot;
+- a complete Telegram/MAX IndustryPack configurator: ordered and single/multi
+  services, typed fields/choices/prompts, evidence, pool policy, role labels,
+  preview, publish, discard and version restore;
+- active-intake revision pinning and separate Telegram/MAX sessions for the
+  organisation's single designated administrator-owner;
 - operator/master workspaces with master creation, role-safe removal, active
   order navigation and paired Telegram/MAX PostgreSQL E2E;
 - FastAPI command/configuration surface and health endpoints;
 - Docker Compose packaging and file-based provider secrets;
 - worker heartbeat, tenant-scoped queue health, bounded terminal-record
   retention and a disposable PostgreSQL restore drill;
-- 730 tests, including 55 live PostgreSQL race/E2E tests, and a 90% branch
+- 739 tests, including 57 live PostgreSQL race/E2E tests, and a 90% branch
   coverage gate.
 
 This milestone is usable as an integration backend and a technical portfolio.

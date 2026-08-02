@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from dispatch_core.application.identity import ActorIdentity
 from dispatch_core.domain.errors import NotFound
-from dispatch_core.domain.work_order import EvidenceRequirements
+from dispatch_core.domain.work_order import EvidenceRequirements, PoolMode
 from dispatch_core.infrastructure.pack_store import (
     PackValidationError,
     PostgresPackStore,
@@ -20,6 +20,7 @@ from dispatch_core.infrastructure.workflow_store import (
 from dispatch_core.messaging.cards import CardRenderer, normalize_phone, phone_display
 from dispatch_core.messaging.replies import Reply, ReplyButton
 from dispatch_core.packs.catalog import (
+    DEFAULT_ROLE_LABELS,
     FieldDefinition,
     FieldType,
     PackDefinition,
@@ -32,9 +33,13 @@ CONFIG_BRAND = "config_brand"
 CONFIG_SERVICES = "config_services"
 CONFIG_SERVICE_ADD = "config_service_add"
 CONFIG_SERVICE_DELETE = "config_service_delete"
+CONFIG_SERVICE_MOVE = "config_service_move"
+CONFIG_SERVICE_MULTI_SELECT = "config_service_multi_select"
 CONFIG_FIELDS = "config_fields"
 CONFIG_FIELD_ADD = "config_field_add"
 CONFIG_FIELD_DELETE = "config_field_delete"
+CONFIG_FIELD_MOVE = "config_field_move"
+CONFIG_FIELD_PROMPT = "config_field_prompt"
 CONFIG_FIELD_TYPE = "config_field_type"
 CONFIG_FIELD_REQUIRED = "config_field_required"
 CONFIG_EVIDENCE = "config_evidence"
@@ -43,6 +48,15 @@ CONFIG_EVIDENCE_PHOTO_DEC = "config_evidence_photo_dec"
 CONFIG_EVIDENCE_COMMENT = "config_evidence_comment"
 CONFIG_EVIDENCE_SIGNATURE = "config_evidence_signature"
 CONFIG_EVIDENCE_CODE = "config_evidence_code"
+CONFIG_ALLOCATION = "config_allocation"
+CONFIG_POOL_MODE = "config_pool_mode"
+CONFIG_ROLE_LABELS = "config_role_labels"
+CONFIG_ROLE_LABEL_EDIT = "config_role_label_edit"
+CONFIG_VERSIONS = "config_versions"
+CONFIG_DISCARD_DRAFT = "config_discard_draft"
+CONFIG_DISCARD_DRAFT_CONFIRM = "config_discard_draft_confirm"
+CONFIG_RESTORE_VERSION = "config_restore_version"
+CONFIG_RESTORE_VERSION_CONFIRM = "config_restore_version_confirm"
 CONFIG_PREVIEW = "config_preview"
 CONFIG_PUBLISH = "config_publish"
 CONFIG_CANCEL = "config_cancel"
@@ -65,9 +79,13 @@ CONFIG_ACTIONS = frozenset(
         CONFIG_SERVICES,
         CONFIG_SERVICE_ADD,
         CONFIG_SERVICE_DELETE,
+        CONFIG_SERVICE_MOVE,
+        CONFIG_SERVICE_MULTI_SELECT,
         CONFIG_FIELDS,
         CONFIG_FIELD_ADD,
         CONFIG_FIELD_DELETE,
+        CONFIG_FIELD_MOVE,
+        CONFIG_FIELD_PROMPT,
         CONFIG_FIELD_TYPE,
         CONFIG_FIELD_REQUIRED,
         CONFIG_EVIDENCE,
@@ -76,6 +94,15 @@ CONFIG_ACTIONS = frozenset(
         CONFIG_EVIDENCE_COMMENT,
         CONFIG_EVIDENCE_SIGNATURE,
         CONFIG_EVIDENCE_CODE,
+        CONFIG_ALLOCATION,
+        CONFIG_POOL_MODE,
+        CONFIG_ROLE_LABELS,
+        CONFIG_ROLE_LABEL_EDIT,
+        CONFIG_VERSIONS,
+        CONFIG_DISCARD_DRAFT,
+        CONFIG_DISCARD_DRAFT_CONFIRM,
+        CONFIG_RESTORE_VERSION,
+        CONFIG_RESTORE_VERSION_CONFIRM,
         CONFIG_PREVIEW,
         CONFIG_PUBLISH,
         CONFIG_CANCEL,
@@ -99,6 +126,9 @@ MENU_COMMANDS: tuple[tuple[str, str], ...] = (
     ("services", "Услуги: каталог заявок"),
     ("fields", "Поля заявки"),
     ("evidence", "Требования к закрытию"),
+    ("allocation", "Распределение заявок"),
+    ("role_labels", "Названия ролей"),
+    ("versions", "Версии и черновик"),
     ("operators", "Операторы"),
     ("preview", "Предпросмотр глазами клиента"),
     ("publish", "Опубликовать версию"),
@@ -110,6 +140,7 @@ _FIELD_TYPE_LABELS: tuple[tuple[FieldType, str], ...] = (
     (FieldType.INTEGER, "Число"),
     (FieldType.ASSET_REFERENCE, "Объект"),
     (FieldType.ROUTE, "Маршрут"),
+    (FieldType.ENUM, "Выбор из списка"),
 )
 
 _CANCEL_BUTTON = ReplyButton("Отмена", CONFIG_CANCEL, {}, "admin")
@@ -121,7 +152,7 @@ _ConfigHandler = Callable[
 
 
 class ConfigCoordinator:
-    """In-messenger admin configurator that edits a draft pack until publish."""
+    """Single-owner messenger configurator that edits a draft until publish."""
 
     def __init__(
         self,
@@ -140,12 +171,25 @@ class ConfigCoordinator:
             CONFIG_SERVICES: self._on_services,
             CONFIG_SERVICE_ADD: self._on_service_add,
             CONFIG_SERVICE_DELETE: self._on_service_delete,
+            CONFIG_SERVICE_MOVE: self._on_service_move,
+            CONFIG_SERVICE_MULTI_SELECT: self._on_service_multi_select,
             CONFIG_FIELDS: self._on_fields,
             CONFIG_FIELD_ADD: self._on_field_add,
             CONFIG_FIELD_DELETE: self._on_field_delete,
+            CONFIG_FIELD_MOVE: self._on_field_move,
+            CONFIG_FIELD_PROMPT: self._on_field_prompt,
             CONFIG_FIELD_TYPE: self._on_field_type,
             CONFIG_FIELD_REQUIRED: self._on_field_required,
             CONFIG_EVIDENCE: self._on_evidence,
+            CONFIG_ALLOCATION: self._on_allocation,
+            CONFIG_POOL_MODE: self._on_pool_mode,
+            CONFIG_ROLE_LABELS: self._on_role_labels,
+            CONFIG_ROLE_LABEL_EDIT: self._on_role_label_edit,
+            CONFIG_VERSIONS: self._on_versions,
+            CONFIG_DISCARD_DRAFT: self._on_discard_draft,
+            CONFIG_DISCARD_DRAFT_CONFIRM: self._on_discard_draft_confirm,
+            CONFIG_RESTORE_VERSION: self._on_restore_version,
+            CONFIG_RESTORE_VERSION_CONFIRM: self._on_restore_version_confirm,
             CONFIG_PREVIEW: self._on_preview,
             CONFIG_PUBLISH: self._on_publish,
             CONFIG_ADD_OPERATOR: self._on_add_operator,
@@ -170,15 +214,18 @@ class ConfigCoordinator:
         return await self._sessions.handled_event(
             identity.organization_id,
             identity.actor_id,
+            identity.provider,
             event_id,
         )
 
     async def handle_text(self, identity: ActorIdentity, text: str) -> Reply:
         text = text.strip()
-        session = await self._sessions.get(identity.organization_id, identity.actor_id)
+        session = await self._sessions.get(
+            identity.organization_id, identity.actor_id, identity.provider
+        )
         if session and session.get("flow"):
             if text.startswith("/"):
-                await self._sessions.clear(identity.organization_id, identity.actor_id)
+                await self._clear_session(identity)
                 return await self._command(identity, text)
             return await self._consume(identity, session, text)
         if text.startswith("/"):
@@ -199,7 +246,7 @@ class ConfigCoordinator:
     async def _on_cancel(
         self, identity: ActorIdentity, _payload: dict[str, Any]
     ) -> Reply:
-        await self._sessions.clear(identity.organization_id, identity.actor_id)
+        await self._clear_session(identity)
         return await self._menu(identity, note="Действие отменено.")
 
     async def _on_menu(
@@ -227,6 +274,16 @@ class ConfigCoordinator:
     ) -> Reply:
         return await self._service_delete(identity, payload)
 
+    async def _on_service_move(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        return await self._service_move(identity, payload)
+
+    async def _on_service_multi_select(
+        self, identity: ActorIdentity, _payload: dict[str, Any]
+    ) -> Reply:
+        return await self._service_multi_select(identity)
+
     async def _on_fields(
         self, identity: ActorIdentity, _payload: dict[str, Any]
     ) -> Reply:
@@ -242,6 +299,16 @@ class ConfigCoordinator:
     ) -> Reply:
         return await self._field_delete(identity, payload)
 
+    async def _on_field_move(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        return await self._field_move(identity, payload)
+
+    async def _on_field_prompt(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        return await self._field_prompt(identity, payload)
+
     async def _on_field_type(
         self, identity: ActorIdentity, payload: dict[str, Any]
     ) -> Reply:
@@ -256,6 +323,51 @@ class ConfigCoordinator:
         self, identity: ActorIdentity, _payload: dict[str, Any]
     ) -> Reply:
         return await self._evidence(identity)
+
+    async def _on_allocation(
+        self, identity: ActorIdentity, _payload: dict[str, Any]
+    ) -> Reply:
+        return await self._allocation(identity)
+
+    async def _on_pool_mode(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        return await self._pool_mode(identity, payload)
+
+    async def _on_role_labels(
+        self, identity: ActorIdentity, _payload: dict[str, Any]
+    ) -> Reply:
+        return await self._role_labels(identity)
+
+    async def _on_role_label_edit(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        return await self._role_label_edit(identity, payload)
+
+    async def _on_versions(
+        self, identity: ActorIdentity, _payload: dict[str, Any]
+    ) -> Reply:
+        return await self._versions(identity)
+
+    async def _on_discard_draft(
+        self, identity: ActorIdentity, _payload: dict[str, Any]
+    ) -> Reply:
+        return await self._discard_draft(identity)
+
+    async def _on_discard_draft_confirm(
+        self, identity: ActorIdentity, _payload: dict[str, Any]
+    ) -> Reply:
+        return await self._discard_draft_confirm(identity)
+
+    async def _on_restore_version(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        return await self._restore_version(identity, payload)
+
+    async def _on_restore_version_confirm(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        return await self._restore_version_confirm(identity, payload)
 
     def _make_evidence_toggle(self, action: str) -> _ConfigHandler:
         async def handler(identity: ActorIdentity, _payload: dict[str, Any]) -> Reply:
@@ -282,6 +394,9 @@ class ConfigCoordinator:
             "services": self._services,
             "fields": self._fields,
             "evidence": self._evidence,
+            "allocation": self._allocation,
+            "role_labels": self._role_labels,
+            "versions": self._versions,
             "operators": self._list_operators_cmd,
             "preview": self._preview,
             "publish": self._publish,
@@ -302,6 +417,12 @@ class ConfigCoordinator:
             return await self._service_save(identity, session, text)
         if flow == "field_add" and step == "label":
             return await self._field_label(identity, session, text)
+        if flow == "field_add" and step == "choices":
+            return await self._field_choices(identity, session, text)
+        if flow == "field_prompt" and step == "prompt":
+            return await self._field_prompt_save(identity, session, text)
+        if flow == "role_label" and step == "label":
+            return await self._role_label_save(identity, session, text)
         if flow == "add_operator" and step == "name":
             return await self._add_operator_save(identity, session, text)
         if flow == "add_operator" and step == "phone":
@@ -320,7 +441,8 @@ class ConfigCoordinator:
     async def _brand_step(self, identity: ActorIdentity, step: Any, text: str) -> Reply:
         draft = await self._ensure_draft(identity)
         branding = draft.branding
-        value = "" if text == "-" else text
+        limit = 120 if step == "name" else 500
+        value = "" if text == "-" else text.strip()[:limit]
         if step == "name":
             if not value:
                 return Reply(
@@ -341,7 +463,7 @@ class ConfigCoordinator:
             )
         branding = dataclasses.replace(branding, support=value)
         await self._replace(identity, draft, branding=branding)
-        await self._sessions.clear(identity.organization_id, identity.actor_id)
+        await self._clear_session(identity)
         return await self._menu(identity, note="Бренд обновлён.")
 
     # -- services --------------------------------------------------------
@@ -349,26 +471,59 @@ class ConfigCoordinator:
     async def _services(self, identity: ActorIdentity) -> Reply:
         draft = await self._ensure_draft(identity)
         categories = draft.service_catalog.categories
-        lines = ["Услуги каталога:"]
+        selection = (
+            "несколько услуг" if draft.service_catalog.multi_select else "одна услуга"
+        )
+        lines = ["Услуги каталога:", f"Выбор клиента: {selection}"]
         if categories:
             lines.extend(f"• {item.label}" for item in categories)
         else:
             lines.append("(пока пусто)")
         buttons: list[ReplyButton] = [
-            ReplyButton("Добавить услугу", CONFIG_SERVICE_ADD, {}, "admin")
+            ReplyButton("Добавить услугу", CONFIG_SERVICE_ADD, {}, "admin"),
+            ReplyButton(
+                "Разрешить несколько"
+                if not draft.service_catalog.multi_select
+                else "Только одна услуга",
+                CONFIG_SERVICE_MULTI_SELECT,
+                {},
+                "admin",
+                row=0,
+            ),
         ]
-        for index, item in enumerate(categories, start=1):
+        for index, item in enumerate(categories):
+            row = index + 1
+            if index > 0:
+                buttons.append(
+                    ReplyButton(
+                        f"↑ {item.label}",
+                        CONFIG_SERVICE_MOVE,
+                        {"key": item.key, "direction": "up"},
+                        "admin",
+                        row=row,
+                    )
+                )
+            if index < len(categories) - 1:
+                buttons.append(
+                    ReplyButton(
+                        f"↓ {item.label}",
+                        CONFIG_SERVICE_MOVE,
+                        {"key": item.key, "direction": "down"},
+                        "admin",
+                        row=row,
+                    )
+                )
             buttons.append(
                 ReplyButton(
                     f"Удалить: {item.label}",
                     CONFIG_SERVICE_DELETE,
                     {"key": item.key},
                     "admin",
-                    row=index,
+                    row=row,
                 )
             )
         buttons.append(
-            ReplyButton("В меню", CONFIG_MENU, {}, "admin", row=len(buttons))
+            ReplyButton("В меню", CONFIG_MENU, {}, "admin", row=len(categories) + 1)
         )
         return Reply("\n".join(lines), buttons=tuple(buttons))
 
@@ -383,6 +538,7 @@ class ConfigCoordinator:
         session: dict[str, Any],
         text: str,
     ) -> Reply:
+        text = text.strip()[:120]
         if not text:
             return Reply(
                 "Название не может быть пустым. Введите название услуги:",
@@ -397,7 +553,7 @@ class ConfigCoordinator:
             None,
         )
         if existing is not None:
-            await self._sessions.clear(identity.organization_id, identity.actor_id)
+            await self._clear_session(identity)
             return await self._services(identity)
         if not key or saved_label != text:
             taken = {item.key for item in catalog.categories}
@@ -408,7 +564,7 @@ class ConfigCoordinator:
         categories = (*catalog.categories, ServiceCategory(key, text))
         new_catalog = dataclasses.replace(catalog, categories=categories)
         await self._replace(identity, draft, service_catalog=new_catalog)
-        await self._sessions.clear(identity.organization_id, identity.actor_id)
+        await self._clear_session(identity)
         return await self._services(identity)
 
     async def _service_delete(
@@ -422,6 +578,33 @@ class ConfigCoordinator:
         await self._replace(identity, draft, service_catalog=new_catalog)
         return await self._services(identity)
 
+    async def _service_multi_select(self, identity: ActorIdentity) -> Reply:
+        draft = await self._ensure_draft(identity)
+        catalog = dataclasses.replace(
+            draft.service_catalog,
+            multi_select=not draft.service_catalog.multi_select,
+        )
+        await self._replace(identity, draft, service_catalog=catalog)
+        return await self._services(identity)
+
+    async def _service_move(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        key = str(payload.get("key") or "")
+        direction = str(payload.get("direction") or "")
+        draft = await self._ensure_draft(identity)
+        categories = _move_item(
+            draft.service_catalog.categories,
+            key=key,
+            direction=direction,
+        )
+        catalog = dataclasses.replace(
+            draft.service_catalog,
+            categories=categories,
+        )
+        await self._replace(identity, draft, service_catalog=catalog)
+        return await self._services(identity)
+
     # -- fields ----------------------------------------------------------
 
     async def _fields(self, identity: ActorIdentity) -> Reply:
@@ -431,24 +614,59 @@ class ConfigCoordinator:
         if fields:
             for item in fields:
                 mark = "*" if item.required else ""
-                lines.append(f"• {item.label} ({item.field_type.value}){mark}")
+                choices = (
+                    f" [{', '.join(item.choices)}]"
+                    if item.field_type is FieldType.ENUM
+                    else ""
+                )
+                lines.append(f"• {item.label} ({item.field_type.value}){mark}{choices}")
         else:
             lines.append("(пока пусто)")
         buttons: list[ReplyButton] = [
             ReplyButton("Добавить поле", CONFIG_FIELD_ADD, {}, "admin")
         ]
-        for index, item in enumerate(fields, start=1):
+        for index, item in enumerate(fields):
+            row = index + 1
+            if index > 0:
+                buttons.append(
+                    ReplyButton(
+                        "↑",
+                        CONFIG_FIELD_MOVE,
+                        {"key": item.key, "direction": "up"},
+                        "admin",
+                        row=row,
+                    )
+                )
+            if index < len(fields) - 1:
+                buttons.append(
+                    ReplyButton(
+                        "↓",
+                        CONFIG_FIELD_MOVE,
+                        {"key": item.key, "direction": "down"},
+                        "admin",
+                        row=row,
+                    )
+                )
             buttons.append(
                 ReplyButton(
-                    f"Удалить: {item.label}",
+                    f"Текст: {item.label}",
+                    CONFIG_FIELD_PROMPT,
+                    {"key": item.key},
+                    "admin",
+                    row=row,
+                )
+            )
+            buttons.append(
+                ReplyButton(
+                    "Удалить",
                     CONFIG_FIELD_DELETE,
                     {"key": item.key},
                     "admin",
-                    row=index,
+                    row=row,
                 )
             )
         buttons.append(
-            ReplyButton("В меню", CONFIG_MENU, {}, "admin", row=len(buttons))
+            ReplyButton("В меню", CONFIG_MENU, {}, "admin", row=len(fields) + 1)
         )
         return Reply("\n".join(lines), buttons=tuple(buttons))
 
@@ -462,6 +680,7 @@ class ConfigCoordinator:
     async def _field_label(
         self, identity: ActorIdentity, session: dict[str, Any], text: str
     ) -> Reply:
+        text = text.strip()[:120]
         if not text:
             return Reply(
                 "Название не может быть пустым. Введите название поля:",
@@ -490,7 +709,9 @@ class ConfigCoordinator:
     async def _field_type(
         self, identity: ActorIdentity, payload: dict[str, Any]
     ) -> Reply:
-        session = await self._sessions.get(identity.organization_id, identity.actor_id)
+        session = await self._sessions.get(
+            identity.organization_id, identity.actor_id, identity.provider
+        )
         if not session or session.get("flow") != "field_add":
             return await self._fields(identity)
         try:
@@ -499,27 +720,60 @@ class ConfigCoordinator:
             return Reply("Неизвестный тип поля.", buttons=(_CANCEL_BUTTON,))
         scratch = dict(session.get("scratch", {}))
         scratch["type"] = field_type.value
+        if field_type is FieldType.ADDRESS:
+            draft = await self._ensure_draft(identity)
+            address_taken = any(item.key == "address" for item in draft.fields)
+            if not address_taken:
+                scratch["key"] = "address"
+        session["scratch"] = scratch
+        if field_type is FieldType.ENUM:
+            session["step"] = "choices"
+            await self._set_session(identity, session)
+            return Reply(
+                "Введите варианты через запятую (минимум два):",
+                buttons=(_CANCEL_BUTTON,),
+            )
+        session["step"] = "required"
+        await self._set_session(identity, session)
+        return _required_field_reply()
+
+    async def _field_choices(
+        self,
+        identity: ActorIdentity,
+        session: dict[str, Any],
+        text: str,
+    ) -> Reply:
+        values = []
+        seen: set[str] = set()
+        for raw in text.split(","):
+            value = raw.strip()[:80]
+            folded = value.casefold()
+            if value and folded not in seen:
+                values.append(value)
+                seen.add(folded)
+        if len(values) < 2:
+            return Reply(
+                "Нужно минимум два разных варианта через запятую:",
+                buttons=(_CANCEL_BUTTON,),
+            )
+        if len(values) > 20:
+            return Reply(
+                "Допустимо не больше 20 вариантов. Сократите список:",
+                buttons=(_CANCEL_BUTTON,),
+            )
+        scratch = dict(session.get("scratch", {}))
+        scratch["choices"] = values
         session["scratch"] = scratch
         session["step"] = "required"
         await self._set_session(identity, session)
-        return Reply(
-            "Поле обязательно к заполнению?",
-            buttons=(
-                ReplyButton("Да", CONFIG_FIELD_REQUIRED, {"required": True}, "admin"),
-                ReplyButton(
-                    "Нет",
-                    CONFIG_FIELD_REQUIRED,
-                    {"required": False},
-                    "admin",
-                    row=1,
-                ),
-            ),
-        )
+        return _required_field_reply()
 
     async def _field_required(
         self, identity: ActorIdentity, payload: dict[str, Any]
     ) -> Reply:
-        session = await self._sessions.get(identity.organization_id, identity.actor_id)
+        session = await self._sessions.get(
+            identity.organization_id, identity.actor_id, identity.provider
+        )
         if not session or session.get("flow") != "field_add":
             return await self._fields(identity)
         scratch = dict(session.get("scratch", {}))
@@ -535,7 +789,7 @@ class ConfigCoordinator:
             await self._set_session(identity, session)
         existing = next((item for item in draft.fields if item.key == key), None)
         if existing is not None:
-            await self._sessions.clear(identity.organization_id, identity.actor_id)
+            await self._clear_session(identity)
             return await self._fields(identity)
         order = max((item.order for item in draft.fields), default=0) + 1
         definition = FieldDefinition(
@@ -543,12 +797,13 @@ class ConfigCoordinator:
             label=label,
             field_type=field_type,
             required=required,
+            choices=tuple(scratch.get("choices") or ()),
             prompt=f"Введите: {label}",
             order=order,
         )
         fields = (*draft.fields, definition)
         await self._replace(identity, draft, fields=fields)
-        await self._sessions.clear(identity.organization_id, identity.actor_id)
+        await self._clear_session(identity)
         return await self._fields(identity)
 
     async def _field_delete(
@@ -558,6 +813,59 @@ class ConfigCoordinator:
         draft = await self._ensure_draft(identity)
         fields = tuple(item for item in draft.fields if item.key != key)
         await self._replace(identity, draft, fields=fields)
+        return await self._fields(identity)
+
+    async def _field_move(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        draft = await self._ensure_draft(identity)
+        fields = list(draft.ordered_fields())
+        key = str(payload.get("key") or "")
+        direction = str(payload.get("direction") or "")
+        moved = _move_item(tuple(fields), key=key, direction=direction)
+        normalized = tuple(
+            dataclasses.replace(item, order=index)
+            for index, item in enumerate(moved, start=1)
+        )
+        await self._replace(identity, draft, fields=normalized)
+        return await self._fields(identity)
+
+    async def _field_prompt(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        key = str(payload.get("key") or "")
+        draft = await self._ensure_draft(identity)
+        definition = next((item for item in draft.fields if item.key == key), None)
+        if definition is None:
+            return await self._fields(identity)
+        await self._set_session(
+            identity,
+            {"flow": "field_prompt", "step": "prompt", "key": key},
+        )
+        return Reply(
+            f"Текущий вопрос: {definition.ask()}\n\n"
+            "Введите новый текст вопроса или «-» для стандартного:",
+            buttons=(_CANCEL_BUTTON,),
+        )
+
+    async def _field_prompt_save(
+        self,
+        identity: ActorIdentity,
+        session: dict[str, Any],
+        text: str,
+    ) -> Reply:
+        key = str(session.get("key") or "")
+        prompt = "" if text.strip() == "-" else text.strip()[:500]
+        draft = await self._ensure_draft(identity)
+        fields = tuple(
+            dataclasses.replace(item, prompt=prompt) if item.key == key else item
+            for item in draft.fields
+        )
+        if fields == draft.fields:
+            await self._clear_session(identity)
+            return await self._fields(identity)
+        await self._replace(identity, draft, fields=fields)
+        await self._clear_session(identity)
         return await self._fields(identity)
 
     # -- evidence --------------------------------------------------------
@@ -616,6 +924,226 @@ class ConfigCoordinator:
             ReplyButton("В меню", CONFIG_MENU, {}, "admin", row=3),
         )
         return Reply("\n".join(lines), buttons=buttons)
+
+    # -- allocation / terminology --------------------------------------
+
+    async def _allocation(self, identity: ActorIdentity) -> Reply:
+        draft = await self._ensure_draft(identity)
+        labels = {
+            PoolMode.CURATED: "оператор выбирает мастера",
+            PoolMode.FIRST_CLAIM: "заявку забирает первый мастер",
+        }
+        buttons = (
+            ReplyButton(
+                "Оператор выбирает",
+                CONFIG_POOL_MODE,
+                {"mode": PoolMode.CURATED.value},
+                "admin",
+            ),
+            ReplyButton(
+                "Первый отклик",
+                CONFIG_POOL_MODE,
+                {"mode": PoolMode.FIRST_CLAIM.value},
+                "admin",
+                row=1,
+            ),
+            ReplyButton("В меню", CONFIG_MENU, {}, "admin", row=2),
+        )
+        return Reply(
+            f"Распределение заявок:\nСейчас: {labels[draft.default_pool_mode]}",
+            buttons=buttons,
+        )
+
+    async def _pool_mode(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        try:
+            mode = PoolMode(str(payload.get("mode") or ""))
+        except ValueError:
+            return await self._allocation(identity)
+        draft = await self._ensure_draft(identity)
+        await self._replace(identity, draft, default_pool_mode=mode)
+        return await self._allocation(identity)
+
+    async def _role_labels(self, identity: ActorIdentity) -> Reply:
+        draft = await self._ensure_draft(identity)
+        labels = draft.role_labels
+        lines = [
+            "Названия ролей в карточках заявок:",
+            f"• Мастер: {labels['master']}",
+            f"• Оператор: {labels['operator']}",
+            f"• Клиент: {labels['client']}",
+        ]
+        buttons = (
+            *(
+                ReplyButton(
+                    f"Изменить: {labels[role]}",
+                    CONFIG_ROLE_LABEL_EDIT,
+                    {"role": role},
+                    "admin",
+                    row=index,
+                )
+                for index, role in enumerate(("master", "operator", "client"))
+            ),
+            ReplyButton("В меню", CONFIG_MENU, {}, "admin", row=3),
+        )
+        return Reply("\n".join(lines), buttons=buttons)
+
+    async def _role_label_edit(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        role = str(payload.get("role") or "")
+        if role not in DEFAULT_ROLE_LABELS:
+            return await self._role_labels(identity)
+        await self._set_session(
+            identity,
+            {"flow": "role_label", "step": "label", "role": role},
+        )
+        return Reply(
+            f"Введите название роли «{DEFAULT_ROLE_LABELS[role]}» "
+            "или «-» для стандартного:",
+            buttons=(_CANCEL_BUTTON,),
+        )
+
+    async def _role_label_save(
+        self,
+        identity: ActorIdentity,
+        session: dict[str, Any],
+        text: str,
+    ) -> Reply:
+        role = str(session.get("role") or "")
+        if role not in DEFAULT_ROLE_LABELS:
+            await self._clear_session(identity)
+            return await self._role_labels(identity)
+        label = text.strip()[:80]
+        if label == "-":
+            label = DEFAULT_ROLE_LABELS[role]
+        if not label:
+            return Reply(
+                "Название роли не может быть пустым:",
+                buttons=(_CANCEL_BUTTON,),
+            )
+        draft = await self._ensure_draft(identity)
+        labels = dict(draft.role_labels)
+        labels[role] = label
+        await self._replace(identity, draft, role_labels=labels)
+        await self._clear_session(identity)
+        return await self._role_labels(identity)
+
+    # -- versions -------------------------------------------------------
+
+    async def _versions(self, identity: ActorIdentity) -> Reply:
+        revisions = await self._packs.revisions(identity.organization_id)
+        if not revisions:
+            return await self._menu(identity, note="Версий пока нет.")
+        state_labels = {
+            "draft": "черновик",
+            "active": "активная",
+            "archived": "архив",
+        }
+        lines = ["Версии конфигурации:"]
+        buttons: list[ReplyButton] = []
+        draft_exists = False
+        row = 0
+        for revision in revisions:
+            name = revision.definition.branding.name or "без названия"
+            lines.append(
+                f"• v{revision.version} — {state_labels[revision.state]} — {name}"
+            )
+            if revision.state == "draft":
+                draft_exists = True
+                continue
+            buttons.append(
+                ReplyButton(
+                    f"В черновик v{revision.version}",
+                    CONFIG_RESTORE_VERSION,
+                    {"version": revision.version},
+                    "admin",
+                    row=row,
+                )
+            )
+            row += 1
+        if draft_exists:
+            buttons.append(
+                ReplyButton(
+                    "Отменить текущий черновик",
+                    CONFIG_DISCARD_DRAFT,
+                    {},
+                    "admin",
+                    row=row,
+                )
+            )
+            row += 1
+        buttons.append(ReplyButton("В меню", CONFIG_MENU, {}, "admin", row=row))
+        return Reply("\n".join(lines), buttons=tuple(buttons))
+
+    async def _discard_draft(self, identity: ActorIdentity) -> Reply:
+        draft = await self._packs.draft(identity.organization_id)
+        if draft is None:
+            return await self._versions(identity)
+        return Reply(
+            "Отменить все неопубликованные изменения черновика?",
+            buttons=(
+                ReplyButton(
+                    "Да, отменить черновик",
+                    CONFIG_DISCARD_DRAFT_CONFIRM,
+                    {},
+                    "admin",
+                ),
+                ReplyButton("Нет", CONFIG_VERSIONS, {}, "admin", row=1),
+            ),
+        )
+
+    async def _discard_draft_confirm(self, identity: ActorIdentity) -> Reply:
+        discarded = await self._packs.discard_draft(identity.organization_id)
+        note = "Черновик отменён." if discarded else "Черновика уже нет."
+        return await self._menu(identity, note=note)
+
+    async def _restore_version(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        try:
+            version = int(payload.get("version"))
+        except (TypeError, ValueError):
+            return await self._versions(identity)
+        revision = await self._packs.revision(identity.organization_id, version)
+        if revision is None:
+            return await self._versions(identity)
+        return Reply(
+            f"Создать черновик на основе версии {version}? "
+            "Текущий черновик будет заменён, активная версия не изменится.",
+            buttons=(
+                ReplyButton(
+                    "Да, создать черновик",
+                    CONFIG_RESTORE_VERSION_CONFIRM,
+                    {"version": version},
+                    "admin",
+                ),
+                ReplyButton("Нет", CONFIG_VERSIONS, {}, "admin", row=1),
+            ),
+        )
+
+    async def _restore_version_confirm(
+        self, identity: ActorIdentity, payload: dict[str, Any]
+    ) -> Reply:
+        try:
+            version = int(payload.get("version"))
+        except (TypeError, ValueError):
+            return await self._versions(identity)
+        try:
+            draft_version = await self._packs.restore_as_draft(
+                identity.organization_id,
+                version,
+            )
+        except NotFound:
+            return await self._versions(identity)
+        return await self._menu(
+            identity,
+            note=(
+                f"Версия {version} скопирована в черновик {draft_version}. "
+                "Проверьте предпросмотр и опубликуйте вручную."
+            ),
+        )
 
     # -- preview / publish ----------------------------------------------
 
@@ -684,10 +1212,13 @@ class ConfigCoordinator:
             ReplyButton("Услуги", CONFIG_SERVICES, {}, "admin", row=0),
             ReplyButton("Поля", CONFIG_FIELDS, {}, "admin", row=1),
             ReplyButton("Закрытие", CONFIG_EVIDENCE, {}, "admin", row=1),
-            ReplyButton("Предпросмотр", CONFIG_PREVIEW, {}, "admin", row=2),
-            ReplyButton("Опубликовать", CONFIG_PUBLISH, {}, "admin", row=2),
-            ReplyButton("Операторы", CONFIG_LIST_OPERATORS, {}, "admin", row=3),
-            ReplyButton("Мои роли", CONFIG_OWNER_ROLES, {}, "admin", row=3),
+            ReplyButton("Распределение", CONFIG_ALLOCATION, {}, "admin", row=2),
+            ReplyButton("Названия ролей", CONFIG_ROLE_LABELS, {}, "admin", row=2),
+            ReplyButton("Предпросмотр", CONFIG_PREVIEW, {}, "admin", row=3),
+            ReplyButton("Опубликовать", CONFIG_PUBLISH, {}, "admin", row=3),
+            ReplyButton("Версии", CONFIG_VERSIONS, {}, "admin", row=4),
+            ReplyButton("Операторы", CONFIG_LIST_OPERATORS, {}, "admin", row=4),
+            ReplyButton("Мои роли", CONFIG_OWNER_ROLES, {}, "admin", row=5),
         )
         if identity.provider.value == "telegram":
             lines.extend(("", "Команды доступны в меню слева от поля ввода 👈"))
@@ -720,6 +1251,13 @@ class ConfigCoordinator:
             actor_id=identity.actor_id,
             provider=identity.provider,
             state=state,
+        )
+
+    async def _clear_session(self, identity: ActorIdentity) -> None:
+        await self._sessions.clear(
+            identity.organization_id,
+            identity.actor_id,
+            identity.provider,
         )
 
     # -- operator management -----------------------------------------------
@@ -929,7 +1467,7 @@ class ConfigCoordinator:
             )
         name = str(session.get("name") or "").strip()
         if not name:
-            await self._sessions.clear(identity.organization_id, identity.actor_id)
+            await self._clear_session(identity)
             return await self._menu(
                 identity,
                 note="Имя оператора потеряно, начните добавление заново.",
@@ -946,7 +1484,7 @@ class ConfigCoordinator:
             phone=phone,
             request_key=request_key,
         )
-        await self._sessions.clear(identity.organization_id, identity.actor_id)
+        await self._clear_session(identity)
         return Reply(
             f"✅ Оператор создан!\n\n"
             f"👤 Имя: {result['name']}\n"
@@ -1148,7 +1686,7 @@ class ConfigCoordinator:
             actor_id=actor_id,
             phone=phone,
         )
-        await self._sessions.clear(identity.organization_id, identity.actor_id)
+        await self._clear_session(identity)
         if not updated:
             return await self._list_operators(identity)
         return await self._operator_info(identity, {"actor_id": actor_id})
@@ -1211,6 +1749,42 @@ _EVIDENCE_ACTIONS = frozenset(
 
 def _yes_no(value: bool) -> str:
     return "да" if value else "нет"
+
+
+def _required_field_reply() -> Reply:
+    return Reply(
+        "Поле обязательно к заполнению?",
+        buttons=(
+            ReplyButton("Да", CONFIG_FIELD_REQUIRED, {"required": True}, "admin"),
+            ReplyButton(
+                "Нет",
+                CONFIG_FIELD_REQUIRED,
+                {"required": False},
+                "admin",
+                row=1,
+            ),
+        ),
+    )
+
+
+def _move_item(
+    items: tuple[Any, ...],
+    *,
+    key: str,
+    direction: str,
+) -> tuple[Any, ...]:
+    values = list(items)
+    index = next(
+        (position for position, item in enumerate(values) if item.key == key),
+        None,
+    )
+    if index is None:
+        return items
+    target = index - 1 if direction == "up" else index + 1
+    if direction not in {"up", "down"} or target < 0 or target >= len(values):
+        return items
+    values[index], values[target] = values[target], values[index]
+    return tuple(values)
 
 
 def _slug(label: str, prefix: str, taken: set[str]) -> str:

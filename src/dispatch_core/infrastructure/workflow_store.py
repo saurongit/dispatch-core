@@ -1452,3 +1452,76 @@ class PostgresIntakeSessionStore(_PostgresSessionStore):
 
 class PostgresConfigSessionStore(_PostgresSessionStore):
     _table = "config_sessions"
+
+    async def get(
+        self,
+        organization_id: str,
+        actor_id: str,
+        provider: Provider,
+    ) -> dict[str, Any] | None:
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT state FROM config_sessions
+                WHERE organization_id = $1 AND actor_id = $2 AND provider = $3
+                """,
+                organization_id,
+                actor_id,
+                provider.value,
+            )
+        if row is None:
+            return None
+        state = row["state"]
+        return json.loads(state) if isinstance(state, str) else state
+
+    async def put(
+        self,
+        *,
+        organization_id: str,
+        actor_id: str,
+        provider: Provider,
+        state: dict[str, Any],
+    ) -> None:
+        stored_state = state_with_session_event(state)
+        async with self._pool.acquire() as connection:
+            await connection.execute(
+                """
+                INSERT INTO config_sessions (
+                    organization_id, actor_id, provider, state
+                ) VALUES ($1, $2, $3, $4::jsonb)
+                ON CONFLICT (organization_id, actor_id, provider) DO UPDATE SET
+                    state = EXCLUDED.state,
+                    updated_at = now()
+                """,
+                organization_id,
+                actor_id,
+                provider.value,
+                json.dumps(stored_state, ensure_ascii=False, separators=(",", ":")),
+            )
+
+    async def handled_event(
+        self,
+        organization_id: str,
+        actor_id: str,
+        provider: Provider,
+        event_id: str,
+    ) -> bool:
+        state = await self.get(organization_id, actor_id, provider)
+        return state_handled_event(state, event_id)
+
+    async def clear(
+        self,
+        organization_id: str,
+        actor_id: str,
+        provider: Provider,
+    ) -> None:
+        async with self._pool.acquire() as connection:
+            await connection.execute(
+                """
+                DELETE FROM config_sessions
+                WHERE organization_id = $1 AND actor_id = $2 AND provider = $3
+                """,
+                organization_id,
+                actor_id,
+                provider.value,
+            )
