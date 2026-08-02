@@ -72,7 +72,7 @@ three branded source forks.
 
 ## Deliberately postponed
 
-Native mobile apps, AI configuration, SaaS billing, warehouse, payroll, 1C,
+Native mobile apps, SaaS billing, warehouse, payroll, 1C,
 telephony, fuel/CAN/OBD telematics, general BPMN and automatic route
 optimisation. These are expensive product branches, not prerequisites for a
 credible dispatch core or the first paid deployment.
