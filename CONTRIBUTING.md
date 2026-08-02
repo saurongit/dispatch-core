@@ -1,5 +1,7 @@
 # Contributing
 
+[Русский](CONTRIBUTING.ru.md) | **English**
+
 Dispatch Core keeps business rules independent from provider payloads and UI
 frameworks. Changes should preserve that boundary.
 

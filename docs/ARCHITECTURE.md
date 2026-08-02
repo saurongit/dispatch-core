@@ -1,5 +1,7 @@
 # Architecture
 
+[Русский](ARCHITECTURE.ru.md) | **English**
+
 ## Stable centre, replaceable edges
 
 ```text

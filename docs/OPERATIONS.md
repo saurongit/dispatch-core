@@ -1,5 +1,7 @@
 # Operations
 
+[Русский](OPERATIONS.ru.md) | **English**
+
 ## Configuration
 
 Copy `.env.example` to `.env`. Generate independent random values for the

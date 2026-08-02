@@ -1,5 +1,7 @@
 # Security policy
 
+[Русский](SECURITY.ru.md) | **English**
+
 ## Supported version
 
 This repository is an early development release. Only the latest commit on the

@@ -1,5 +1,7 @@
 # Roadmap
 
+[Русский](ROADMAP.ru.md) | **English**
+
 ## Implemented — portfolio-grade server core
 
 - guarded WorkOrder and TrackingSession aggregates;

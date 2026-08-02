@@ -1,5 +1,7 @@
 # Connectivity and resilient Telegram egress
 
+[Русский](CONNECTIVITY.ru.md) | **English**
+
 Restricted or unstable Telegram connectivity is handled at the transport
 boundary. The honest product claim is **configurable alternative egress**, not
 “Telegram always works”: no proxy, tunnel or provider can guarantee availability

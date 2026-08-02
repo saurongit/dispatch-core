@@ -1,5 +1,7 @@
 # Commercial support without artificial lock-in
 
+[Русский](SUPPORT_MODEL.ru.md) | **English**
+
 Dispatch Core must earn recurring support revenue through operational value,
 not through a hidden kill switch, backdoor, undocumented dependency or the
 deliberate degradation of a customer's production system. The customer keeps

@@ -198,7 +198,7 @@ docker compose -f compose.yaml -f compose.transports.example.yaml up --build -d
 использует подмену геопозиции.
 
 Подробные команды, настройка webhook и ограничения описаны в
-[руководстве по эксплуатации](docs/OPERATIONS.md).
+[руководстве по эксплуатации](docs/OPERATIONS.ru.md).
 
 ## Гарантии доставки и восстановления
 
@@ -238,15 +238,15 @@ IndustryPack, guided client intake, контролируемая привязк�
 
 ## Документация
 
-- [Якорь продукта и parity-контракт](ANCHOR.md)
-- [Архитектура](docs/ARCHITECTURE.md)
-- [Эксплуатация и развёртывание](docs/OPERATIONS.md)
-- [Коммерческое сопровождение без скрытой блокировки](docs/SUPPORT_MODEL.md)
-- [Каталог применимости](docs/APPLICATIONS.md)
-- [Связность и резервный Telegram egress](docs/CONNECTIVITY.md)
-- [Дорожная карта](docs/ROADMAP.md)
-- [Политика безопасности](SECURITY.md)
-- [Правила участия](CONTRIBUTING.md)
+- [Якорь продукта и контракт соответствия](ANCHOR.md)
+- [Архитектура](docs/ARCHITECTURE.ru.md)
+- [Эксплуатация и развёртывание](docs/OPERATIONS.ru.md)
+- [Коммерческое сопровождение без скрытой блокировки](docs/SUPPORT_MODEL.ru.md)
+- [Каталог применимости](docs/APPLICATIONS.ru.md)
+- [Связность и резервный маршрут Telegram](docs/CONNECTIVITY.ru.md)
+- [Дорожная карта](docs/ROADMAP.ru.md)
+- [Политика безопасности](SECURITY.ru.md)
+- [Правила участия](CONTRIBUTING.ru.md)
 
 ## Лицензия
 

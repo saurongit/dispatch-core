@@ -1,5 +1,7 @@
 # Application catalog
 
+[Русский](APPLICATIONS.ru.md) | **English**
+
 ## The applicability test
 
 Dispatch Core is a candidate when most answers are “yes”:
