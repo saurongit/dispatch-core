@@ -14,9 +14,9 @@ request -> pool/direct assignment -> accept -> travel -> work -> report -> close
 
 It is deliberately a focused operational core, not an unfinished attempt to
 clone every CRM feature. Client, operator, master and administrator workplaces
-live in messenger frontends; a dispatcher web board is outside the target
-product. Sites, phone intake and external systems remain optional request
-generators.
+live in Telegram/MAX role frontends. The administrator constructs and publishes
+the service there through an IndustryPack. Sites, phone intake and external
+systems remain optional request generators.
 
 ## Why this repository exists
 
@@ -193,9 +193,9 @@ the lifecycle actions valid for its current state.
 Still pending: complete order cards and assignment from the operator menu,
 operator report approval, the remaining customer conversations, installer UI,
 SQLite desktop profile, attachment object storage and a separate hybrid edge.
-A dispatcher web UI, route optimisation, billing, inventory, payroll and a
-full sales CRM are deliberately outside the current product boundary. The
-module catalog reports these boundaries explicitly.
+Route optimisation, billing, inventory, payroll and a full sales CRM are
+deliberately outside the current product boundary. The module catalog reports
+these boundaries explicitly.
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Operations](docs/OPERATIONS.md)

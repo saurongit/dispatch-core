@@ -61,14 +61,14 @@ MODULES: tuple[ModuleDescriptor, ...] = (
         ModuleKind.INTAKE,
         ModuleState.AVAILABLE,
         ("service_selection", "field_prompts", "confirmation", "order_creation"),
-        "Pack-driven client flow in the messenger; no dispatcher panel needed.",
+        "Pack-driven client flow remains inside Telegram/MAX frontends.",
     ),
     ModuleDescriptor(
         "config.messenger_admin",
         ModuleKind.USER_INTERFACE,
         ModuleState.AVAILABLE,
         ("brand", "services", "fields", "evidence", "preview", "publish"),
-        "Admin assembles the whole service from bot commands; drafts then publish.",
+        "Admin drafts, previews and publishes the service in Telegram/MAX.",
     ),
     ModuleDescriptor(
         "worker.telegram",
@@ -83,13 +83,6 @@ MODULES: tuple[ModuleDescriptor, ...] = (
         ModuleState.AVAILABLE,
         ("polling", "callbacks", "location", "photo_report"),
         "Uses platform-api2.max.ru and Authorization header authentication.",
-    ),
-    ModuleDescriptor(
-        "ui.dispatcher_web",
-        ModuleKind.USER_INTERFACE,
-        ModuleState.STUB,
-        ("board", "map", "configuration"),
-        "Planned for the single-machine milestone.",
     ),
     ModuleDescriptor(
         "storage.memory",

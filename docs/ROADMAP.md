@@ -33,7 +33,8 @@ It is not yet a self-service product for a non-technical dispatcher.
 ## Next — messenger production parity without a source-code fork
 
 The behavioural source of truth is `dez_core_dr`; `../ANCHOR.md` records the
-non-negotiable product contract. There is deliberately no dispatcher web board.
+non-negotiable product contract. All client, operator, master and admin
+workplaces are implemented in Telegram/MAX.
 
 - keep the now-green PostgreSQL integration suite mandatory in CI;
 - port curated pool preview/diagnostics, deliberate assignment, calls and chat
@@ -48,7 +49,7 @@ non-negotiable product contract. There is deliberately no dispatcher web board.
 
 Exit criterion: a non-technical team configures an IndustryPack in the admin
 bot and completes client -> operator -> master -> report -> operator close for a
-week without a web board, YAML edits or a source fork.
+week entirely through role bots, without YAML edits or a source fork.
 
 ## Then — packaging and reusable packs
 

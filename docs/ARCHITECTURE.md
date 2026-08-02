@@ -31,7 +31,8 @@
 No provider adapter writes domain tables. A Telegram callback, MAX button or
 HTTP request reaches the same application service and domain invariants.
 Client, operator, master and admin user interfaces live in messenger
-frontends; an operator web board is deliberately outside the target product.
+frontends. Through the same path, the administrator drafts, previews and
+publishes the service IndustryPack.
 
 The behavioural baseline is `dez_core_dr`. Industry packs generalise its
 terminology, fields and evidence requirements, but do not replace its proven
