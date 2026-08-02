@@ -11,6 +11,10 @@ license = "AGPL-3.0-only"
 requires-python = ">=3.12"
 dependencies = []
 
+[project.urls]
+Homepage = "https://qubit-db.ru/"
+Repository = "https://github.com/saurongit/dispatch-core"
+
 [project.optional-dependencies]
 server = [
     "asyncpg>=0.30,<1",

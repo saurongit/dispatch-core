@@ -2,6 +2,8 @@
 
 [Русский](README.md) | **English**
 
+An open engineering project by digital product studio [QUBIT](https://qubit-db.ru/).
+
 Dispatch Core is a self-hosted, messenger-first dispatch backend for small
 field teams. It accepts work, offers or assigns it to an executor, records the
 route and requires evidence before completion.
