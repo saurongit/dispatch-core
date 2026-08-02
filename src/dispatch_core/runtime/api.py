@@ -16,11 +16,13 @@ def factory():
 
 def main() -> None:
     settings = Settings()  # type: ignore[call-arg]
-    uvicorn.run(
-        "dispatch_core.runtime.api:factory",
-        factory=True,
-        host=settings.api_host,
-        port=settings.api_port,
-        proxy_headers=False,
-        server_header=False,
-    )
+    options = {
+        "factory": True,
+        "host": settings.api_host,
+        "port": settings.api_port,
+        "proxy_headers": bool(settings.trusted_proxy_ips),
+        "server_header": False,
+    }
+    if settings.trusted_proxy_ips:
+        options["forwarded_allow_ips"] = settings.trusted_proxy_ips
+    uvicorn.run("dispatch_core.runtime.api:factory", **options)

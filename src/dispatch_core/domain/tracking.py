@@ -59,12 +59,20 @@ class TrackingSession:
     location_token: str | None = None
     status: TrackingStatus = TrackingStatus.ACTIVE
     points: list[TrackingPoint] = field(default_factory=list)
+    point_count: int = 0
     version: int = 0
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     _events: list[DomainEvent] = field(default_factory=list, repr=False)
+    _persisted_point_count: int = field(default=0, repr=False)
 
     def __post_init__(self) -> None:
+        if self.points and self.point_count == 0:
+            self.point_count = len(self.points)
+        if self.point_count < len(self.points):
+            raise ValueError("point_count cannot be smaller than loaded points")
+        if not 0 <= self._persisted_point_count <= self.point_count:
+            raise ValueError("persisted point count is invalid")
         if self.public_token is not None and (
             len(self.public_token) < 43 or not self.public_token.strip()
         ):
@@ -133,6 +141,7 @@ class TrackingSession:
         if self.points and point.captured_at < self.points[-1].captured_at:
             raise ValueError("tracking points must be ordered by capture time")
         self.points.append(point)
+        self.point_count += 1
         self._record(
             "tracking.point_recorded",
             {
@@ -149,7 +158,7 @@ class TrackingSession:
         self.status = TrackingStatus.COMPLETED
         self.public_token = None
         self.location_token = None
-        self._record("tracking.completed", {"point_count": len(self.points)}, now)
+        self._record("tracking.completed", {"point_count": self.point_count}, now)
 
     def cancel(
         self, reason: str = "", *, now: datetime | None = None
@@ -165,6 +174,14 @@ class TrackingSession:
 
     def latest_point(self) -> TrackingPoint | None:
         return self.points[-1] if self.points else None
+
+    def pending_points(self) -> tuple[TrackingPoint, ...]:
+        pending_count = self.point_count - self._persisted_point_count
+        if pending_count > len(self.points):
+            raise ValueError("pending point count exceeds loaded tracking points")
+        if pending_count == 0:
+            return ()
+        return tuple(self.points[-pending_count:])
 
     def pull_events(self) -> tuple[DomainEvent, ...]:
         events = tuple(self._events)

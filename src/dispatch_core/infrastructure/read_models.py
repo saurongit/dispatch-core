@@ -94,7 +94,7 @@ class AsyncMemoryTrackingViewReader:
                 master_name=session.executor_id,
                 order_status=order.status.value,
                 tracking_status=session.status,
-                point_count=len(session.points),
+                point_count=session.point_count,
                 latest_point=deepcopy(session.latest_point()),
                 updated_at=session.updated_at,
             )
@@ -150,7 +150,7 @@ class PostgresTrackingViewReader:
                        latest.source,
                        latest.accuracy_m,
                        latest.source_event_id,
-                       COALESCE(points.point_count, 0) AS point_count
+                       tracking.point_count
                 FROM tracking_sessions AS tracking
                 JOIN work_orders AS orders
                   ON orders.organization_id = tracking.organization_id
@@ -168,12 +168,6 @@ class PostgresTrackingViewReader:
                     ORDER BY point.sequence_no DESC
                     LIMIT 1
                 ) AS latest ON true
-                LEFT JOIN LATERAL (
-                    SELECT count(*)::integer AS point_count
-                    FROM tracking_points AS point
-                    WHERE point.organization_id = tracking.organization_id
-                      AND point.session_id = tracking.id
-                ) AS points ON true
                 WHERE tracking.public_token = $1
                   AND tracking.status = 'active'
                 """,

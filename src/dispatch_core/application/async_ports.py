@@ -23,6 +23,13 @@ class AsyncTrackingRepository(Protocol):
         self, organization_id: str, order_id: str
     ) -> TrackingSession | None: ...
 
+    async def has_source_event(
+        self,
+        organization_id: str,
+        source: str,
+        source_event_id: str,
+    ) -> bool: ...
+
     async def save(
         self, session: TrackingSession, *, expected_version: int | None
     ) -> None: ...

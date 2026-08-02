@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import deque
+from collections import defaultdict, deque
 from typing import Any
 
 import httpx
@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 _MAX_ATTACHMENT_READY_RETRIES = 4
 _MAX_ATTACHMENT_READY_DELAYS = (0, 1, 2, 4)
+_MAX_TEXT_LENGTH_LIMIT = 4000
+_MAX_CHAT_REQUESTS_PER_SECOND = 2
 
 
 class MaxTransport:
@@ -48,6 +50,7 @@ class MaxTransport:
         self._rate = requests_per_second
         self._rate_lock = asyncio.Lock()
         self._request_times: deque[float] = deque()
+        self._chat_request_times: defaultdict[str, deque[float]] = defaultdict(deque)
 
     async def close(self) -> None:
         if self._owns_client:
@@ -187,9 +190,7 @@ class MaxTransport:
             params=parameters,
             request_timeout=timeout_seconds + 15,
         )
-        data = response.json()
-        if not isinstance(data, dict):
-            raise RuntimeError("MAX updates response is not an object")
+        data = self._response_object(response, operation="updates")
         updates = data.get("updates") or []
         if not isinstance(updates, list):
             raise RuntimeError("MAX updates field is not a list")
@@ -203,7 +204,15 @@ class MaxTransport:
         return items, next_marker if next_marker is not None else marker
 
     async def send(self, message: OutboundEnvelope) -> SendResult:
-        body: dict[str, Any] = {"text": message.text, "format": "html"}
+        text = message.text
+        if len(text) > _MAX_TEXT_LENGTH_LIMIT:
+            logger.warning(
+                "truncating MAX message from %d to %d chars",
+                len(text),
+                _MAX_TEXT_LENGTH_LIMIT,
+            )
+            text = text[:_MAX_TEXT_LENGTH_LIMIT]
+        body: dict[str, Any] = {"text": text}
         if message.buttons:
             body["attachments"] = [
                 {
@@ -222,9 +231,14 @@ class MaxTransport:
                 "/messages",
                 params={"user_id": message.recipient_id},
                 json=body,
+                rate_limit_key=message.recipient_id,
             )
-            data = response.json()
-            if isinstance(data, dict) and data.get("code") == "attachment.not.ready":
+            data = self._response_object(
+                response,
+                operation="send message",
+                allowed_error_codes=frozenset({"attachment.not.ready"}),
+            )
+            if data.get("code") == "attachment.not.ready":
                 if attempt < _MAX_ATTACHMENT_READY_RETRIES - 1:
                     delay = _MAX_ATTACHMENT_READY_DELAYS[
                         min(attempt, len(_MAX_ATTACHMENT_READY_DELAYS) - 1)
@@ -238,8 +252,8 @@ class MaxTransport:
                     await asyncio.sleep(delay)
                     continue
             break
-        if not isinstance(data, dict):
-            return SendResult()
+        if data.get("code"):
+            raise RuntimeError(self._provider_error(data, operation="send message"))
         sent = data.get("message")
         sent = sent if isinstance(sent, dict) else data
         sent_body = sent.get("body")
@@ -250,20 +264,21 @@ class MaxTransport:
             or sent.get("id")
             or data.get("message_id")
         )
-        return SendResult(
-            external_message_id=str(external_id) if external_id else None
-        )
+        if not external_id:
+            raise RuntimeError("MAX send message response has no message id")
+        return SendResult(external_message_id=str(external_id))
 
     async def answer_callback(
         self, callback_id: str, text: str | None = None
     ) -> None:
         body = {"notification": text} if text else {}
-        await self._request(
+        response = await self._request(
             "POST",
             "/answers",
             params={"callback_id": callback_id},
             json=body,
         )
+        self._response_object(response, operation="answer callback")
 
     async def _request(
         self,
@@ -273,8 +288,9 @@ class MaxTransport:
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
         request_timeout: float | None = None,
+        rate_limit_key: str | None = None,
     ) -> httpx.Response:
-        await self._wait_api_slot()
+        await self._wait_api_slot(rate_limit_key)
         response = await self._client.request(
             method,
             f"{self._api_base}{path}",
@@ -294,23 +310,107 @@ class MaxTransport:
             raise MaxRateLimitError(retry_after=retry_after)
         if response.status_code >= 500:
             raise RuntimeError(f"MAX server error HTTP {response.status_code}")
+        if response.status_code >= 400:
+            try:
+                data = response.json()
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            raise RuntimeError(
+                self._provider_error(
+                    data,
+                    operation=f"HTTP {response.status_code}",
+                )
+            )
         return response
 
-    async def _wait_api_slot(self) -> None:
-        delay = 0.0
-        async with self._rate_lock:
-            now = time.monotonic()
-            cutoff = now - 1
-            while self._request_times and self._request_times[0] <= cutoff:
-                self._request_times.popleft()
-            if len(self._request_times) < self._rate:
-                self._request_times.append(now)
-                return
-            delay = max(0, 1 - (now - self._request_times[0]))
-        if delay > 0:
+    @classmethod
+    def _response_object(
+        cls,
+        response: httpx.Response,
+        *,
+        operation: str,
+        allowed_error_codes: frozenset[str] = frozenset(),
+    ) -> dict[str, Any]:
+        try:
+            data = response.json()
+        except Exception as exc:
+            raise RuntimeError(
+                f"MAX {operation} response is not valid JSON"
+            ) from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(f"MAX {operation} response is not an object")
+        code = data.get("code")
+        if code and str(code) not in allowed_error_codes:
+            raise RuntimeError(cls._provider_error(data, operation=operation))
+        return data
+
+    @staticmethod
+    def _provider_error(data: dict[str, Any], *, operation: str) -> str:
+        code = str(data.get("code") or "unknown_error")
+        description = str(
+            data.get("message")
+            or data.get("description")
+            or data.get("error")
+            or "provider rejected the request"
+        )
+        return f"MAX {operation} error {code}: {description}"
+
+    async def _wait_api_slot(self, rate_limit_key: str | None = None) -> None:
+        while True:
+            async with self._rate_lock:
+                now = time.monotonic()
+                cutoff = now - 1
+                self._prune_request_times(self._request_times, cutoff)
+                chat_times = (
+                    self._chat_request_times[rate_limit_key]
+                    if rate_limit_key is not None
+                    else None
+                )
+                if chat_times is not None:
+                    self._prune_request_times(chat_times, cutoff)
+                global_delay = self._slot_delay(
+                    self._request_times,
+                    self._rate,
+                    now,
+                )
+                chat_delay = self._slot_delay(
+                    chat_times,
+                    _MAX_CHAT_REQUESTS_PER_SECOND,
+                    now,
+                )
+                delay = max(global_delay, chat_delay)
+                if delay <= 0:
+                    self._request_times.append(now)
+                    if chat_times is not None:
+                        chat_times.append(now)
+                    if len(self._chat_request_times) > 1000:
+                        self._chat_request_times = defaultdict(
+                            deque,
+                            {
+                                key: values
+                                for key, values in self._chat_request_times.items()
+                                if values and values[-1] > cutoff
+                            },
+                        )
+                    return
             await asyncio.sleep(delay)
-        async with self._rate_lock:
-            self._request_times.append(time.monotonic())
+
+    @staticmethod
+    def _prune_request_times(values: deque[float], cutoff: float) -> None:
+        while values and values[0] <= cutoff:
+            values.popleft()
+
+    @staticmethod
+    def _slot_delay(
+        values: deque[float] | None,
+        limit: int,
+        now: float,
+    ) -> float:
+        if values is None or len(values) < limit:
+            return 0.0
+        return max(0.0, 1 - (now - values[0]))
 
     @staticmethod
     def _identity_candidates(item: dict[str, Any]) -> tuple[object, ...]:

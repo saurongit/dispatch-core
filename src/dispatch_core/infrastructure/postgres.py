@@ -30,6 +30,8 @@ from dispatch_core.domain.work_order import (
 
 logger = logging.getLogger(__name__)
 
+_MIGRATION_LOCK_ID = 7_624_311_991_241_337_041
+
 
 def _json_value(value: Any) -> Any:
     return json.loads(value) if isinstance(value, str) else value
@@ -74,31 +76,41 @@ class PostgresDatabase:
             raise RuntimeError("database is not connected")
         applied: list[str] = []
         async with self.pool.acquire() as connection:
-            await connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS schema_migrations (
-                    version text PRIMARY KEY,
-                    applied_at timestamptz NOT NULL DEFAULT now()
-                )
-                """
+            await connection.fetchval(
+                "SELECT pg_advisory_lock($1)",
+                _MIGRATION_LOCK_ID,
             )
-            # Migration discovery is a bounded startup operation, not event-loop work.
-            for path in sorted(directory.glob("*.sql")):  # noqa: ASYNC240
-                version = path.name
-                exists = await connection.fetchval(
-                    "SELECT 1 FROM schema_migrations WHERE version = $1",
-                    version,
+            try:
+                await connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS schema_migrations (
+                        version text PRIMARY KEY,
+                        applied_at timestamptz NOT NULL DEFAULT now()
+                    )
+                    """
                 )
-                if exists:
-                    continue
-                sql = path.read_text(encoding="utf-8")
-                async with connection.transaction():
-                    await connection.execute(sql)
-                    await connection.execute(
-                        "INSERT INTO schema_migrations(version) VALUES ($1)",
+                # Migration discovery is bounded startup work, not event-loop work.
+                for path in sorted(directory.glob("*.sql")):  # noqa: ASYNC240
+                    version = path.name
+                    exists = await connection.fetchval(
+                        "SELECT 1 FROM schema_migrations WHERE version = $1",
                         version,
                     )
-                applied.append(version)
+                    if exists:
+                        continue
+                    sql = path.read_text(encoding="utf-8")
+                    async with connection.transaction():
+                        await connection.execute(sql)
+                        await connection.execute(
+                            "INSERT INTO schema_migrations(version) VALUES ($1)",
+                            version,
+                        )
+                    applied.append(version)
+            finally:
+                await connection.fetchval(
+                    "SELECT pg_advisory_unlock($1)",
+                    _MIGRATION_LOCK_ID,
+                )
         return tuple(applied)
 
 
@@ -306,8 +318,6 @@ class PostgresOrderRepository:
                 for response in order.pool_responses.values()
             ],
         )
-
-
 class PostgresTrackingRepository:
     def __init__(self, connection: asyncpg.Connection) -> None:
         self._connection = connection
@@ -315,25 +325,53 @@ class PostgresTrackingRepository:
     async def get(self, organization_id: str, session_id: str) -> TrackingSession:
         row = await self._connection.fetchrow(
             """
-            SELECT * FROM tracking_sessions
-            WHERE organization_id = $1 AND id = $2
-            FOR UPDATE
+            SELECT session.*,
+                   latest.latitude AS point_latitude,
+                   latest.longitude AS point_longitude,
+                   latest.captured_at AS point_captured_at,
+                   latest.ingested_at AS point_ingested_at,
+                   latest.source AS point_source,
+                   latest.accuracy_m AS point_accuracy_m,
+                   latest.source_event_id AS point_source_event_id
+            FROM tracking_sessions AS session
+            LEFT JOIN LATERAL (
+                SELECT point.latitude, point.longitude, point.captured_at,
+                       point.ingested_at, point.source, point.accuracy_m,
+                       point.source_event_id
+                FROM tracking_points AS point
+                WHERE point.organization_id = session.organization_id
+                  AND point.session_id = session.id
+                ORDER BY point.sequence_no DESC
+                LIMIT 1
+            ) AS latest ON true
+            WHERE session.organization_id = $1 AND session.id = $2
+            FOR UPDATE OF session
             """,
             organization_id,
             session_id,
         )
         if row is None:
             raise NotFound(f"tracking session {session_id!r} was not found")
-        points = await self._connection.fetch(
-            """
-            SELECT * FROM tracking_points
-            WHERE organization_id = $1 AND session_id = $2
-            ORDER BY sequence_no
-            """,
-            organization_id,
-            session_id,
+        return _tracking_from_row(row)
+
+    async def has_source_event(
+        self,
+        organization_id: str,
+        source: str,
+        source_event_id: str,
+    ) -> bool:
+        return bool(
+            await self._connection.fetchval(
+                """
+                SELECT 1 FROM tracking_points
+                WHERE organization_id = $1 AND source = $2
+                  AND source_event_id = $3
+                """,
+                organization_id,
+                source,
+                source_event_id,
+            )
         )
-        return _tracking_from_rows(row, points)
 
     async def find_active_for_order(
         self, organization_id: str, order_id: str
@@ -360,9 +398,9 @@ class PostgresTrackingRepository:
                     """
                     INSERT INTO tracking_sessions (
                         organization_id, id, work_order_id, executor_id,
-                        public_token, location_token, status, version,
-                        created_at, updated_at
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                        public_token, location_token, status, point_count,
+                        version, created_at, updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                     ON CONFLICT (organization_id, id) DO NOTHING
                     """,
                     session.organization_id,
@@ -372,6 +410,7 @@ class PostgresTrackingRepository:
                     session.public_token,
                     session.location_token,
                     session.status.value,
+                    session.point_count,
                     session.version,
                     session.created_at,
                     session.updated_at,
@@ -389,9 +428,10 @@ class PostgresTrackingRepository:
                         public_token = $5,
                         location_token = $6,
                         status = $7,
-                        version = $8,
-                        updated_at = $9
-                    WHERE organization_id = $1 AND id = $2 AND version = $10
+                        point_count = $8,
+                        version = $9,
+                        updated_at = $10
+                    WHERE organization_id = $1 AND id = $2 AND version = $11
                     """,
                     session.organization_id,
                     session.id,
@@ -400,6 +440,7 @@ class PostgresTrackingRepository:
                     session.public_token,
                     session.location_token,
                     session.status.value,
+                    session.point_count,
                     session.version,
                     session.updated_at,
                     expected_version,
@@ -415,19 +456,7 @@ class PostgresTrackingRepository:
             ) from exc
 
     async def _append_new_points(self, session: TrackingSession) -> None:
-        persisted_count = await self._connection.fetchval(
-            """
-            SELECT count(*) FROM tracking_points
-            WHERE organization_id = $1 AND session_id = $2
-            """,
-            session.organization_id,
-            session.id,
-        )
-        if persisted_count > len(session.points):
-            raise ConcurrencyConflict(
-                f"tracking session {session.id!r} lost persisted points"
-            )
-        new_points = session.points[persisted_count:]
+        new_points = session.pending_points()
         if not new_points:
             return
         await self._connection.executemany(
@@ -452,10 +481,11 @@ class PostgresTrackingRepository:
                 )
                 for sequence_no, point in enumerate(
                     new_points,
-                    start=persisted_count + 1,
+                    start=session._persisted_point_count + 1,
                 )
             ],
         )
+        session._persisted_point_count = session.point_count
 
 
 class PostgresOutbox:
@@ -566,9 +596,20 @@ def _order_from_rows(
     )
 
 
-def _tracking_from_rows(
-    row: asyncpg.Record, points: Iterable[asyncpg.Record]
-) -> TrackingSession:
+def _tracking_from_row(row: asyncpg.Record) -> TrackingSession:
+    points = []
+    if row["point_latitude"] is not None:
+        points.append(
+            TrackingPoint(
+                latitude=row["point_latitude"],
+                longitude=row["point_longitude"],
+                captured_at=row["point_captured_at"],
+                ingested_at=row["point_ingested_at"],
+                source=LocationSource(row["point_source"]),
+                accuracy_m=row["point_accuracy_m"],
+                source_event_id=row["point_source_event_id"],
+            )
+        )
     return TrackingSession(
         id=row["id"],
         organization_id=row["organization_id"],
@@ -577,19 +618,10 @@ def _tracking_from_rows(
         public_token=row["public_token"],
         location_token=row["location_token"],
         status=TrackingStatus(row["status"]),
-        points=[
-            TrackingPoint(
-                latitude=item["latitude"],
-                longitude=item["longitude"],
-                captured_at=item["captured_at"],
-                ingested_at=item["ingested_at"],
-                source=LocationSource(item["source"]),
-                accuracy_m=item["accuracy_m"],
-                source_event_id=item["source_event_id"],
-            )
-            for item in points
-        ],
+        points=points,
+        point_count=row["point_count"],
         version=row["version"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        _persisted_point_count=row["point_count"],
     )

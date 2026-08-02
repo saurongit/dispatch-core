@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import secrets
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -11,6 +13,33 @@ import asyncpg
 from dispatch_core.application.identity import ActorIdentity
 from dispatch_core.domain.work_order import CompletionReport
 from dispatch_core.messaging.models import Provider
+
+_SESSION_EVENT_KEY = "_dispatch_last_event_id"
+_CURRENT_SESSION_EVENT_ID: ContextVar[str | None] = ContextVar(
+    "dispatch_session_event_id",
+    default=None,
+)
+
+
+@contextmanager
+def session_event(event_id: str):
+    token = _CURRENT_SESSION_EVENT_ID.set(event_id)
+    try:
+        yield
+    finally:
+        _CURRENT_SESSION_EVENT_ID.reset(token)
+
+
+def state_with_session_event(state: dict[str, Any]) -> dict[str, Any]:
+    stored_state = dict(state)
+    event_id = _CURRENT_SESSION_EVENT_ID.get()
+    if event_id:
+        stored_state[_SESSION_EVENT_KEY] = event_id
+    return stored_state
+
+
+def state_handled_event(state: dict[str, Any] | None, event_id: str) -> bool:
+    return bool(state and state.get(_SESSION_EVENT_KEY) == event_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +149,69 @@ class PostgresIdentityStore:
             organization_id=organization_id,
             actor_id=row["id"],
             role=effective_role,
+            display_name=row["display_name"],
+            provider=provider,
+            external_user_id=external_user_id,
+            roles=roles,
+        )
+
+    async def resolve_actor_id(
+        self,
+        *,
+        organization_id: str,
+        actor_id: str,
+        required_role: str,
+    ) -> ActorIdentity | None:
+        self._validate_role(required_role)
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT actor.display_name,
+                       identity.provider,
+                       identity.external_user_id,
+                       ARRAY(
+                           SELECT membership.role
+                           FROM actor_roles AS membership
+                           WHERE membership.organization_id = actor.organization_id
+                             AND membership.actor_id = actor.id
+                             AND membership.active
+                           ORDER BY membership.role
+                       ) AS roles
+                FROM actors AS actor
+                LEFT JOIN LATERAL (
+                    SELECT external.provider, external.external_user_id
+                    FROM external_identities AS external
+                    WHERE external.organization_id = actor.organization_id
+                      AND external.actor_id = actor.id
+                    ORDER BY (external.provider = 'telegram') DESC,
+                             external.provider,
+                             external.external_user_id
+                    LIMIT 1
+                ) AS identity ON true
+                WHERE actor.organization_id = $1
+                  AND actor.id = $2
+                  AND actor.active
+                  AND EXISTS (
+                      SELECT 1 FROM actor_roles AS required
+                      WHERE required.organization_id = actor.organization_id
+                        AND required.actor_id = actor.id
+                        AND required.role = $3
+                        AND required.active
+                  )
+                """,
+                organization_id,
+                actor_id,
+                required_role,
+            )
+        if row is None:
+            return None
+        roles = self._role_set(row["roles"])
+        provider = Provider(row["provider"] or Provider.TELEGRAM.value)
+        external_user_id = str(row["external_user_id"] or actor_id)
+        return ActorIdentity(
+            organization_id=organization_id,
+            actor_id=actor_id,
+            role=required_role,
             display_name=row["display_name"],
             provider=provider,
             external_user_id=external_user_id,
@@ -869,7 +961,7 @@ class PostgresStaffBindingSessionStore:
         external_user_id: str,
         consumer_key: str,
         ttl_minutes: int = 15,
-    ) -> None:
+    ) -> bool:
         if consumer_key not in {"operator", "master", "staff"}:
             raise ValueError(
                 "staff binding requires an operator, master or shared frontend"
@@ -877,7 +969,7 @@ class PostgresStaffBindingSessionStore:
         if ttl_minutes <= 0:
             raise ValueError("binding session TTL must be positive")
         async with self._pool.acquire() as connection:
-            await connection.execute(
+            active = await connection.fetchval(
                 """
                 INSERT INTO staff_binding_sessions (
                     organization_id, provider, external_user_id,
@@ -889,16 +981,26 @@ class PostgresStaffBindingSessionStore:
                 ON CONFLICT (
                     organization_id, provider, external_user_id, consumer_key
                 ) DO UPDATE SET
-                    attempts = 0,
-                    expires_at = EXCLUDED.expires_at,
+                    attempts = CASE
+                        WHEN staff_binding_sessions.expires_at <= now() THEN 0
+                        ELSE staff_binding_sessions.attempts
+                    END,
+                    expires_at = CASE
+                        WHEN staff_binding_sessions.expires_at <= now()
+                        THEN EXCLUDED.expires_at
+                        ELSE staff_binding_sessions.expires_at
+                    END,
                     updated_at = now()
+                RETURNING expires_at > now() AND attempts < $6
                 """,
                 organization_id,
                 provider.value,
                 external_user_id,
                 consumer_key,
                 ttl_minutes,
+                self.MAX_ATTEMPTS,
             )
+        return bool(active)
 
     async def take_attempt(
         self,
@@ -1214,6 +1316,7 @@ class _PostgresSessionStore:
         provider: Provider,
         state: dict[str, Any],
     ) -> None:
+        stored_state = state_with_session_event(state)
         async with self._pool.acquire() as connection:
             await connection.execute(
                 f"""
@@ -1228,8 +1331,17 @@ class _PostgresSessionStore:
                 organization_id,
                 actor_id,
                 provider.value,
-                json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+                json.dumps(stored_state, ensure_ascii=False, separators=(",", ":")),
             )
+
+    async def handled_event(
+        self,
+        organization_id: str,
+        actor_id: str,
+        event_id: str,
+    ) -> bool:
+        state = await self.get(organization_id, actor_id)
+        return state_handled_event(state, event_id)
 
     async def clear(self, organization_id: str, actor_id: str) -> None:
         async with self._pool.acquire() as connection:

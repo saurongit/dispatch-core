@@ -97,6 +97,29 @@ def test_settings_rejects_invalid_public_base_url(value: str) -> None:
         settings(public_base_url=value)
 
 
+def test_settings_requires_https_for_non_local_production_url() -> None:
+    with pytest.raises(ValidationError, match="must use HTTPS"):
+        settings(public_base_url="http://dispatch.example")
+
+
+@pytest.mark.parametrize("field", ["callback_signing_secret", "executor_token_secret"])
+def test_settings_rejects_short_signing_secrets(field: str) -> None:
+    with pytest.raises(ValidationError, match="at least 24"):
+        settings(**{field: "short"})
+
+
+def test_worker_health_window_must_cover_two_heartbeats() -> None:
+    with pytest.raises(ValidationError, match="at least twice"):
+        settings(worker_heartbeat_seconds=20, worker_health_stale_seconds=30)
+
+
+def test_settings_validates_trusted_proxy_networks() -> None:
+    configured = settings(trusted_proxy_ips="127.0.0.1, 172.16.0.0/12")
+    assert configured.trusted_proxy_ips == "127.0.0.1,172.16.0.0/12"
+    with pytest.raises(ValidationError, match="IP addresses or CIDRs"):
+        settings(trusted_proxy_ips="reverse-proxy")
+
+
 def test_transport_factory_returns_empty_when_channels_disabled() -> None:
     assert build_transports(settings()) == {}
 
@@ -270,18 +293,21 @@ def message(provider: Provider, message_id: int = 1) -> OutboundEnvelope:
 class FakeOutboundStore:
     messages: tuple[OutboundEnvelope, ...]
     delivered: list[tuple[int, str | None]] = field(default_factory=list)
-    failed: list[tuple[int, str]] = field(default_factory=list)
+    failed: list[tuple[int, str, float | None]] = field(default_factory=list)
     claimed_consumer_keys: tuple[str, ...] = ()
+    claimed_organization_id: str | None = None
 
     async def claim(
         self,
         provider: Provider,
         *,
         limit: int,
+        organization_id: str | None = None,
         consumer_key: str = "",
         consumer_keys: tuple[str, ...] | None = None,
     ) -> tuple[OutboundEnvelope, ...]:
         self.claimed_consumer_keys = consumer_keys or (consumer_key,)
+        self.claimed_organization_id = organization_id
         matches = tuple(item for item in self.messages if item.provider is provider)
         return matches[:limit]
 
@@ -290,8 +316,14 @@ class FakeOutboundStore:
     ) -> None:
         self.delivered.append((item.message_id, external_message_id))
 
-    async def mark_failed(self, item: OutboundEnvelope, error: str) -> None:
-        self.failed.append((item.message_id, error))
+    async def mark_failed(
+        self,
+        item: OutboundEnvelope,
+        error: str,
+        *,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        self.failed.append((item.message_id, error, retry_after_seconds))
 
 
 @dataclass
@@ -312,16 +344,40 @@ async def test_sender_records_success_and_failure_without_losing_batch() -> None
     sender = OutboundSender(  # type: ignore[arg-type]
         store,
         {Provider.TELEGRAM: FakeTransport(fail_ids={2})},  # type: ignore[dict-item]
+        organization_id="org-1",
     )
     assert await sender.run_once(Provider.TELEGRAM) == 1
     assert store.delivered == [(1, "external-1")]
-    assert store.failed == [(2, "RuntimeError: provider down")]
+    assert store.failed == [(2, "RuntimeError: provider down", None)]
+
+
+@pytest.mark.asyncio
+async def test_sender_honors_provider_retry_after() -> None:
+    class RateLimitedTransport:
+        async def send(self, item: OutboundEnvelope) -> SendResult:
+            error = RuntimeError("provider rate limit")
+            error.retry_after = 17  # type: ignore[attr-defined]
+            raise error
+
+    store = FakeOutboundStore(messages=(message(Provider.MAX),))
+    sender = OutboundSender(  # type: ignore[arg-type]
+        store,
+        {Provider.MAX: RateLimitedTransport()},  # type: ignore[dict-item]
+        organization_id="org-1",
+    )
+
+    assert await sender.run_once(Provider.MAX) == 0
+    assert store.failed == [(1, "RuntimeError: provider rate limit", 17.0)]
 
 
 @pytest.mark.asyncio
 async def test_sender_does_not_claim_queue_without_transport() -> None:
     store = FakeOutboundStore(messages=(message(Provider.MAX),))
-    sender = OutboundSender(store, {})  # type: ignore[arg-type]
+    sender = OutboundSender(  # type: ignore[arg-type]
+        store,
+        {},
+        organization_id="org-1",
+    )
     assert await sender.run_once(Provider.MAX) == 0
     assert store.delivered == []
 
@@ -332,6 +388,7 @@ async def test_shared_max_staff_sender_claims_all_staff_role_queues() -> None:
     sender = OutboundSender(  # type: ignore[arg-type]
         store,
         {Provider.MAX: FakeTransport()},  # type: ignore[dict-item]
+        organization_id="org-1",
         consumer_key="staff",
     )
 
@@ -342,6 +399,7 @@ async def test_shared_max_staff_sender_claims_all_staff_role_queues() -> None:
         "operator",
         "master",
     )
+    assert store.claimed_organization_id == "org-1"
 
 
 @dataclass
@@ -447,8 +505,15 @@ async def test_polling_does_not_advance_when_provider_has_no_cursor() -> None:
 class FakeOutboxWorkerStore:
     events: tuple[PendingDomainEvent, ...]
     failures: list[str] = field(default_factory=list)
+    claimed_organization_id: str | None = None
 
-    async def claim_events(self, *, limit: int) -> tuple[PendingDomainEvent, ...]:
+    async def claim_events(
+        self,
+        *,
+        organization_id: str | None = None,
+        limit: int,
+    ) -> tuple[PendingDomainEvent, ...]:
+        self.claimed_organization_id = organization_id
         return self.events[:limit]
 
     async def mark_failed(self, event: PendingDomainEvent, error: str) -> None:
@@ -492,10 +557,12 @@ async def test_projector_worker_isolates_failed_event() -> None:
     worker = OutboxProjectorWorker(  # type: ignore[arg-type]
         store,
         projector,  # type: ignore[arg-type]
+        organization_id="org-1",
     )
     assert await worker.run_once() == 1
     assert projector.projected == ["event-1"]
     assert store.failures == ["RuntimeError: projection failed"]
+    assert store.claimed_organization_id == "org-1"
 
 
 @pytest.mark.asyncio
@@ -667,3 +734,19 @@ def test_runtime_api_main_uses_hardened_uvicorn_options(monkeypatch) -> None:
         "proxy_headers": False,
         "server_header": False,
     }
+
+
+def test_runtime_api_trusts_only_explicit_proxy_networks(monkeypatch) -> None:
+    configured = settings(trusted_proxy_ips="172.16.0.0/12")
+    calls: dict[str, Any] = {}
+    monkeypatch.setattr(runtime_api, "Settings", lambda: configured)
+    monkeypatch.setattr(
+        runtime_api.uvicorn,
+        "run",
+        lambda app, **options: calls.update(app=app, **options),
+    )
+
+    runtime_api.main()
+
+    assert calls["proxy_headers"] is True
+    assert calls["forwarded_allow_ips"] == "172.16.0.0/12"

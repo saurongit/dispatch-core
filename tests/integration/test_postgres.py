@@ -730,7 +730,8 @@ async def test_tracking_points_are_appended_without_rewriting_history(
         )
     assert [row["sequence_no"] for row in rows] == [1, 2]
     assert rows[0]["xmin"] == first_xmin
-    assert len(duplicate.points) == 2
+    assert duplicate.point_count == 2
+    assert len(duplicate.points) == 1
 
 
 @pytest.mark.asyncio

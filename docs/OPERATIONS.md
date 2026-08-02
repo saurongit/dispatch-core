@@ -3,7 +3,8 @@
 ## Configuration
 
 Copy `.env.example` to `.env`. Generate independent random values for the
-PostgreSQL password, admin API key and callback signing secret. Use a URL-safe
+PostgreSQL password, admin API key, callback signing secret and executor token
+secret. Use a URL-safe
 alphanumeric/hex PostgreSQL password because Compose interpolates it into a
 connection URI. Do not reuse a bot token as a webhook or admin secret.
 
@@ -19,7 +20,8 @@ curl http://127.0.0.1:8080/health/ready
 ```
 
 `/health/live` only proves that the API process answers. `/health/ready` also
-checks PostgreSQL.
+checks PostgreSQL. Worker containers have a separate database-backed heartbeat
+healthcheck, so a running but stalled worker becomes unhealthy.
 
 ## Client address, tracking and master GPS
 
@@ -163,12 +165,26 @@ subscription and long polling cannot be active together.
 The Compose file publishes the API directly for development. In production,
 place it behind a maintained TLS reverse proxy, expose only required routes,
 rate-limit the admin API, and restrict it by network/VPN where possible. Set
-trusted proxy handling explicitly if a future deployment needs client IPs; the
-bundled Uvicorn launcher intentionally disables implicit proxy-header trust.
+`DISPATCH_TRUSTED_PROXY_IPS` to the exact proxy IP addresses or CIDRs when the
+deployment needs forwarded client IPs. Empty means that forwarding headers are
+not trusted. Keep edge rate limiting even though the application also has a
+bounded local abuse guard.
 
 ## Backup and recovery
 
-The database is the system of record. A production runbook must include:
+The database is the system of record. Create and verify a local database dump:
+
+```bash
+scripts/backup-database.sh /secure/local/dispatch-backups
+scripts/verify-database-backup.sh \
+  /secure/local/dispatch-backups/dispatch_YYYYMMDDTHHMMSSZ.dump
+```
+
+The first command takes a custom-format dump through the Compose PostgreSQL
+service, validates its archive structure and creates a SHA-256 sidecar. The
+second verifies that checksum and performs a real restore into a disposable,
+network-isolated PostgreSQL container. It never restores into the production
+database. A production runbook must additionally include:
 
 - encrypted PostgreSQL backups outside the host;
 - a retention schedule appropriate for request, GPS and evidence metadata;
@@ -177,15 +193,29 @@ The database is the system of record. A production runbook must include:
   secrets into ordinary archives;
 - verification that bot tokens and webhook secrets can be rotated.
 
-Compose creates the `dispatch-postgres` volume but does not pretend that a
-volume alone is a backup. Automated encrypted backup/restore tooling is still a
-roadmap item.
+Compose creates the `dispatch-postgres` volume but a volume alone is not a
+backup. Copy verified dumps to encrypted off-host storage, alert on missed runs
+and rehearse the restore procedure on a schedule.
 
 ## Queue recovery
 
 Inbox, outbox and outbound rows have `pending`, `processing`, `delivered` or
 `dead` states. A worker killed after claiming work does not lose it: stale
 `processing` rows become eligible again. Repeated failures use bounded backoff
-and eventually move to `dead`. A production UI/metric for dead-letter review is
-not implemented yet; inspect and requeue only with an audited operator
-procedure.
+and eventually move to `dead`.
+
+The worker logs an error whenever dead-letter items exist and warns when
+pending/processing work exceeds `DISPATCH_QUEUE_WARNING_AGE_SECONDS`. The
+authenticated endpoint below returns per-status counts, oldest timestamps and
+worker heartbeats for the configured organisation:
+
+```bash
+curl https://dispatch.example/v1/operations/queues \
+  -H 'Authorization: Bearer YOUR_ADMIN_KEY'
+```
+
+Successful inbox/outbox/outbound technical records are deleted in bounded
+batches after `DISPATCH_QUEUE_RETENTION_DAYS` (30 by default). Expired
+idempotency keys and sufficiently old callbacks are also removed. Dead-letter
+rows, requests, reports and GPS history are never removed by this maintenance
+job; inspect and requeue dead items only through an audited procedure.

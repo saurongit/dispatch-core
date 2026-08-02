@@ -90,10 +90,12 @@ class FakeBindingSessions:
 
     MAX_ATTEMPTS = 5
 
-    async def begin(self, **values: Any) -> None:
+    async def begin(self, **values: Any) -> bool:
         self.begun.append(values)
+        if self.attempts >= self.MAX_ATTEMPTS:
+            return False
         self.active = True
-        self.attempts = 0
+        return True
 
     async def is_active(self, **values: Any) -> bool:
         return self.active and self.attempts < self.MAX_ATTEMPTS
@@ -115,6 +117,10 @@ class FakeRoleCoordinator:
     started: list[str] = field(default_factory=list)
     texts: list[str] = field(default_factory=list)
     callbacks: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    replayed_event_ids: set[str] = field(default_factory=set)
+
+    async def handled_event(self, actor: ActorIdentity, event_id: str) -> bool:
+        return event_id in self.replayed_event_ids
 
     async def start(self, actor: ActorIdentity) -> Reply:
         self.started.append(actor.actor_id)
@@ -137,6 +143,15 @@ class FakeRoleCoordinator:
 @dataclass
 class FakeIntake:
     callbacks: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    replayed_event_ids: set[str] = field(default_factory=set)
+    texts: list[str] = field(default_factory=list)
+
+    async def handled_event(self, actor: ActorIdentity, event_id: str) -> bool:
+        return event_id in self.replayed_event_ids
+
+    async def handle_text(self, actor: ActorIdentity, text: str) -> Reply:
+        self.texts.append(text)
+        return Reply("client text")
 
     async def handle_callback(
         self,
@@ -401,6 +416,68 @@ async def test_dispatch_saves_report_photo_and_comment() -> None:
     assert comment_result.text == "Комментарий отчёта сохранён."
     assert drafts.photos == ["telegram:photo-1"]
     assert drafts.comments == ["work done"]
+
+
+@pytest.mark.asyncio
+async def test_replayed_client_text_does_not_advance_fsm_twice() -> None:
+    item = InboundEnvelope(
+        provider=Provider.TELEGRAM,
+        external_event_id="telegram:1",
+        organization_id="org-1",
+        payload={},
+    )
+    inbox = FakeInbox(items=(item,))
+    intake = FakeIntake(replayed_event_ids={"telegram:1:0"})
+    outbound = FakeOutbound()
+    target, _ = processor(
+        inbox=inbox,
+        identities=FakeIdentities(identity("client")),
+        intake=intake,
+        outbound=outbound,
+        transport=FakeTransport(
+            events=(event(EventKind.MESSAGE, text="+79990000000"),)
+        ),
+    )
+
+    assert await target.run_once() == 1
+    assert intake.texts == []
+    assert "уже обработано" in outbound.values[0]["text"]
+    assert inbox.processed == ["telegram:1"]
+
+
+@pytest.mark.asyncio
+async def test_replayed_operator_text_does_not_advance_fsm_twice() -> None:
+    item = InboundEnvelope(
+        provider=Provider.TELEGRAM,
+        external_event_id="telegram:operator:1",
+        organization_id="org-1",
+        payload={},
+    )
+    inbox = FakeInbox(items=(item,))
+    operator = FakeRoleCoordinator(
+        "operator",
+        replayed_event_ids={"telegram:operator:1:0"},
+    )
+    outbound = FakeOutbound()
+    target, _ = processor(
+        inbox=inbox,
+        identities=FakeIdentities(identity("operator")),
+        operator=operator,
+        outbound=outbound,
+        transport=FakeTransport(
+            events=(
+                event(
+                    EventKind.MESSAGE,
+                    external_event_id="telegram:operator:1",
+                    text="Ivan",
+                ),
+            )
+        ),
+    )
+
+    assert await target.run_once() == 1
+    assert operator.texts == []
+    assert "уже обработано" in outbound.values[0]["text"]
 
 
 @pytest.mark.asyncio
@@ -941,6 +1018,13 @@ async def test_staff_binding_locks_after_five_failed_codes() -> None:
     assert bound is None
     assert reply is not None
     assert "Попытки закончились" in reply.text
+
+    _, restart_reply = await target._maybe_bind_staff(
+        item,
+        event(EventKind.START, text="/start"),
+    )
+    assert restart_reply is not None
+    assert "Лимит попыток" in restart_reply.text
 
 
 @pytest.mark.asyncio

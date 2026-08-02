@@ -44,7 +44,9 @@ Dispatch Core — самостоятельно разворачиваемое я
   GPS из браузера, если нативная геолокация мессенджера недоступна;
 - раздельные 256-битные capability-токены чтения и записи, которые не попадают
   в query string и отзываются при завершении или отмене заявки;
-- контейнеры без root, read-only filesystem и файловые Docker secrets.
+- контейнеры без root, read-only filesystem и файловые Docker secrets;
+- heartbeat воркеров, защищённая диагностика очередей и проверяемый
+  PostgreSQL restore-drill.
 
 Исходный код и Git-история полностью отделены от частной рабочей системы,
 которая подсказала бизнес-процесс. В репозитории нет production-токенов,
@@ -111,9 +113,8 @@ ASSIGNED --отказ--> POOL_OPEN или SUBMITTED
 
 ## Тесты и контроль качества
 
-Текущий проверенный набор содержит **682 проходящих тестов**, включая 45
-integration-теста на отдельной PostgreSQL-базе, указанной в
-`TEST_DATABASE_URL`.
+Текущий проверенный набор содержит **730 проходящих тестов**, включая 55
+PostgreSQL-теста в изолированной схеме, указанной в `TEST_DATABASE_URL`.
 Проверяются:
 
 - все 256 комбинаций требований и состава отчёта;
@@ -135,10 +136,9 @@ CI запускается на Python 3.12, 3.13 и 3.14 с PostgreSQL 17 и н�
 Требуется Python 3.12 или новее.
 
 ```bash
-python -m venv .venv
-.venv/bin/pip install -e '.[server,dev]'
-.venv/bin/python -m dispatch_core
-.venv/bin/pytest
+uv sync --frozen --extra server --extra dev
+uv run python -m dispatch_core
+uv run pytest
 ```
 
 Демонстрация в памяти проводит заявку через полный курируемый сценарий без
@@ -239,6 +239,7 @@ IndustryPack, guided client intake, контролируемая привязк�
 - [Якорь продукта и parity-контракт](ANCHOR.md)
 - [Архитектура](docs/ARCHITECTURE.md)
 - [Эксплуатация и развёртывание](docs/OPERATIONS.md)
+- [Коммерческое сопровождение без скрытой блокировки](docs/SUPPORT_MODEL.md)
 - [Каталог применимости](docs/APPLICATIONS.md)
 - [Связность и резервный Telegram egress](docs/CONNECTIVITY.md)
 - [Дорожная карта](docs/ROADMAP.md)

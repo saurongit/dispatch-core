@@ -4,6 +4,7 @@ import asyncio
 import logging
 import signal
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 from dispatch_core.api.settings import Settings
@@ -13,6 +14,10 @@ from dispatch_core.infrastructure.messaging import (
     PostgresInboxStore,
     PostgresOutboundStore,
     PostgresOutboxStore,
+)
+from dispatch_core.infrastructure.operations import (
+    OperationsSnapshot,
+    PostgresOperationsStore,
 )
 from dispatch_core.infrastructure.pack_store import PostgresPackStore
 from dispatch_core.infrastructure.postgres import (
@@ -104,6 +109,7 @@ async def run_worker(
     staff_roles = StaffRoleCoordinator(PostgresStaffRoleSelectionStore(pool))
     staff_views = PostgresStaffViewStore(pool)
     identities = PostgresIdentityStore(pool)
+    operations = PostgresOperationsStore(pool)
     intake = IntakeCoordinator(
         packs=packs,
         sessions=intake_sessions,
@@ -149,8 +155,14 @@ async def run_worker(
             packs,
             public_base_url=settings.public_base_url,
         ),
+        organization_id=settings.organization_id,
     )
-    sender = OutboundSender(outbound, transports, consumer_key=settings.consumer_key)
+    sender = OutboundSender(
+        outbound,
+        transports,
+        organization_id=settings.organization_id,
+        consumer_key=settings.consumer_key,
+    )
     polling = DurablePollingReceiver(inbox)
     telegram = transports.get(Provider.TELEGRAM)
     if isinstance(telegram, TelegramTransport):
@@ -159,6 +171,7 @@ async def run_worker(
             settings.consumer_key,
         )
     stop = stop_event or asyncio.Event()
+    worker_started_at = datetime.now(UTC)
     if stop_event is None:
         loop = asyncio.get_running_loop()
         for name in (signal.SIGINT, signal.SIGTERM):
@@ -181,6 +194,33 @@ async def run_worker(
                     ),
                     stop,
                     _SESSION_CLEANUP_INTERVAL_SECONDS,
+                )
+            )
+            tasks.create_task(
+                _periodic(
+                    lambda: operations.heartbeat(
+                        organization_id=settings.organization_id,
+                        consumer_key=settings.consumer_key,
+                        instance_id=settings.worker_instance_id,
+                        started_at=worker_started_at,
+                    ),
+                    stop,
+                    settings.worker_heartbeat_seconds,
+                )
+            )
+            tasks.create_task(
+                _periodic(
+                    lambda: _maintain_operations(
+                        operations,
+                        organization_id=settings.organization_id,
+                        retention_days=settings.queue_retention_days,
+                        warning_age_seconds=settings.queue_warning_age_seconds,
+                        worker_stale_after_seconds=(
+                            settings.worker_health_stale_seconds
+                        ),
+                    ),
+                    stop,
+                    settings.maintenance_interval_seconds,
                 )
             )
             for provider in transports:
@@ -223,6 +263,14 @@ async def run_worker(
                 )
             await stop.wait()
     finally:
+        try:
+            await operations.remove_worker(
+                organization_id=settings.organization_id,
+                consumer_key=settings.consumer_key,
+                instance_id=settings.worker_instance_id,
+            )
+        except Exception:
+            logger.warning("failed to remove worker heartbeat", exc_info=True)
         for transport in transports.values():
             await transport.close()
         await database.close()
@@ -327,6 +375,66 @@ async def _cleanup_sessions(
             config_deleted,
             binding_deleted,
             staff_deleted,
+        )
+
+
+async def _maintain_operations(
+    operations: PostgresOperationsStore,
+    *,
+    organization_id: str,
+    retention_days: int,
+    warning_age_seconds: int,
+    worker_stale_after_seconds: int,
+) -> None:
+    deleted = await operations.cleanup_terminal(
+        organization_id,
+        retention_days=retention_days,
+    )
+    deleted_total = sum(deleted.values())
+    if deleted_total:
+        logger.info(
+            "cleaned up %d terminal runtime records: %s",
+            deleted_total,
+            deleted,
+        )
+    snapshot = await operations.snapshot(
+        organization_id,
+        worker_stale_after_seconds=worker_stale_after_seconds,
+    )
+    _log_operations_alerts(snapshot, warning_age_seconds=warning_age_seconds)
+
+
+def _log_operations_alerts(
+    snapshot: OperationsSnapshot,
+    *,
+    warning_age_seconds: int,
+) -> None:
+    now = datetime.now(UTC)
+    dead = [item for item in snapshot.queues if item.status == "dead" and item.count]
+    if dead:
+        logger.error(
+            "dead-letter items require review for organization %s: %s",
+            snapshot.organization_id,
+            {item.queue: item.count for item in dead},
+        )
+    delayed = [
+        item
+        for item in snapshot.queues
+        if item.status in {"pending", "processing"}
+        and (now - item.oldest_at).total_seconds() >= warning_age_seconds
+    ]
+    if delayed:
+        logger.warning(
+            "runtime queues are delayed for organization %s: %s",
+            snapshot.organization_id,
+            {
+                f"{item.queue}:{item.status}": {
+                    "status": item.status,
+                    "count": item.count,
+                    "oldest_at": item.oldest_at.isoformat(),
+                }
+                for item in delayed
+            },
         )
 
 

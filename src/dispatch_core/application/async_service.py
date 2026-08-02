@@ -254,12 +254,19 @@ class AsyncDispatchService:
                 from dispatch_core.domain.errors import InvalidTransition
 
                 raise InvalidTransition("session does not belong to this executor")
+            if source_event_id is not None and await uow.tracking.has_source_event(
+                organization_id,
+                source.value,
+                source_event_id,
+            ):
+                await uow.commit()
+                return session
             expected_version = session.version
             now = datetime.now(UTC)
             observed_at = captured_at or now
             latest = session.latest_point()
             if latest is not None and observed_at < latest.captured_at:
-                observed_at = now
+                observed_at = max(now, latest.captured_at)
             session.add_point(
                 TrackingPoint(
                     latitude=latitude,

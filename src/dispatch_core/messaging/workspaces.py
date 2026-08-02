@@ -92,6 +92,15 @@ class OperatorCoordinator:
         await self._clear_session(identity)
         return self.menu(identity)
 
+    async def handled_event(self, identity: ActorIdentity, event_id: str) -> bool:
+        return await self._sessions.handled_event(
+            organization_id=identity.organization_id,
+            actor_id=identity.actor_id,
+            role="operator",
+            provider=identity.provider,
+            event_id=event_id,
+        )
+
     def menu(self, identity: ActorIdentity, *, note: str | None = None) -> Reply:
         lines: list[str] = []
         if note:

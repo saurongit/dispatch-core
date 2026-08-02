@@ -166,6 +166,13 @@ class ConfigCoordinator:
     async def start(self, identity: ActorIdentity) -> Reply:
         return await self._menu(identity)
 
+    async def handled_event(self, identity: ActorIdentity, event_id: str) -> bool:
+        return await self._sessions.handled_event(
+            identity.organization_id,
+            identity.actor_id,
+            event_id,
+        )
+
     async def handle_text(self, identity: ActorIdentity, text: str) -> Reply:
         text = text.strip()
         session = await self._sessions.get(identity.organization_id, identity.actor_id)

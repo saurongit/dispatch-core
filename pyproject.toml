@@ -21,7 +21,7 @@ server = [
 ]
 dev = [
     "coverage[toml]>=7.6,<8",
-    "pytest>=8.3,<9",
+    "pytest>=9.0.3,<10",
     "pytest-asyncio>=1.2,<2",
     "ruff>=0.9,<1",
 ]
@@ -30,6 +30,7 @@ dev = [
 dispatch-core = "dispatch_core.__main__:main"
 dispatch-core-api = "dispatch_core.runtime.api:main"
 dispatch-core-worker = "dispatch_core.runtime.worker:main"
+dispatch-core-worker-healthcheck = "dispatch_core.runtime.healthcheck:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

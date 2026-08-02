@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -16,6 +17,11 @@ from dispatch_core.infrastructure.async_memory import (
     AsyncMemoryStore,
     AsyncMemoryUnitOfWorkFactory,
 )
+from dispatch_core.infrastructure.operations import (
+    OperationsSnapshot,
+    QueueStatus,
+    WorkerHeartbeat,
+)
 from dispatch_core.infrastructure.read_models import (
     AsyncMemoryOrderReader,
     AsyncMemoryTrackingViewReader,
@@ -26,6 +32,8 @@ from dispatch_core.transports.common import encode_executor_token
 
 ADMIN_KEY = "test-admin-key-that-is-at-least-32-characters"
 EXECUTOR_SECRET = "test-executor-token-signing-secret-32-chars!"
+TELEGRAM_WEBHOOK_SECRET = "telegram-webhook-secret-at-least-32-characters"
+MAX_WEBHOOK_SECRET = "max-webhook-secret-at-least-32-characters"
 
 
 @dataclass
@@ -69,15 +77,36 @@ class FakeIntakeAddressStore:
         return self.selection
 
 
+@dataclass
+class FakeOperationsStore:
+    calls: list[tuple[str, int]] = field(default_factory=list)
+
+    async def snapshot(
+        self,
+        organization_id: str,
+        *,
+        worker_stale_after_seconds: int,
+    ) -> OperationsSnapshot:
+        self.calls.append((organization_id, worker_stale_after_seconds))
+        now = datetime.now(UTC)
+        return OperationsSnapshot(
+            organization_id=organization_id,
+            generated_at=now,
+            queues=(QueueStatus("inbox", "dead", 2, now),),
+            workers=(WorkerHeartbeat("client", "worker-1", now, now, True),),
+        )
+
+
 @asynccontextmanager
 async def api_client(
     *,
     inbox: FakeInbox | None = None,
     transports: dict[Provider, FakeTransport] | None = None,
     identities: FakeIdentityConfig | None = None,
+    operations: FakeOperationsStore | None = None,
     intake_sessions: FakeIntakeAddressStore | None = None,
-    telegram_secret: str | None = "telegram-webhook-secret",
-    max_secret: str | None = "max-webhook-secret",
+    telegram_secret: str | None = TELEGRAM_WEBHOOK_SECRET,
+    max_secret: str | None = MAX_WEBHOOK_SECRET,
     webhook_max_body_bytes: int = 1_048_576,
     environment: str = "production",
     executor_token_secret: str | None = EXECUTOR_SECRET,
@@ -105,6 +134,7 @@ async def api_client(
         intake_sessions=intake_sessions,  # type: ignore[arg-type]
         inbox=inbox,  # type: ignore[arg-type]
         identities=identities,  # type: ignore[arg-type]
+        operations=operations,  # type: ignore[arg-type]
         transports=transports,  # type: ignore[arg-type]
     )
     async with app.router.lifespan_context(app):
@@ -196,6 +226,27 @@ async def test_health_endpoints_are_public_and_ready_when_injected() -> None:
     assert live.json() == {"status": "alive"}
     assert ready.status_code == 200
     assert ready.json() == {"status": "ready"}
+
+
+@pytest.mark.asyncio
+async def test_operations_queue_status_requires_admin_auth() -> None:
+    operations = FakeOperationsStore()
+    async with api_client(operations=operations) as (client, _):
+        unauthorized = await client.get("/v1/operations/queues")
+        response = await client.get(
+            "/v1/operations/queues",
+            headers=auth_headers(),
+        )
+    assert unauthorized.status_code == 401
+    assert response.status_code == 200
+    assert response.json()["queues"][0] == {
+        "queue": "inbox",
+        "status": "dead",
+        "count": 2,
+        "oldest_at": response.json()["queues"][0]["oldest_at"],
+    }
+    assert response.json()["workers"][0]["healthy"] is True
+    assert operations.calls == [("org-1", 45)]
 
 
 @pytest.mark.asyncio
@@ -749,9 +800,9 @@ async def test_completion_validation_does_not_change_state() -> None:
         (
             Provider.TELEGRAM,
             "X-Telegram-Bot-Api-Secret-Token",
-            "telegram-webhook-secret",
+            TELEGRAM_WEBHOOK_SECRET,
         ),
-        (Provider.MAX, "X-Max-Bot-Api-Secret", "max-webhook-secret"),
+        (Provider.MAX, "X-Max-Bot-Api-Secret", MAX_WEBHOOK_SECRET),
     ],
 )
 @pytest.mark.asyncio
@@ -811,7 +862,7 @@ async def test_disabled_webhook_is_not_discoverable() -> None:
     async with api_client() as (client, _):
         response = await client.post(
             "/webhooks/telegram",
-            headers={"X-Telegram-Bot-Api-Secret-Token": "telegram-webhook-secret"},
+            headers={"X-Telegram-Bot-Api-Secret-Token": TELEGRAM_WEBHOOK_SECRET},
             json={"update_id": 1},
         )
     assert response.status_code == 404
@@ -825,7 +876,7 @@ async def test_webhook_rejects_non_object_json() -> None:
     ) as (client, _):
         response = await client.post(
             "/webhooks/telegram",
-            headers={"X-Telegram-Bot-Api-Secret-Token": "telegram-webhook-secret"},
+            headers={"X-Telegram-Bot-Api-Secret-Token": TELEGRAM_WEBHOOK_SECRET},
             json=[1, 2, 3],
         )
     assert response.status_code == 400
@@ -840,7 +891,7 @@ async def test_webhook_rejects_invalid_json() -> None:
         response = await client.post(
             "/webhooks/telegram",
             headers={
-                "X-Telegram-Bot-Api-Secret-Token": "telegram-webhook-secret",
+                "X-Telegram-Bot-Api-Secret-Token": TELEGRAM_WEBHOOK_SECRET,
                 "Content-Type": "application/json",
             },
             content=b"{not-json",
@@ -858,7 +909,7 @@ async def test_webhook_rejects_invalid_content_length() -> None:
         response = await client.post(
             "/webhooks/telegram",
             headers={
-                "X-Telegram-Bot-Api-Secret-Token": "telegram-webhook-secret",
+                "X-Telegram-Bot-Api-Secret-Token": TELEGRAM_WEBHOOK_SECRET,
                 "Content-Length": "invalid",
             },
             content=b"{}",
@@ -877,10 +928,32 @@ async def test_webhook_rejects_declared_oversized_payload() -> None:
         response = await client.post(
             "/webhooks/telegram",
             headers={
-                "X-Telegram-Bot-Api-Secret-Token": "telegram-webhook-secret",
+                "X-Telegram-Bot-Api-Secret-Token": TELEGRAM_WEBHOOK_SECRET,
                 "Content-Length": "1025",
             },
             content=b"{}",
+        )
+    assert response.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_webhook_stops_buffering_oversized_chunked_payload() -> None:
+    async def body():
+        yield b"{" + (b"x" * 700)
+        yield b"y" * 400
+
+    async with api_client(
+        inbox=FakeInbox(),
+        transports={Provider.TELEGRAM: FakeTransport(Provider.TELEGRAM)},
+        webhook_max_body_bytes=1024,
+    ) as (client, _):
+        response = await client.post(
+            "/webhooks/telegram",
+            headers={
+                "X-Telegram-Bot-Api-Secret-Token": TELEGRAM_WEBHOOK_SECRET,
+                "Content-Type": "application/json",
+            },
+            content=body(),
         )
     assert response.status_code == 413
 

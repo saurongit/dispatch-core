@@ -7,6 +7,8 @@ import asyncpg
 
 from dispatch_core.messaging.models import Provider
 
+from .workflow_store import state_handled_event, state_with_session_event
+
 
 class PostgresStaffWorkflowSessionStore:
     """Role/provider-scoped state for operator and master messenger flows."""
@@ -56,6 +58,7 @@ class PostgresStaffWorkflowSessionStore:
         state: dict[str, Any],
     ) -> None:
         self._validate_role(role)
+        stored_state = state_with_session_event(state)
         async with self._pool.acquire() as connection:
             await connection.execute(
                 """
@@ -69,8 +72,25 @@ class PostgresStaffWorkflowSessionStore:
                 actor_id,
                 role,
                 provider.value,
-                json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+                json.dumps(stored_state, ensure_ascii=False, separators=(",", ":")),
             )
+
+    async def handled_event(
+        self,
+        *,
+        organization_id: str,
+        actor_id: str,
+        role: str,
+        provider: Provider,
+        event_id: str,
+    ) -> bool:
+        state = await self.get(
+            organization_id=organization_id,
+            actor_id=actor_id,
+            role=role,
+            provider=provider,
+        )
+        return state_handled_event(state, event_id)
 
     async def clear(
         self,

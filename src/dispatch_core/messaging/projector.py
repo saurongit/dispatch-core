@@ -618,12 +618,20 @@ class OutboxProjectorWorker:
         self,
         store: PostgresOutboxStore,
         projector: PostgresNotificationProjector,
+        *,
+        organization_id: str,
     ) -> None:
+        if not organization_id:
+            raise ValueError("outbox projector requires an organization id")
         self._store = store
         self._projector = projector
+        self._organization_id = organization_id
 
     async def run_once(self, *, limit: int = 50) -> int:
-        events = await self._store.claim_events(limit=limit)
+        events = await self._store.claim_events(
+            organization_id=self._organization_id,
+            limit=limit,
+        )
         projected = 0
         for event in events:
             try:

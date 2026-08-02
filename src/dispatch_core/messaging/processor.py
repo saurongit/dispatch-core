@@ -24,6 +24,7 @@ from dispatch_core.infrastructure.workflow_store import (
     PostgresIdentityStore,
     PostgresReportDraftStore,
     PostgresStaffBindingSessionStore,
+    session_event,
 )
 from dispatch_core.messaging.config import CONFIG_ACTIONS, ConfigCoordinator
 from dispatch_core.messaging.intake import INTAKE_ACTIONS, IntakeCoordinator
@@ -158,10 +159,22 @@ class InboundProcessor:
                     f"{event.external_user_id}."
                 )
             else:
-                try:
-                    response = await self._dispatch(identity, event)
-                except DomainError as exc:
-                    response = Reply(f"Команда не выполнена: {exc}")
+                session_event_id = f"{event.external_event_id}:{index}"
+                if await self._is_replayed_session_event(
+                    identity,
+                    event,
+                    session_event_id,
+                ):
+                    response = Reply(
+                        "Предыдущее сообщение уже обработано. Продолжите с "
+                        "текущего шага; если подсказка потерялась, нажмите /start."
+                    )
+                else:
+                    with session_event(session_event_id):
+                        try:
+                            response = await self._dispatch(identity, event)
+                        except DomainError as exc:
+                            response = Reply(f"Команда не выполнена: {exc}")
             reply = response
             if reply.text or reply.buttons:
                 buttons = await self._mint_buttons(item.organization_id, reply.buttons)
@@ -191,6 +204,22 @@ class InboundProcessor:
                         "answer_callback failed for %s — durable reply still queued",
                         event.callback_id,
                     )
+
+    async def _is_replayed_session_event(
+        self,
+        identity: ActorIdentity,
+        event: InboundEvent,
+        event_id: str,
+    ) -> bool:
+        if event.kind is not EventKind.MESSAGE:
+            return False
+        if identity.role == "client" and self._intake is not None:
+            return await self._intake.handled_event(identity, event_id)
+        if identity.role == "admin" and self._config is not None:
+            return await self._config.handled_event(identity, event_id)
+        if identity.role == "operator" and self._operator is not None:
+            return await self._operator.handled_event(identity, event_id)
+        return False
 
     async def _resolve_shared_staff(
         self,
@@ -287,7 +316,12 @@ class InboundProcessor:
             "consumer_key": role,
         }
         if event.kind is EventKind.START:
-            await sessions.begin(**session_values)
+            active = await sessions.begin(**session_values)
+            if not active:
+                return None, Reply(
+                    "Лимит попыток привязки исчерпан. Повторите позже или "
+                    "запросите новый код у администратора."
+                )
             return None, Reply(
                 "Введите 4-значный код, который выдал администратор. "
                 "Код действует для роли "
@@ -334,10 +368,9 @@ class InboundProcessor:
                 "Сеанс привязки истёк. Нажмите /start, чтобы начать заново."
             )
         if attempts >= sessions.MAX_ATTEMPTS:
-            await sessions.clear(**session_values)
             return None, Reply(
-                "Попытки закончились. Нажмите /start, чтобы начать заново, "
-                "или запросите новый код у администратора."
+                "Попытки закончились. Повторите позже или запросите новый код "
+                "у администратора."
             )
         remaining = sessions.MAX_ATTEMPTS - attempts
         return None, Reply(

@@ -253,7 +253,7 @@ def render_location_share_page(nonce: str) -> str:
   const start = document.getElementById('start');
   const stop = document.getElementById('stop');
   let watchId = null;
-  let lastSentAt = 0;
+  let lastAttemptAt = 0;
   let sending = false;
 
   function eventId() {{
@@ -272,8 +272,9 @@ def render_location_share_page(nonce: str) -> str:
 
   async function submit(position) {{
     const now = Date.now();
-    if (sending || now - lastSentAt < 5000) return;
+    if (sending || now - lastAttemptAt < 5000) return;
     sending = true;
+    lastAttemptAt = now;
     try {{
       const response = await fetch('/v1/public/location', {{
         method: 'POST',
@@ -292,10 +293,14 @@ def render_location_share_page(nonce: str) -> str:
         }})
       }});
       if (!response.ok) {{
-        end(response.status === 404 ? 'Заявка завершена или ссылка недействительна.' : 'Сервер временно не принял координаты.');
+        if ([401, 403, 404, 409, 410].includes(response.status)) {{
+          end('Заявка завершена или ссылка недействительна.');
+        }} else {{
+          status.dataset.active = 'true';
+          status.textContent = 'Сервер временно не принял координаты. Повторяем автоматически.';
+        }}
         return;
       }}
-      lastSentAt = now;
       status.dataset.active = 'true';
       status.textContent = 'Геопозиция передаётся · ' + new Date().toLocaleTimeString('ru-RU', {{ hour: '2-digit', minute: '2-digit' }});
     }} catch (_error) {{

@@ -2,7 +2,7 @@ name: dispatch-core
 
 services:
   postgres:
-    image: postgres:17-alpine
+    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
     restart: unless-stopped
     environment:
       POSTGRES_DB: dispatch
@@ -32,6 +32,9 @@ services:
       DISPATCH_ORGANIZATION_ID: ${DISPATCH_ORGANIZATION_ID:-default}
       DISPATCH_ORGANIZATION_NAME: ${DISPATCH_ORGANIZATION_NAME:-Dispatch Core}
       DISPATCH_PUBLIC_BASE_URL: ${DISPATCH_PUBLIC_BASE_URL:-http://127.0.0.1:8080}
+      DISPATCH_CALLBACK_SIGNING_SECRET: ${CALLBACK_SIGNING_SECRET:?set a 32+ character callback signing secret in .env}
+      DISPATCH_EXECUTOR_TOKEN_SECRET: ${EXECUTOR_TOKEN_SECRET:?set a different 32+ character executor token secret in .env}
+      DISPATCH_TRUSTED_PROXY_IPS: ${DISPATCH_TRUSTED_PROXY_IPS:-}
       DISPATCH_TELEGRAM_RECEIVE_MODE: disabled
       DISPATCH_MAX_RECEIVE_MODE: disabled
     ports:
@@ -54,6 +57,12 @@ services:
       api:
         condition: service_started
     environment: *dispatch-environment
+    healthcheck:
+      test: ["CMD", "dispatch-core-worker-healthcheck"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777

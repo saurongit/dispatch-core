@@ -168,6 +168,22 @@ class _AsyncTrackingRepository:
             raise RuntimeError("more than one active tracking session for work order")
         return deepcopy(matches[0]) if matches else None
 
+    async def has_source_event(
+        self,
+        organization_id: str,
+        source: str,
+        source_event_id: str,
+    ) -> bool:
+        return any(
+            session.organization_id == organization_id
+            and any(
+                point.source.value == source
+                and point.source_event_id == source_event_id
+                for point in session.points
+            )
+            for session in self._uow._store.tracking_sessions.values()
+        )
+
     async def save(
         self, session: TrackingSession, *, expected_version: int | None
     ) -> None:

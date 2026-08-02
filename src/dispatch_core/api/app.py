@@ -25,6 +25,7 @@ from dispatch_core.domain.errors import (
 from dispatch_core.domain.tracking import LocationSource
 from dispatch_core.domain.work_order import CompletionReport, EvidenceRequirements
 from dispatch_core.infrastructure.messaging import PostgresInboxStore
+from dispatch_core.infrastructure.operations import PostgresOperationsStore
 from dispatch_core.infrastructure.postgres import (
     PostgresDatabase,
     PostgresUnitOfWorkFactory,
@@ -62,6 +63,7 @@ from .schemas import (
     IntakeAddressLocationResponse,
     LocationInput,
     LocationRecordedResponse,
+    OperationsQueueResponse,
     PublicMapPointResponse,
     PublicTrackingPointResponse,
     PublicTrackingResponse,
@@ -78,10 +80,43 @@ logger = logging.getLogger(__name__)
 _AUTH_ATTEMPTS: dict[str, list[float]] = defaultdict(list)
 _AUTH_WINDOW = 60.0
 _AUTH_MAX_ATTEMPTS = 10
-_AUTH_SWEEPCounter: int = 0
 _TRACKING_ATTEMPTS: dict[str, list[float]] = defaultdict(list)
 _TRACKING_WINDOW = 60.0
 _TRACKING_MAX_ATTEMPTS = 30
+_RATE_LIMIT_BUCKET_CAP = 10_000
+
+
+def _recent_attempts(
+    buckets: dict[str, list[float]],
+    key: str,
+    now: float,
+    window: float,
+) -> list[float]:
+    recent = [instant for instant in buckets.get(key, ()) if now - instant < window]
+    if recent:
+        buckets[key] = recent
+    else:
+        buckets.pop(key, None)
+    if len(buckets) > _RATE_LIMIT_BUCKET_CAP:
+        stale = [
+            bucket_key
+            for bucket_key, timestamps in buckets.items()
+            if not timestamps or now - timestamps[-1] >= window
+        ]
+        for bucket_key in stale:
+            buckets.pop(bucket_key, None)
+        while len(buckets) > _RATE_LIMIT_BUCKET_CAP:
+            buckets.pop(next(iter(buckets)))
+    return recent
+
+
+async def _read_bounded_body(request: Request, maximum_bytes: int) -> bytes:
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > maximum_bytes:
+            raise HTTPException(status_code=413, detail="Payload too large")
+        body.extend(chunk)
+    return bytes(body)
 
 
 def create_app(
@@ -93,6 +128,7 @@ def create_app(
     intake_sessions: PostgresIntakeSessionStore | None = None,
     inbox: PostgresInboxStore | None = None,
     identities: PostgresIdentityStore | None = None,
+    operations: PostgresOperationsStore | None = None,
     transports: dict[Provider, Transport] | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings()  # type: ignore[call-arg]
@@ -102,7 +138,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         nonlocal database, service, reader, tracking_reader, intake_sessions
-        nonlocal inbox, identities
+        nonlocal inbox, identities, operations
         if not injected:
             database = PostgresDatabase(
                 resolved_settings.database_url.get_secret_value()
@@ -133,6 +169,7 @@ def create_app(
             intake_sessions = PostgresIntakeSessionStore(database.pool)
             inbox = PostgresInboxStore(database.pool)
             identities = PostgresIdentityStore(database.pool)
+            operations = PostgresOperationsStore(database.pool)
         app.state.database = database
         app.state.service = service
         app.state.reader = reader
@@ -140,6 +177,7 @@ def create_app(
         app.state.intake_sessions = intake_sessions
         app.state.inbox = inbox
         app.state.identities = identities
+        app.state.operations = operations
         try:
             yield
         finally:
@@ -185,24 +223,15 @@ def create_app(
         request: Request,
         authorization: str | None = Header(default=None),
     ) -> None:
-        global _AUTH_SWEEPCounter
         client_ip = request.client.host if request.client else "unknown"
         now = time.monotonic()
-        _AUTH_ATTEMPTS[client_ip] = [
-            t for t in _AUTH_ATTEMPTS[client_ip] if now - t < _AUTH_WINDOW
-        ]
-        if not _AUTH_ATTEMPTS[client_ip]:
-            _AUTH_ATTEMPTS.pop(client_ip, None)
-        _AUTH_SWEEPCounter += 1
-        if _AUTH_SWEEPCounter % 100 == 0:
-            stale = [
-                ip
-                for ip, timestamps in _AUTH_ATTEMPTS.items()
-                if not timestamps or now - timestamps[-1] >= _AUTH_WINDOW
-            ]
-            for ip in stale:
-                _AUTH_ATTEMPTS.pop(ip, None)
-        if len(_AUTH_ATTEMPTS[client_ip]) >= _AUTH_MAX_ATTEMPTS:
+        attempts = _recent_attempts(
+            _AUTH_ATTEMPTS,
+            client_ip,
+            now,
+            _AUTH_WINDOW,
+        )
+        if len(attempts) >= _AUTH_MAX_ATTEMPTS:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Too many authentication attempts",
@@ -227,15 +256,15 @@ def create_app(
         request: Request,
         authorization: str | None = Header(default=None),
     ) -> ActorIdentity:
-        global _AUTH_SWEEPCounter
         client_ip = request.client.host if request.client else "unknown"
         now = time.monotonic()
-        _AUTH_ATTEMPTS[client_ip] = [
-            t for t in _AUTH_ATTEMPTS[client_ip] if now - t < _AUTH_WINDOW
-        ]
-        if not _AUTH_ATTEMPTS[client_ip]:
-            _AUTH_ATTEMPTS.pop(client_ip, None)
-        if len(_AUTH_ATTEMPTS[client_ip]) >= _AUTH_MAX_ATTEMPTS:
+        attempts = _recent_attempts(
+            _AUTH_ATTEMPTS,
+            client_ip,
+            now,
+            _AUTH_WINDOW,
+        )
+        if len(attempts) >= _AUTH_MAX_ATTEMPTS:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Too many authentication attempts",
@@ -261,10 +290,10 @@ def create_app(
         org_id, actor_id = result
         identities = get_identities(request)
         if identities is not None:
-            identity = await identities.resolve(
+            identity = await identities.resolve_actor_id(
                 organization_id=org_id,
-                provider=Provider.TELEGRAM,
-                external_user_id=actor_id,
+                actor_id=actor_id,
+                required_role="master",
             )
         else:
             identity = None
@@ -307,6 +336,12 @@ def create_app(
             raise HTTPException(status_code=503, detail="Intake map is not ready")
         return value
 
+    def get_operations(request: Request) -> PostgresOperationsStore:
+        value = request.app.state.operations
+        if value is None:
+            raise HTTPException(status_code=503, detail="Operations store is not ready")
+        return value
+
     @app.get("/health/live", tags=["health"])
     async def live() -> dict[str, str]:
         return {"status": "alive"}
@@ -319,6 +354,23 @@ def create_app(
         if active_database is not None and await active_database.health():
             return JSONResponse(status_code=200, content={"status": "ready"})
         return JSONResponse(status_code=503, content={"status": "not_ready"})
+
+    @app.get(
+        "/v1/operations/queues",
+        tags=["operations"],
+        response_model=OperationsQueueResponse,
+    )
+    async def operations_queues(
+        _authenticated: None = Depends(authenticate),
+        store: PostgresOperationsStore = Depends(get_operations),  # noqa: B008
+    ) -> OperationsQueueResponse:
+        snapshot = await store.snapshot(
+            resolved_settings.organization_id,
+            worker_stale_after_seconds=(
+                resolved_settings.worker_health_stale_seconds
+            ),
+        )
+        return OperationsQueueResponse.model_validate(snapshot, from_attributes=True)
 
     @app.get("/track", include_in_schema=False, response_class=HTMLResponse)
     async def tracking_page() -> HTMLResponse:
@@ -388,15 +440,12 @@ def create_app(
     ) -> IntakeAddressLocationResponse:
         client_ip = request.client.host if request.client else "unknown"
         now = time.monotonic()
-        attempts = [
-            instant
-            for instant in _TRACKING_ATTEMPTS[client_ip]
-            if now - instant < _TRACKING_WINDOW
-        ]
-        if attempts:
-            _TRACKING_ATTEMPTS[client_ip] = attempts
-        else:
-            _TRACKING_ATTEMPTS.pop(client_ip, None)
+        attempts = _recent_attempts(
+            _TRACKING_ATTEMPTS,
+            client_ip,
+            now,
+            _TRACKING_WINDOW,
+        )
         if len(attempts) >= _TRACKING_MAX_ATTEMPTS:
             raise HTTPException(status_code=429, detail="Too many attempts")
         if intake_token is None or len(intake_token) < 43:
@@ -460,15 +509,12 @@ def create_app(
     ) -> PublicTrackingResponse:
         client_ip = request.client.host if request.client else "unknown"
         now = time.monotonic()
-        attempts = [
-            instant
-            for instant in _TRACKING_ATTEMPTS[client_ip]
-            if now - instant < _TRACKING_WINDOW
-        ]
-        if attempts:
-            _TRACKING_ATTEMPTS[client_ip] = attempts
-        else:
-            _TRACKING_ATTEMPTS.pop(client_ip, None)
+        attempts = _recent_attempts(
+            _TRACKING_ATTEMPTS,
+            client_ip,
+            now,
+            _TRACKING_WINDOW,
+        )
         if len(attempts) >= _TRACKING_MAX_ATTEMPTS:
             raise HTTPException(status_code=429, detail="Too many attempts")
         if tracking_token is None or len(tracking_token) < 43:
@@ -528,15 +574,12 @@ def create_app(
     ) -> LocationRecordedResponse:
         client_ip = request.client.host if request.client else "unknown"
         now = time.monotonic()
-        attempts = [
-            instant
-            for instant in _TRACKING_ATTEMPTS[client_ip]
-            if now - instant < _TRACKING_WINDOW
-        ]
-        if attempts:
-            _TRACKING_ATTEMPTS[client_ip] = attempts
-        else:
-            _TRACKING_ATTEMPTS.pop(client_ip, None)
+        attempts = _recent_attempts(
+            _TRACKING_ATTEMPTS,
+            client_ip,
+            now,
+            _TRACKING_WINDOW,
+        )
         if len(attempts) >= _TRACKING_MAX_ATTEMPTS:
             raise HTTPException(status_code=429, detail="Too many attempts")
         if location_token is None or len(location_token) < 43:
@@ -564,6 +607,10 @@ def create_app(
             raise HTTPException(
                 status_code=404, detail="Location link is unavailable"
             ) from None
+        except ValueError:
+            raise HTTPException(
+                status_code=422, detail="Location timestamp is invalid"
+            ) from None
         _TRACKING_ATTEMPTS.pop(client_ip, None)
         response.headers["Cache-Control"] = "no-store, private"
         response.headers["Referrer-Policy"] = "no-referrer"
@@ -571,7 +618,7 @@ def create_app(
         response.headers["X-Robots-Tag"] = "noindex, nofollow"
         return LocationRecordedResponse(
             tracking_session_id=tracking.id,
-            point_count=len(tracking.points),
+            point_count=tracking.point_count,
             version=tracking.version,
         )
 
@@ -650,6 +697,18 @@ def create_app(
                 status_code=503,
                 detail="executor_token_secret is not configured",
             )
+        identity_store = get_identities(request)
+        if identity_store is not None:
+            actor = await identity_store.resolve_actor_id(
+                organization_id=resolved_settings.organization_id,
+                actor_id=body.actor_id,
+                required_role="master",
+            )
+            if actor is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Active master was not found",
+                )
         token, expires_at = encode_executor_token(
             resolved_settings.organization_id,
             body.actor_id,
@@ -823,7 +882,7 @@ def create_app(
         )
         return LocationRecordedResponse(
             tracking_session_id=tracking.id,
-            point_count=len(tracking.points),
+            point_count=tracking.point_count,
             version=tracking.version,
         )
 
@@ -890,9 +949,10 @@ def create_app(
                 raise HTTPException(
                     status_code=400, detail="Invalid Content-Length"
                 ) from None
-        raw = await request.body()
-        if len(raw) > resolved_settings.webhook_max_body_bytes:
-            raise HTTPException(status_code=413, detail="Payload too large")
+        raw = await _read_bounded_body(
+            request,
+            resolved_settings.webhook_max_body_bytes,
+        )
         try:
             payload = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError):

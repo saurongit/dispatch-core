@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -11,6 +11,7 @@ from dispatch_core.messaging.models import Provider
 
 _MAX_DETAILS_KEYS = 50
 _MAX_DETAIL_VALUE_LEN = 1000
+_MAX_LOCATION_CLOCK_SKEW = timedelta(minutes=5)
 
 
 class EvidenceRequirementsInput(BaseModel):
@@ -77,6 +78,28 @@ class ActorResponse(BaseModel):
     external_user_id: str | None
 
 
+class QueueStatusResponse(BaseModel):
+    queue: str
+    status: str
+    count: int
+    oldest_at: datetime
+
+
+class WorkerHeartbeatResponse(BaseModel):
+    consumer_key: str
+    instance_id: str
+    started_at: datetime
+    heartbeat_at: datetime
+    healthy: bool
+
+
+class OperationsQueueResponse(BaseModel):
+    organization_id: str
+    generated_at: datetime
+    queues: tuple[QueueStatusResponse, ...]
+    workers: tuple[WorkerHeartbeatResponse, ...]
+
+
 class PublishPoolInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -121,6 +144,11 @@ class BrowserLocationInput(BaseModel):
     def captured_at_requires_timezone(cls, value: datetime | None) -> datetime | None:
         if value is not None and value.tzinfo is None:
             raise ValueError("captured_at must include a timezone")
+        if (
+            value is not None
+            and value.astimezone(UTC) > datetime.now(UTC) + _MAX_LOCATION_CLOCK_SKEW
+        ):
+            raise ValueError("captured_at is too far in the future")
         return value
 
 

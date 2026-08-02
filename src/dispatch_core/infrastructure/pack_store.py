@@ -149,27 +149,21 @@ class PostgresPackStore:
         seed: PackDefinition,
     ) -> bool:
         async with self._pool.acquire() as connection:
-            async with connection.transaction():
-                existing = await connection.fetchval(
-                    """
-                    SELECT 1 FROM org_packs
-                    WHERE organization_id = $1
-                    LIMIT 1
-                    """,
-                    organization_id,
+            result = await connection.execute(
+                """
+                INSERT INTO org_packs (
+                    organization_id, version, state, definition, activated_at
                 )
-                if existing is not None:
-                    return False
-                await connection.execute(
-                    """
-                    INSERT INTO org_packs (
-                        organization_id, version, state, definition, activated_at
-                    ) VALUES ($1, 1, 'active', $2::jsonb, now())
-                    """,
-                    organization_id,
-                    _json_text(seed.to_json()),
+                SELECT $1, 1, 'active', $2::jsonb, now()
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM org_packs WHERE organization_id = $1
                 )
-        return True
+                ON CONFLICT DO NOTHING
+                """,
+                organization_id,
+                _json_text(seed.to_json()),
+            )
+        return result == "INSERT 0 1"
 
 
 async def _next_version(

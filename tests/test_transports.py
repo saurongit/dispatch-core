@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 import pytest
 
+import dispatch_core.transports.max as max_module
 from dispatch_core.messaging.models import (
     OutboundButton,
     OutboundEnvelope,
@@ -472,6 +473,8 @@ async def test_max_send_uses_authorization_header_and_native_keyboard() -> None:
 
     assert captured["authorization"] == "max-secret"
     assert captured["user_id"] == "7001"
+    assert captured["json"]["text"] == "Новая заявка"
+    assert "format" not in captured["json"]
     expected_hmac = encode_callback("accept-token", signing_secret=_TEST_SECRET)
     buttons = captured["json"]["attachments"][0]["payload"]["buttons"]
     assert buttons == [
@@ -523,6 +526,117 @@ async def test_max_send_retries_on_attachment_not_ready() -> None:
     await client.aclose()
     assert call_count == 2
     assert result.external_message_id == "m-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 401, 404])
+async def test_max_send_rejects_http_client_errors(status_code: int) -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                status_code,
+                json={"code": "recipient.not.found", "message": "bad recipient"},
+            )
+        )
+    )
+    transport = MaxTransport("token", client=client)
+
+    with pytest.raises(RuntimeError, match=r"recipient\.not\.found"):
+        await transport.send(outbound(Provider.MAX))
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_max_send_rejects_provider_error_on_http_200() -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={"code": "recipient.not.found", "message": "bad recipient"},
+            )
+        )
+    )
+    transport = MaxTransport("token", client=client)
+
+    with pytest.raises(RuntimeError, match=r"recipient\.not\.found"):
+        await transport.send(outbound(Provider.MAX))
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_max_send_requires_provider_message_id() -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"message": {"body": {}}})
+        )
+    )
+    transport = MaxTransport("token", client=client)
+
+    with pytest.raises(RuntimeError, match="no message id"):
+        await transport.send(outbound(Provider.MAX))
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_max_truncates_long_text_and_sends_plain_text() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["json"] = json.loads(request.content)
+        return httpx.Response(200, json={"message": {"body": {"mid": "m-1"}}})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = MaxTransport("token", client=client)
+    original = outbound(Provider.MAX)
+    await transport.send(
+        OutboundEnvelope(
+            message_id=original.message_id,
+            deduplication_key=original.deduplication_key,
+            organization_id=original.organization_id,
+            provider=original.provider,
+            recipient_id=original.recipient_id,
+            text="<a href='https://evil.test'>x</a>" + "y" * 5000,
+            buttons=original.buttons,
+            attempts=original.attempts,
+        )
+    )
+    await client.aclose()
+
+    assert len(captured["json"]["text"]) == 4000
+    assert captured["json"]["text"].startswith("<a href=")
+    assert "format" not in captured["json"]
+
+
+@pytest.mark.asyncio
+async def test_max_limits_each_recipient_to_two_messages_per_second(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+
+    async def advance(delay: float) -> None:
+        clock[0] += delay
+
+    monkeypatch.setattr(max_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(max_module.asyncio, "sleep", advance)
+    sent = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal sent
+        sent += 1
+        return httpx.Response(
+            200,
+            json={"message": {"body": {"mid": f"m-{sent}"}}},
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = MaxTransport("token", client=client)
+    await transport.send(outbound(Provider.MAX))
+    await transport.send(outbound(Provider.MAX))
+    await transport.send(outbound(Provider.MAX))
+    await client.aclose()
+
+    assert sent == 3
+    assert clock[0] == 1.0
 
 
 @pytest.mark.asyncio

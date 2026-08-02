@@ -100,6 +100,13 @@ class IntakeCoordinator:
         await self._save(identity, state)
         return Reply("Введите ваш телефон:", buttons=(_CANCEL_BUTTON,))
 
+    async def handled_event(self, identity: ActorIdentity, event_id: str) -> bool:
+        return await self._sessions.handled_event(
+            identity.organization_id,
+            identity.actor_id,
+            event_id,
+        )
+
     async def handle_text(self, identity: ActorIdentity, text: str) -> Reply:
         state = await self._sessions.get(identity.organization_id, identity.actor_id)
         if state is None:

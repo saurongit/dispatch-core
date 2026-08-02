@@ -262,6 +262,7 @@ class PostgresOutboxStore:
     async def claim_events(
         self,
         *,
+        organization_id: str | None = None,
         limit: int = 50,
         stale_after_seconds: int = 120,
     ) -> tuple[PendingDomainEvent, ...]:
@@ -274,12 +275,15 @@ class PostgresOutboxStore:
                     WITH candidates AS (
                         SELECT event_id
                         FROM outbox_events
-                        WHERE (
-                            status = 'pending' AND next_attempt_at <= now()
-                        ) OR (
-                            status = 'processing'
-                            AND claimed_at < now() - make_interval(secs => $2)
-                        )
+                        WHERE ($3::text IS NULL OR organization_id = $3)
+                          AND (
+                            (
+                                status = 'pending' AND next_attempt_at <= now()
+                            ) OR (
+                                status = 'processing'
+                                AND claimed_at < now() - make_interval(secs => $2)
+                            )
+                          )
                         ORDER BY occurred_at, event_id
                         FOR UPDATE SKIP LOCKED
                         LIMIT $1
@@ -295,6 +299,7 @@ class PostgresOutboxStore:
                     """,
                     limit,
                     stale_after_seconds,
+                    organization_id,
                 )
         return tuple(
             PendingDomainEvent(
@@ -387,6 +392,7 @@ class PostgresOutboundStore:
         self,
         provider: Provider,
         *,
+        organization_id: str | None = None,
         consumer_key: str = "",
         consumer_keys: Sequence[str] | None = None,
         limit: int = 50,
@@ -411,7 +417,8 @@ class PostgresOutboundStore:
                                 status = 'processing'
                                 AND claimed_at < now() - make_interval(secs => $3)
                             )
-                        )
+                          )
+                          AND ($5::text IS NULL OR organization_id = $5)
                         ORDER BY created_at, id
                         FOR UPDATE SKIP LOCKED
                         LIMIT $2
@@ -429,6 +436,7 @@ class PostgresOutboundStore:
                     limit,
                     stale_after_seconds,
                     list(routed_consumer_keys),
+                    organization_id,
                 )
         return tuple(_outbound_from_row(row) for row in rows)
 
@@ -453,9 +461,14 @@ class PostgresOutboundStore:
         error: str,
         *,
         max_attempts: int = 10,
+        retry_after_seconds: float | None = None,
     ) -> None:
         is_dead = message.attempts >= max_attempts
-        delay = retry_delay(message.attempts, message.deduplication_key)
+        delay = (
+            max(0.001, retry_after_seconds)
+            if retry_after_seconds is not None
+            else retry_delay(message.attempts, message.deduplication_key)
+        )
         async with self._pool.acquire() as connection:
             await connection.execute(
                 """
